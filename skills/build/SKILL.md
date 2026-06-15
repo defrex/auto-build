@@ -1,6 +1,6 @@
 ---
 name: build
-description: Take a design at build/[feature]/design.md through plan → build → review → PR autonomously. If no design exists yet, writes a short one from your instructions and starts immediately — no /spec required for simple tasks. Infers the feature from the current branch's changes or your instructions. Launches bin/build.ts as a background OS process and reports status from state.json / build.log / NEEDS-INPUT.md.
+description: Take a spec at build/[feature]/spec.md through plan → build → review → PR autonomously. If no spec exists yet, writes a short one from your instructions and starts immediately — no /spec required for simple tasks. Infers the feature from the current branch's changes or your instructions. Launches bin/build.ts as a background OS process and reports status from state.json / build.log / NEEDS-INPUT.md.
 argument-hint: "[feature-name] (optional)"
 user-invocable: true
 allowed-tools: Bash, Read, Write, Glob
@@ -32,9 +32,9 @@ Pick `FEATURE` (kebab-case), in priority order:
    State the name you chose in one line so the user can correct it.
 3. **Bare `/build` with no instruction** (checking in / resuming) → infer from existing
    work:
-   - Enumerate candidate dirs that hold a design: `ls -d build/*/` and keep the ones
-     containing a `design.md`.
-   - If exactly one has a `design.md`, that's the feature.
+   - Enumerate candidate dirs that hold a spec: `ls -d build/*/` and keep the ones
+     containing a `spec.md` (or, for in-flight worktrees, a legacy `design.md`).
+   - If exactly one has a `spec.md`/`design.md`, that's the feature.
    - If several do, narrow by the current branch name and changed paths
      (`git diff --name-only main...HEAD`, plus `git status --short`). Branch-name
      correspondence is the primary signal; treat weak path matches as inconclusive.
@@ -43,15 +43,17 @@ Pick `FEATURE` (kebab-case), in priority order:
 
 Let `DIR=build/$FEATURE`.
 
-## Step 1 — Ensure a design exists
+## Step 1 — Ensure a spec exists
 
 - **If `$DIR/NEEDS-INPUT.md` exists**, the previous run is **blocked on a human
   decision**. Read it, surface the blocker and the requested decision to the user, and
-  stop — do not relaunch until they've resolved it and deleted the file. (See Step 4.)
-- **If `$DIR/design.md` exists**, use it as the target (a human-approved `/spec` output,
-  or one a prior `/build` wrote). Proceed to Step 2.
-- **If `$DIR/design.md` does NOT exist**, write a **short** one from the user's
-  instructions and proceed immediately — this is the no-`/spec`-needed path:
+  stop — do not relaunch until it's resolved and the file deleted. The user may resolve
+  it themselves, or hand you their decision in conversation — in that case apply it,
+  delete the file, and relaunch, per the supervision flow in Step 3. (See Step 4.)
+- **If `$DIR/spec.md` (or a legacy `$DIR/design.md`) exists**, use it as the target (a
+  human-approved `/spec` output, or one a prior `/build` wrote). Proceed to Step 2.
+- **If neither `$DIR/spec.md` nor `$DIR/design.md` exists**, write a **short** spec from
+  the user's instructions and proceed immediately — this is the no-`/spec`-needed path:
   1. Capture the user's intent faithfully and concisely. Size the doc to the task: a
      couple of sentences plus a short bullet list for something simple; only expand if
      the instruction itself carries real detail. Don't open a `/spec`-style
@@ -69,11 +71,11 @@ Let `DIR=build/$FEATURE`.
 
      - <any specific behavior, constraint, or file the user named>
      ```
-  3. Write it to `$DIR/design.md`, then continue to Step 2.
+  3. Write it to `$DIR/spec.md`, then continue to Step 2.
 
   If the request is genuinely large or ambiguous, you may suggest the user run
-  `/spec $FEATURE` first for a fuller design — but the default is to write the short
-  design and build.
+  `/spec $FEATURE` first for a fuller spec — but the default is to write the short
+  spec and build.
 
 ## Step 2 — Report existing status (if any)
 
@@ -96,6 +98,15 @@ mergeable PR. Check back any time with `/build $FEATURE`."
 Do **not** block waiting for it to finish. The orchestrator writes progress to
 `$DIR/state.json` and `$DIR/build.log`; status is read from disk, not from the
 launching process.
+
+**Supervise to the end of the session.** Because the launch used background
+mode, you are re-invoked when the process exits — that is your escalation
+hook (this is how dispatched maintenance builds surface blockers to the user).
+When the notification arrives, report per Step 4: on exit code 2 (or whenever
+`$DIR/NEEDS-INPUT.md` exists), surface the blocker and the decision needed
+prominently and wait for the user; if they resolve it in conversation, apply
+their decision, delete `NEEDS-INPUT.md`, and relaunch the same way. On exit 0,
+report the PR as done.
 
 ## Step 4 — Reporting status on a later invocation
 

@@ -1,8 +1,60 @@
-import { describe, expect, test } from "bun:test"
-import { chooseReviewVerdict, decideStartup } from "./orchestrator"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { chooseReviewVerdict, createCtx, decideStartup } from "./orchestrator"
 import { initState } from "./state"
 
 const now = "2026-05-28T00:00:00Z"
+
+describe("createCtx", () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "orchestrator-ctx-"))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function ctxFor(buildDir: string) {
+    return createCtx({
+      repoRoot: dir,
+      feature: "feat",
+      buildDir,
+      baseBranch: "main",
+      env: process.env,
+      now: () => now,
+    })
+  }
+
+  test("specPath getter resolves spec.md when present", () => {
+    writeFileSync(join(dir, "spec.md"), "# spec")
+    const ctx = ctxFor(dir)
+    expect(ctx.specPath).toBe(join(dir, "spec.md"))
+  })
+
+  test("specPath getter resolves legacy design.md when spec.md is absent", () => {
+    writeFileSync(join(dir, "design.md"), "# design")
+    const ctx = ctxFor(dir)
+    expect(ctx.specPath).toBe(join(dir, "design.md"))
+  })
+
+  test("picks up a rename mid-run from the same ctx object", () => {
+    writeFileSync(join(dir, "design.md"), "# design")
+    const ctx = ctxFor(dir)
+    // First resolution sees the legacy artifact.
+    expect(ctx.specPath.endsWith("design.md")).toBe(true)
+
+    // Simulate the A8 design.md → spec.md migration mid-run.
+    rmSync(join(dir, "design.md"))
+    writeFileSync(join(dir, "spec.md"), "# spec")
+
+    // The same ctx object now resolves the new name — path is not cached.
+    expect(ctx.specPath.endsWith("spec.md")).toBe(true)
+  })
+})
 
 describe("chooseReviewVerdict", () => {
   test("prefers the round-file verdict over the chat-message verdict", () => {
@@ -30,7 +82,7 @@ describe("chooseReviewVerdict", () => {
 describe("decideStartup", () => {
   test("no state + no design → halt (run /spec first)", () => {
     const d = decideStartup(
-      { designExists: false, state: null, needsInputExists: false },
+      { specExists: false, state: null, needsInputExists: false },
       "feat",
       "br",
       now,
@@ -41,7 +93,7 @@ describe("decideStartup", () => {
 
   test("no state + design → start fresh at plan", () => {
     const d = decideStartup(
-      { designExists: true, state: null, needsInputExists: false },
+      { specExists: true, state: null, needsInputExists: false },
       "feat",
       "br",
       now,
@@ -60,7 +112,7 @@ describe("decideStartup", () => {
       status: "blocked" as const,
     }
     const d = decideStartup(
-      { designExists: true, state, needsInputExists: true },
+      { specExists: true, state, needsInputExists: true },
       "feat",
       "br",
       now,
@@ -77,7 +129,7 @@ describe("decideStartup", () => {
       reviewRound: 2,
     }
     const d = decideStartup(
-      { designExists: true, state, needsInputExists: false },
+      { specExists: true, state, needsInputExists: false },
       "feat",
       "br",
       now,
@@ -97,7 +149,7 @@ describe("decideStartup", () => {
       status: "done" as const,
     }
     const d = decideStartup(
-      { designExists: true, state, needsInputExists: false },
+      { specExists: true, state, needsInputExists: false },
       "feat",
       "br",
       now,

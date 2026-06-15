@@ -54,6 +54,14 @@ export const buildStateSchema = z.object({
   reviewRound: z.number().int().nonnegative(),
   branch: z.string().min(1),
   harnessMap: harnessMapSchema,
+  /**
+   * Linear human identifier for this build's ticket, e.g. "PRO-123". Optional:
+   * set by the ensure-ticket step at launch (best-effort); absent on old
+   * `state.json` files and before a ticket is ensured, keeping resume compatible.
+   */
+  linearIssueId: z.string().min(1).optional(),
+  /** Linear issue UUID, recorded alongside `linearIssueId`. Optional (see above). */
+  linearIssueUuid: z.string().min(1).optional(),
   updatedAt: z.string(),
 })
 export type BuildState = z.infer<typeof buildStateSchema>

@@ -1,0 +1,31 @@
+{
+  "linear": {
+    "teamId": "",
+    "projectId": "",
+    "triageStateId": "",
+    "readyStateId": "",
+    "inProgressStateId": "",
+    "doneStateId": "",
+    "rejectedStateIds": [],
+    "sourceObservationsLabelId": "",
+    "sourceSentryLabelId": "",
+    "needsDefinitionLabelId": ""
+  },
+  "sentry": {
+    "minEvents": 25,
+    "minAffectedUsers": 0,
+    "lookbackDays": 14,
+    "environments": ["production"],
+    "requireSeenSinceLatestDeploy": true,
+    "staleAfterDeployFallbackDays": 3
+  },
+  "caps": {
+    "maxNewIssuesPerRun": 5,
+    "maxInvestigationsPerRun": 3
+  },
+  "worktree": {
+    "provider": "git",
+    "supersetProjectId": ""
+  },
+  "maxConcurrentBuilds": 1
+}

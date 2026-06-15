@@ -53,6 +53,45 @@ describe("initState", () => {
     expect(s.updatedAt).toBe("2026-05-28T00:00:00Z")
     expect(() => buildStateSchema.parse(s)).not.toThrow()
   })
+
+  test("leaves the Linear issue fields unset (a fresh build has no ticket)", () => {
+    const s = initState("build-flow", "br", "2026-05-28T00:00:00Z")
+    expect(s.linearIssueId).toBeUndefined()
+    expect(s.linearIssueUuid).toBeUndefined()
+  })
+})
+
+describe("Linear issue fields", () => {
+  let repo: string
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "build-flow-linear-"))
+  })
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true })
+  })
+
+  test("linearIssueId/linearIssueUuid round-trip through write/read", () => {
+    const s = {
+      ...initState("feat", "br", "2026-05-28T00:00:00Z"),
+      linearIssueId: "PRO-123",
+      linearIssueUuid: "uuid-abc",
+    }
+    writeState(repo, s, "2026-05-28T01:00:00Z")
+    const read = readState(repo, "feat")
+    expect(read?.linearIssueId).toBe("PRO-123")
+    expect(read?.linearIssueUuid).toBe("uuid-abc")
+  })
+
+  test("an existing state.json without the keys still parses (optional)", () => {
+    const s = initState("feat", "br", "2026-05-28T00:00:00Z")
+    writeState(repo, s, "2026-05-28T00:00:00Z")
+    // simulate a pre-existing file that never had the new keys
+    const raw = JSON.parse(
+      readFileSync(statePath(repo, "feat"), "utf-8"),
+    ) as Record<string, unknown>
+    expect("linearIssueId" in raw).toBe(false)
+    expect(readState(repo, "feat")?.feature).toBe("feat")
+  })
 })
 
 describe("readState / writeState round-trip", () => {

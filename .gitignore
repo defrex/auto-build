@@ -1,0 +1,4 @@
+node_modules/
+# kickoff runtime scratch (pid lock, select logs, select results)
+build/kickoff/.kickoff/
+# per-build runtime artifacts live under build/<feature>/ at runtime

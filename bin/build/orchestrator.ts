@@ -10,7 +10,8 @@
  *
  * See `build/build-flow/design.html` — that `.html` is build's OWN design doc.
  * The per-feature input this pipeline reads and builds against is always
- * `build/[feature]/design.md` (what `/spec` produces); don't conflate the two.
+ * `build/[feature]/spec.md` (what `/spec` produces; legacy `design.md` is read
+ * as a fallback via `resolveSpecPath`); don't conflate the two.
  */
 
 import {
@@ -20,8 +21,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { loadConfig } from "../kickoff/config"
 import { builderArgs, reviewerArgs, runHarness } from "./harness"
+import { type EnsureTicketDeps, ensureLinearTicket } from "./linear-ticket"
 import { appendLog } from "./log"
 import { writeScopedNextDevtoolsConfig } from "./mcp-config"
 import { monitorPr } from "./monitor"
@@ -43,6 +46,7 @@ import {
   fetchPrSnapshot,
   rebaseOntoBase,
 } from "./repo"
+import { resolveSpecPath, specExists } from "./spec-doc"
 import {
   type BuildState,
   buildDir as buildDirOf,
@@ -87,7 +91,7 @@ export class EscalateError extends Error {
 }
 
 export type StartupInputs = {
-  designExists: boolean
+  specExists: boolean
   state: BuildState | null
   needsInputExists: boolean
 }
@@ -99,8 +103,8 @@ export type StartupDecision =
 /**
  * Decide how to begin a run from on-disk facts. (pure)
  *
- * - No state + no design → halt (run /spec first).
- * - No state + design → start fresh.
+ * - No state + no spec → halt (run /spec first).
+ * - No state + spec → start fresh.
  * - Blocked with NEEDS-INPUT.md still present → halt (human must resolve + delete it).
  * - Already done → halt.
  * - Otherwise → resume: flip status to running, keep the phase.
@@ -112,10 +116,10 @@ export function decideStartup(
   now: string,
 ): StartupDecision {
   if (!inputs.state) {
-    if (!inputs.designExists) {
+    if (!inputs.specExists) {
       return {
         kind: "halt",
-        message: `no design.md for "${feature}" — run /spec ${feature} first`,
+        message: `no spec.md for "${feature}" — run /spec ${feature} first`,
       }
     }
     return { kind: "start", state: initState(feature, branch, now) }
@@ -134,14 +138,52 @@ export function decideStartup(
   return { kind: "start", state: { ...inputs.state, status: "running" } }
 }
 
-type Ctx = {
+export type Ctx = {
   repoRoot: string
   feature: string
   buildDir: string
+  /**
+   * Canonical-input path, resolved fresh on every access (spec.md, or legacy
+   * design.md). Derived from `buildDir`, not cached — so a build that renames
+   * its own input artifact mid-run (e.g. the A8 design.md → spec.md migration)
+   * has its later phases pick up the new filename. Read-only: assigning is a
+   * mistake, since the value is recomputed each read.
+   */
+  readonly specPath: string
   logPath: string
   baseBranch: string
   env: NodeJS.ProcessEnv
   now: () => string
+}
+
+/**
+ * Build a {@link Ctx}. `specPath` is a getter that calls
+ * `resolveSpecPath(buildDir)` on every access (closing over the `buildDir`
+ * parameter, not `this`, so it survives any future spread/destructure), so each
+ * phase reads the input artifact's current on-disk name rather than a value
+ * cached at startup.
+ */
+export function createCtx(args: {
+  repoRoot: string
+  feature: string
+  buildDir: string
+  baseBranch: string
+  env: NodeJS.ProcessEnv
+  now: () => string
+}): Ctx {
+  const { repoRoot, feature, buildDir, baseBranch, env, now } = args
+  return {
+    repoRoot,
+    feature,
+    buildDir,
+    get specPath() {
+      return resolveSpecPath(buildDir)
+    },
+    logPath: join(buildDir, "build.log"),
+    baseBranch,
+    env,
+    now,
+  }
 }
 
 const noVerdictEscalate = (phase: string): BuilderVerdict => ({
@@ -226,7 +268,7 @@ async function invokeReviewer<T>(
 
 /**
  * The e2e step of the validate gate. Runs by default: brings up the dev server
- * (launch-only-if-not-running) and dispatches the builder to drive real flows
+ * (launch-only-if-not-running) and launches the builder to drive real flows
  * via the next-devtools browser MCP. Opt out with `BUILD_SKIP_E2E=1`.
  *
  * The builder is scoped to ONLY the project's `next-devtools` MCP server
@@ -260,16 +302,16 @@ function makeE2e(ctx: Ctx, state: BuildState): RunValidateArgs["e2e"] {
   return async () => {
     const { deriveDevUrl, withDevServer } = await import("./dev-server")
     const devUrl = deriveDevUrl(ctx.env, ctx.repoRoot)
-    const design = join(ctx.buildDir, "design.md")
+    const spec = ctx.specPath
     const verdict = await withDevServer({
       devUrl,
       repoRoot: ctx.repoRoot,
       run: async (url) => {
         const prompt = [
           `You are the e2e step of build for the "${ctx.feature}" feature.`,
-          `Read the canonical design at ${design} to learn the key user flows it introduces or changes.`,
+          `Read the canonical spec at ${spec} to learn the key user flows it introduces or changes.`,
           `Drive a real browser against ${url} with the next-devtools browser MCP (mcp__next-devtools__browser_eval).`,
-          "Authenticate first by navigating to /api/auth/dev-login, then exercise the primary happy path and every flow the design calls out.",
+          "Authenticate first by navigating to /api/auth/dev-login, then exercise the primary happy path and every flow the spec calls out.",
           "If everything works, output the exact line: BUILD_DONE",
           "If a flow is broken, output: ESCALATE: <what broke>",
         ].join("\n")
@@ -293,6 +335,40 @@ function makeE2e(ctx: Ctx, state: BuildState): RunValidateArgs["e2e"] {
       ok: verdict.kind === "done",
       output: verdict.kind === "done" ? "" : verdict.reason,
     }
+  }
+}
+
+/**
+ * Production wiring for the ensure-ticket step (mirrors `kickoff.ts`'s
+ * `defaultDeps`). Spawns `claude` with **non-strict** MCP so the Linear server
+ * from `.mcp.json` is available (same as the kickoff loop's select step — we do
+ * NOT pass the scoped next-devtools config here). Logs warnings to `build.log`.
+ */
+export function defaultEnsureDeps(
+  ctx: Ctx,
+  runHarnessFn: typeof runHarness = runHarness,
+): EnsureTicketDeps {
+  return {
+    runEnsureAgent: async ({ prompt, resultPath }) => {
+      mkdirSync(dirname(resultPath), { recursive: true })
+      // Clear any stale result so a crash before the agent writes can't surface
+      // an old id (mirrors the kickoff loop's select-result handling).
+      rmSync(resultPath, { force: true })
+      const argv = builderArgs({ bin: "claude", model: "opus" }, prompt)
+      const { code } = await runHarnessFn({
+        bin: "claude",
+        argv,
+        cwd: ctx.repoRoot,
+        logPath: ctx.logPath,
+      })
+      return {
+        code: code ?? 1,
+        resultRaw: existsSync(resultPath)
+          ? readFileSync(resultPath, "utf-8")
+          : null,
+      }
+    },
+    log: (message) => appendLog(ctx.logPath, message, ctx.now()),
   }
 }
 
@@ -321,6 +397,7 @@ async function planPhase(
   const prompt = planPrompt({
     feature: ctx.feature,
     buildDir: ctx.buildDir,
+    specPath: ctx.specPath,
     revising,
   })
   const verdict = await invokeBuilder(
@@ -339,6 +416,7 @@ async function planReviewPhase(
   const prompt = planReviewPrompt({
     feature: ctx.feature,
     buildDir: ctx.buildDir,
+    specPath: ctx.specPath,
   })
   const verdict = await invokeReviewer(
     ctx,
@@ -364,6 +442,7 @@ async function buildPhase(
   const prompt = buildPrompt({
     feature: ctx.feature,
     buildDir: ctx.buildDir,
+    specPath: ctx.specPath,
     validateFailuresPath: existsSync(failures) ? failures : undefined,
   })
   const verdict = await invokeBuilder(
@@ -410,6 +489,7 @@ async function reviewPhase(
       reviewPrompt({
         feature: ctx.feature,
         buildDir: ctx.buildDir,
+        specPath: ctx.specPath,
         round,
         baseBranch: ctx.baseBranch,
       }),
@@ -475,6 +555,7 @@ function buildPhasePrompt(ctx: Ctx): string {
   return buildPrompt({
     feature: ctx.feature,
     buildDir: ctx.buildDir,
+    specPath: ctx.specPath,
     validateFailuresPath: existsSync(failures) ? failures : undefined,
   })
 }
@@ -483,7 +564,7 @@ async function prPhase(ctx: Ctx, state: BuildState): Promise<TransitionSignal> {
   const verdict = await invokeBuilder(
     ctx,
     state.harnessMap.pr,
-    prPrompt(ctx.feature),
+    prPrompt(ctx.feature, state.linearIssueId),
     "BUILD_DONE",
   )
   return { phase: "pr", verdict }
@@ -635,19 +716,18 @@ export async function run({
   const repoRoot = detectRepoRoot(cwd)
   const branch = detectBranch(repoRoot)
   const buildDir = buildDirOf(repoRoot, feature)
-  const ctx: Ctx = {
+  const ctx = createCtx({
     repoRoot,
     feature,
     buildDir,
-    logPath: join(buildDir, "build.log"),
     baseBranch: BASE_BRANCH,
     env,
     now,
-  }
+  })
 
   const decision = decideStartup(
     {
-      designExists: existsSync(join(buildDir, "design.md")),
+      specExists: specExists(buildDir),
       state: readState(repoRoot, feature),
       needsInputExists: existsSync(join(buildDir, "NEEDS-INPUT.md")),
     },
@@ -666,6 +746,27 @@ export async function run({
 
   let state = writeState(repoRoot, decision.state, now())
   appendLog(ctx.logPath, `start: phase=${state.phase} branch=${branch}`, now())
+
+  // Ensure a Linear ticket exists + its description is synced to the spec, once
+  // per launch (best-effort — never throws, never blocks). `loadConfig` (not
+  // `validateConfig`): an unpinned config warns-and-skips so ordinary checkouts
+  // without the kickoff setup keep building. On resume this re-syncs by
+  // design, so a human spec edit before a re-run propagates (file wins).
+  const kickoffConfig = loadConfig(repoRoot, env)
+  state = writeState(
+    repoRoot,
+    await ensureLinearTicket(
+      {
+        buildDir,
+        specPath: ctx.specPath,
+        feature,
+        config: kickoffConfig,
+        state,
+      },
+      defaultEnsureDeps(ctx),
+    ),
+    now(),
+  )
 
   while (state.status === "running" && state.phase !== "done") {
     appendLog(ctx.logPath, `▶ phase: ${state.phase}`, now())

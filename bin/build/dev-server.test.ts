@@ -32,9 +32,32 @@ describe("deriveDevUrl", () => {
   })
 })
 
+const headersFrom = (h: Record<string, string>) => ({
+  get: (name: string) => h[name.toLowerCase()] ?? null,
+})
+
 describe("reachable", () => {
-  test("true on any HTTP response", async () => {
-    const ok = await reachable("https://x", async () => ({ ok: false }))
+  test("true on a normal app response (real dev server)", async () => {
+    const ok = await reachable("https://x", async () => ({
+      status: 200,
+      headers: headersFrom({ "x-portless": "1" }),
+    }))
+    expect(ok).toBe(true)
+  })
+
+  test("false on the portless unregistered-host 404 (no dev server)", async () => {
+    const ok = await reachable("https://x", async () => ({
+      status: 404,
+      headers: headersFrom({ "x-portless": "1", "content-type": "text/html" }),
+    }))
+    expect(ok).toBe(false)
+  })
+
+  test("true on a non-portless 404 (some other server is listening)", async () => {
+    const ok = await reachable("https://x", async () => ({
+      status: 404,
+      headers: headersFrom({}),
+    }))
     expect(ok).toBe(true)
   })
 

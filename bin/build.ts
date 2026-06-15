@@ -1,7 +1,7 @@
 /**
  * build: autonomous plan → build → review → PR pipeline.
  *
- * Takes a human-approved design at `build/[feature]/design.md` through a
+ * Takes a human-approved spec at `build/[feature]/spec.md` through a
  * resumable, multi-harness pipeline to a mergeable PR — no supervision. All
  * state lives on disk in `build/[feature]/`, so re-running resumes.
  *
