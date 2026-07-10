@@ -69,4 +69,39 @@ describe("selectCandidates", () => {
     const result = selectCandidates(signals, [], 10)
     expect(result.packet.map((s) => s.signalId)).toEqual(["c", "b", "a"])
   })
+
+  test("orders by recency (newest first) ahead of sourcePath/title", () => {
+    const signals = [
+      { ...sig("old", "build/a/observations.md", "apple"), recencyMs: 1_000 },
+      { ...sig("new", "build/z/observations.md", "zebra"), recencyMs: 3_000 },
+      { ...sig("mid", "build/m/observations.md", "mid"), recencyMs: 2_000 },
+    ]
+    const result = selectCandidates(signals, [], 10)
+    expect(result.packet.map((s) => s.signalId)).toEqual(["new", "mid", "old"])
+  })
+
+  test("signals without recency sort after dated ones, alphabetically", () => {
+    const signals = [
+      sig("undated-z", "build/z/observations.md", "z"),
+      { ...sig("dated", "build/m/observations.md", "m"), recencyMs: 1_000 },
+      sig("undated-a", "build/a/observations.md", "a"),
+    ]
+    const result = selectCandidates(signals, [], 10)
+    expect(result.packet.map((s) => s.signalId)).toEqual([
+      "dated",
+      "undated-a",
+      "undated-z",
+    ])
+  })
+
+  test("cap keeps the newest candidates, skipping the older backlog", () => {
+    const signals = [
+      { ...sig("oldest", "build/a/observations.md", "a"), recencyMs: 1_000 },
+      { ...sig("newest", "build/b/observations.md", "b"), recencyMs: 3_000 },
+      { ...sig("middle", "build/c/observations.md", "c"), recencyMs: 2_000 },
+    ]
+    const result = selectCandidates(signals, [], 2)
+    expect(result.packet.map((s) => s.signalId)).toEqual(["newest", "middle"])
+    expect(result.skipped).toBe(1)
+  })
 })

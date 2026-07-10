@@ -22,7 +22,8 @@ export type TransitionSignal =
   | { phase: "validate"; pass: boolean }
   | { phase: "review"; verdict: CodeReviewVerdict }
   | { phase: "pr"; verdict: BuilderVerdict }
-  | { phase: "monitor"; done: boolean }
+  | { phase: "monitor"; done: boolean; merged?: boolean }
+  | { phase: "cleanup"; done: boolean }
 
 export type Transition = {
   phase: Phase
@@ -83,8 +84,14 @@ export function transition(signal: TransitionSignal): Transition {
         : running("monitor")
 
     case "monitor":
-      return signal.done
-        ? { phase: "done", status: "done" }
-        : running("monitor")
+      // A merged PR routes through `cleanup` (worktree + herdr teardown); a
+      // closed-without-merge PR completes directly, leaving everything intact.
+      if (!signal.done) return running("monitor")
+      return signal.merged
+        ? running("cleanup")
+        : { phase: "done", status: "done" }
+
+    case "cleanup":
+      return { phase: "done", status: "done" }
   }
 }

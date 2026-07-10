@@ -16,6 +16,7 @@
 
 import { join } from "node:path"
 import type { KickoffConfig } from "../kickoff/config"
+import { orderedStateBuckets } from "./linear-state-order"
 import { ensureTicketPrompt } from "./prompts"
 import type { BuildState } from "./state"
 
@@ -53,20 +54,70 @@ export function shouldEnsureTicket(config: EnsureTicketConfig): EnsureDecision {
   return { skip: false, proceed: true }
 }
 
+/** Hard cap for a persisted Linear summary so `state.json` stays bounded. */
+export const MAX_SUMMARY_CHARS = 240
+
 /**
- * Parse the agent's `{"issueId","issueUuid"}` result (pure). Returns `null` on
- * malformed JSON or any missing/empty required field.
+ * Normalize an agent-supplied summary so it can't distort the panel (pure):
+ * trim, collapse internal whitespace/newlines to single spaces, and truncate to
+ * `MAX_SUMMARY_CHARS` (replacing the tail with `…`).
  */
-export function parseEnsureResult(
-  raw: string,
-): { issueId: string; issueUuid: string } | null {
+export function capSummary(raw: string): string {
+  const collapsed = raw.trim().replace(/\s+/g, " ")
+  if (collapsed.length <= MAX_SUMMARY_CHARS) return collapsed
+  return `${collapsed.slice(0, MAX_SUMMARY_CHARS - 1)}…`
+}
+
+/** A parsed ensure-ticket result: id/uuid required, orientation fields optional. */
+export type EnsureResult = {
+  issueId: string
+  issueUuid: string
+  title?: string
+  url?: string
+  summary?: string
+}
+
+/**
+ * Read `key` from `obj` only when it is a string that is non-empty after
+ * trimming, returning the trimmed value (else `undefined`). Whitespace-only
+ * values are treated as absent so they can't render a blank/malformed header.
+ */
+function optionalString(
+  obj: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = obj[key]
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed !== "" ? trimmed : undefined
+}
+
+/**
+ * Parse the agent's result JSON (pure). `issueId`/`issueUuid` are required —
+ * returns `null` on malformed JSON or a missing/empty id (empty after trim, so
+ * a whitespace-only id fails parse). `title`/`url`/`summary` are optional:
+ * absent/empty/whitespace-only/non-string values are simply omitted (never a
+ * parse failure), and `summary` is run through `capSummary` so it stays bounded.
+ */
+export function parseEnsureResult(raw: string): EnsureResult | null {
   try {
     const obj = JSON.parse(raw) as Record<string, unknown>
-    const issueId = obj.issueId
-    const issueUuid = obj.issueUuid
-    if (typeof issueId !== "string" || issueId === "") return null
-    if (typeof issueUuid !== "string" || issueUuid === "") return null
-    return { issueId, issueUuid }
+    const issueId = optionalString(obj, "issueId")
+    const issueUuid = optionalString(obj, "issueUuid")
+    if (issueId === undefined) return null
+    if (issueUuid === undefined) return null
+    const title = optionalString(obj, "title")
+    const url = optionalString(obj, "url")
+    const summaryRaw = optionalString(obj, "summary")
+    const summary =
+      summaryRaw !== undefined ? capSummary(summaryRaw) : undefined
+    return {
+      issueId,
+      issueUuid,
+      ...(title !== undefined ? { title } : {}),
+      ...(url !== undefined ? { url } : {}),
+      ...(summary !== undefined && summary !== "" ? { summary } : {}),
+    }
   } catch {
     return null
   }
@@ -122,6 +173,7 @@ export async function ensureLinearTicket(
       inProgressStateId: config.linear.inProgressStateId,
       projectId: config.linear.projectId,
       resultPath,
+      stateOrdering: orderedStateBuckets(config.linear),
       existingIssueId: state.linearIssueId,
       existingIssueUuid: state.linearIssueUuid,
     })
@@ -147,6 +199,11 @@ export async function ensureLinearTicket(
       ...state,
       linearIssueId: parsed.issueId,
       linearIssueUuid: parsed.issueUuid,
+      ...(parsed.title !== undefined ? { linearTitle: parsed.title } : {}),
+      ...(parsed.summary !== undefined
+        ? { linearSummary: parsed.summary }
+        : {}),
+      ...(parsed.url !== undefined ? { linearUrl: parsed.url } : {}),
     }
   } catch (err) {
     deps.log(

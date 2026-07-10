@@ -16,6 +16,13 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { dirname } from "node:path"
 
+/**
+ * `"sentry"` is retained ONLY for historical-row compatibility: the Sentry
+ * triage path no longer appends ledger rows (dedup now lives on live Sentry +
+ * Linear state — see `sentry-dedup.ts`). Do not narrow this union; committed
+ * `ledger.jsonl` rows still carry `source:"sentry"` and `harvest`/reconcile
+ * parse them.
+ */
 export type LedgerSource = "observations" | "sentry"
 
 export type LedgerOutcome =

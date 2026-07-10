@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process"
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
+import { boundedConcat, safeAppend, safeStreamWrite } from "./safe-output"
 
 export type CheckResult = { name: string; ok: boolean; output: string }
 
@@ -59,9 +60,12 @@ function defaultRunCommand(logPath: string): RunCommand {
       let output = ""
       const onData = (chunk: Buffer) => {
         const text = chunk.toString()
-        process.stdout.write(text)
-        appendFileSync(logPath, text)
-        output += text
+        // Same crash-proofing as the harness sink: the pipe echo and log append
+        // must never escape, and the in-memory copy is tail-bounded (validate
+        // output feeds only pass/fail + a failure digest).
+        safeStreamWrite(process.stdout, text)
+        safeAppend(logPath, text)
+        output = boundedConcat(output, text)
       }
       child.stdout.on("data", onData)
       child.stderr.on("data", onData)
@@ -76,6 +80,8 @@ export type RunValidateArgs = {
   runCommand?: RunCommand
   /** Optional e2e step (dev-server-guarded browser run); skipped if omitted. */
   e2e?: () => Promise<CheckResult>
+  /** Optional evals step (Convex-dev + model-API-key guarded eval run); skipped if omitted. */
+  evals?: () => Promise<CheckResult>
 }
 
 /**
@@ -87,6 +93,7 @@ export async function runValidate({
   logPath,
   runCommand,
   e2e,
+  evals,
 }: RunValidateArgs): Promise<ValidateResult> {
   const run = runCommand ?? defaultRunCommand(logPath)
   const results: CheckResult[] = []
@@ -98,6 +105,9 @@ export async function runValidate({
   }
 
   if (e2e) results.push(await e2e())
+  // Evals runs AFTER e2e (both quality gates; both only reached once
+  // typecheck/lint/test pass via the fail-fast above).
+  if (evals) results.push(await evals())
 
   return summarizeValidation(results)
 }

@@ -22,6 +22,12 @@ export type LinearConfig = {
   triageStateId: string
   readyStateId: string
   inProgressStateId: string
+  /**
+   * In-Review workflow state; OPTIONAL — the build's monitor phase advances the
+   * ticket here. Unpinned → graceful skip (the move is skipped, the build still
+   * runs). Not in `REQUIRED_LINEAR_KEYS`.
+   */
+  inReviewStateId: string
   doneStateId: string
   /** Any workflow state that means "rejected/won't-do" — tombstones its signals. */
   rejectedStateIds: string[]
@@ -46,11 +52,13 @@ export type SentryConfig = {
 export type CapsConfig = {
   maxNewIssuesPerRun: number
   maxInvestigationsPerRun: number
+  /** Hard cap on adversarial-review rounds per candidate ticket (triage-sentry). */
+  adversarialReviewRounds: number
 }
 
 export type WorktreeConfig = {
   /** Which tool provisions build worktrees — see `bin/kickoff/worktree-provider.ts`. */
-  provider: "git" | "superset"
+  provider: "git" | "superset" | "herdr"
   /** Superset project UUID for this repo — required when provider is "superset". */
   supersetProjectId: string
 }
@@ -66,8 +74,13 @@ export type KickoffConfig = {
 
 /** Tunable defaults (plan §0.4). Linear IDs have no default — they must be pinned. */
 export const DEFAULT_SENTRY: SentryConfig = {
-  minEvents: 25,
-  minAffectedUsers: 3,
+  minEvents: 2,
+  // Floor stays 0 by design. User attribution is a lower bound — `users: 0`
+  // means unattributed, not unaffected — so a positive floor would silently
+  // drop real errors that Sentry couldn't attribute. Never reintroduce a
+  // positive floor casually (see the predicate comment in sentry-filter.ts and
+  // the boost-only `users` tiebreak in prioritizeSentryCandidates).
+  minAffectedUsers: 0,
   lookbackDays: 14,
   environments: ["production"],
   requireSeenSinceLatestDeploy: true,
@@ -76,7 +89,8 @@ export const DEFAULT_SENTRY: SentryConfig = {
 
 export const DEFAULT_CAPS: CapsConfig = {
   maxNewIssuesPerRun: 5,
-  maxInvestigationsPerRun: 3,
+  maxInvestigationsPerRun: 5,
+  adversarialReviewRounds: 3,
 }
 
 export const DEFAULT_MAX_CONCURRENT_BUILDS = 1
@@ -92,6 +106,7 @@ const EMPTY_LINEAR: LinearConfig = {
   triageStateId: "",
   readyStateId: "",
   inProgressStateId: "",
+  inReviewStateId: "",
   doneStateId: "",
   rejectedStateIds: [],
   sourceObservationsLabelId: "",
@@ -106,6 +121,7 @@ const LINEAR_ENV_OVERRIDES: Record<string, keyof LinearConfig> = {
   KICKOFF_LINEAR_TRIAGE_STATE_ID: "triageStateId",
   KICKOFF_LINEAR_READY_STATE_ID: "readyStateId",
   KICKOFF_LINEAR_IN_PROGRESS_STATE_ID: "inProgressStateId",
+  KICKOFF_LINEAR_IN_REVIEW_STATE_ID: "inReviewStateId",
   KICKOFF_LINEAR_DONE_STATE_ID: "doneStateId",
   KICKOFF_LINEAR_SOURCE_OBSERVATIONS_LABEL_ID: "sourceObservationsLabelId",
   KICKOFF_LINEAR_SOURCE_SENTRY_LABEL_ID: "sourceSentryLabelId",
@@ -200,9 +216,13 @@ export function validateConfig(config: KickoffConfig): void {
   }
 
   const { worktree } = config
-  if (worktree.provider !== "git" && worktree.provider !== "superset") {
+  if (
+    worktree.provider !== "git" &&
+    worktree.provider !== "superset" &&
+    worktree.provider !== "herdr"
+  ) {
     throw new Error(
-      `unknown worktree provider "${worktree.provider}" — expected "git" or "superset" (build/kickoff/config.json → worktree.provider).`,
+      `unknown worktree provider "${worktree.provider}" — expected "git", "superset", or "herdr" (build/kickoff/config.json → worktree.provider).`,
     )
   }
   // `?? ""` guards a JSON `null`, which survives the defaults spread.

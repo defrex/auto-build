@@ -13,6 +13,7 @@ const fullLinear = {
   triageStateId: "s_triage",
   readyStateId: "s_ready",
   inProgressStateId: "s_progress",
+  inReviewStateId: "s_review",
   doneStateId: "s_done",
   rejectedStateIds: ["s_rejected"],
   sourceObservationsLabelId: "l_obs",
@@ -50,6 +51,23 @@ describe("resolveConfig", () => {
     expect(config.maxConcurrentBuilds).toBe(3)
   })
 
+  test("defaults caps.adversarialReviewRounds to 3 when absent", () => {
+    const config = resolveConfig({
+      linear: fullLinear,
+      caps: { maxNewIssuesPerRun: 1 },
+    })
+    expect(config.caps.adversarialReviewRounds).toBe(3)
+    expect(DEFAULT_CAPS.adversarialReviewRounds).toBe(3)
+  })
+
+  test("respects a caps.adversarialReviewRounds override", () => {
+    const config = resolveConfig({
+      linear: fullLinear,
+      caps: { adversarialReviewRounds: 5 },
+    })
+    expect(config.caps.adversarialReviewRounds).toBe(5)
+  })
+
   test("env vars override Linear IDs from the file", () => {
     const config = resolveConfig(
       { linear: { ...fullLinear, teamId: "from_file" } },
@@ -74,6 +92,28 @@ describe("resolveConfig", () => {
     expect(config.linear.teamId).toBe("team_1")
   })
 
+  test("defaults inReviewStateId to '' when the file omits it (old configs resolve cleanly)", () => {
+    const { inReviewStateId, ...rest } = fullLinear
+    const config = resolveConfig({ linear: rest })
+    expect(config.linear.inReviewStateId).toBe("")
+  })
+
+  test("KICKOFF_LINEAR_IN_REVIEW_STATE_ID overrides the file value", () => {
+    const config = resolveConfig(
+      { linear: { ...fullLinear, inReviewStateId: "from_file" } },
+      { KICKOFF_LINEAR_IN_REVIEW_STATE_ID: "from_env" },
+    )
+    expect(config.linear.inReviewStateId).toBe("from_env")
+  })
+
+  test("empty KICKOFF_LINEAR_IN_REVIEW_STATE_ID does not clobber the file value", () => {
+    const config = resolveConfig(
+      { linear: { ...fullLinear, inReviewStateId: "s_review" } },
+      { KICKOFF_LINEAR_IN_REVIEW_STATE_ID: "" },
+    )
+    expect(config.linear.inReviewStateId).toBe("s_review")
+  })
+
   test("defaults rejectedStateIds to [] when missing", () => {
     const { rejectedStateIds, ...rest } = fullLinear
     const config = resolveConfig({ linear: rest })
@@ -92,6 +132,22 @@ describe("resolveConfig", () => {
     })
     expect(config.worktree.provider).toBe("superset")
     expect(config.worktree.supersetProjectId).toBe("proj-uuid")
+  })
+
+  test("accepts the herdr worktree provider", () => {
+    const config = resolveConfig({
+      linear: fullLinear,
+      worktree: { provider: "herdr" },
+    })
+    expect(config.worktree.provider).toBe("herdr")
+  })
+
+  test("KICKOFF_WORKTREE_PROVIDER=herdr env override resolves to herdr", () => {
+    const config = resolveConfig(
+      { linear: fullLinear },
+      { KICKOFF_WORKTREE_PROVIDER: "herdr" },
+    )
+    expect(config.worktree.provider).toBe("herdr")
   })
 
   test("env vars override the worktree provider from the file", () => {
@@ -143,12 +199,27 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).not.toThrow()
   })
 
+  test("inReviewStateId is optional — validation passes when it is empty", () => {
+    const config = resolveConfig({
+      linear: { ...fullLinear, inReviewStateId: "" },
+    })
+    expect(() => validateConfig(config)).not.toThrow()
+  })
+
   test("superset provider requires supersetProjectId", () => {
     const config = resolveConfig({
       linear: fullLinear,
       worktree: { provider: "superset" },
     })
     expect(() => validateConfig(config)).toThrow(/supersetProjectId/)
+  })
+
+  test("herdr provider does not require supersetProjectId", () => {
+    const config = resolveConfig({
+      linear: fullLinear,
+      worktree: { provider: "herdr" },
+    })
+    expect(() => validateConfig(config)).not.toThrow()
   })
 
   test("unknown worktree provider is rejected", () => {

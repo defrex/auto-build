@@ -6,9 +6,12 @@
  *  - seen-again (known + still open → emit a `SeenUpdate`, never a new candidate),
  *  - fresh (never seen → candidates for the agent to cluster + file).
  *
- * The fresh set is ordered deterministically (sourcePath, then title) and capped;
- * overflow is reported via `skipped` and simply absent from the ledger, so the
- * next run reconsiders it (design's "Bounded run size — overflow is not lost").
+ * The fresh set is ordered newest-first by `recencyMs` (falling back to
+ * sourcePath, then title, for ties and undated signals) and capped; overflow is
+ * reported via `skipped` and simply absent from the ledger, so the next run
+ * reconsiders it (design's "Bounded run size — overflow is not lost"). Recency
+ * ordering means a daily harvest consumes yesterday's observations first and
+ * spends the remaining cap draining the older backlog.
  *
  * Identity is per-occurrence (observation-signals.ts), so two fresh occurrences
  * of the "same" underlying problem in different dirs are BOTH candidates here;
@@ -23,6 +26,8 @@ export type SelectableSignal = {
   signalId: string
   sourcePath: string
   title: string
+  /** Epoch ms the observation last changed (git commit time). Absent → sorts last. */
+  recencyMs?: number
 }
 
 /** A known-open signal seen again this run — bump its seenCount/lastSeenAt. */
@@ -56,6 +61,7 @@ export function selectCandidates<T extends SelectableSignal>(
 
   fresh.sort(
     (a, b) =>
+      (b.recencyMs ?? 0) - (a.recencyMs ?? 0) ||
       a.sourcePath.localeCompare(b.sourcePath) ||
       a.title.localeCompare(b.title),
   )

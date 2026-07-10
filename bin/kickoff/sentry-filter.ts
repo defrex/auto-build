@@ -11,28 +11,6 @@
 
 import type { SentryConfig } from "./config"
 
-/** The fields that make a Sentry occurrence's identity unambiguous + scoped. */
-export type SentryIdParts = {
-  organizationSlug: string
-  projectSlug: string
-  /** Sentry's upstream issue fingerprint (already deduped by Sentry). */
-  shortId: string
-}
-
-/**
- * The canonical, project-scoped Sentry signal id. Defined as CODE (not agent
- * prose) so the dedup format can't drift between runs — the same rule the
- * observation path follows with `signalIdFor` (the design's "LLMs never decide
- * identity"). The triage-sentry skill must build the id by this exact format.
- */
-export function sentrySignalId({
-  organizationSlug,
-  projectSlug,
-  shortId,
-}: SentryIdParts): string {
-  return `sentry:${organizationSlug}/${projectSlug}/${shortId}`
-}
-
 export type SentryIssueShape = {
   shortId: string
   events: number
@@ -84,6 +62,12 @@ export function passesSentryThreshold(
       reason: `events ${issue.events} < min ${config.minEvents}`,
     }
   }
+  // The floor is 0 by design (see DEFAULT_SENTRY.minAffectedUsers). User
+  // attribution isn't reliably present on Sentry events — `users: 0` means
+  // unattributed, not unaffected — so a positive floor would silently drop real
+  // errors. `users` is a lower bound, never a penalty; the same rationale makes
+  // it boost-only in prioritizeSentryCandidates. Don't reintroduce a positive
+  // floor casually.
   if (issue.users < config.minAffectedUsers) {
     return {
       pass: false,
@@ -121,4 +105,51 @@ export function passesSentryThreshold(
   }
 
   return { pass: true, reason: "passes thresholds" }
+}
+
+export type SentryPriorityInput = {
+  shortId: string
+  events: number
+  users: number
+  /**
+   * True iff the issue appeared in the is:regressed OR is:escalating actionable
+   * result set (Tier A). The triage-sentry skill captures this membership when
+   * pulling the actionable set. `status` alone is insufficient — an issue can be
+   * status:"unresolved" yet be escalating.
+   */
+  isRegressedOrEscalating: boolean
+}
+
+/**
+ * Deterministic worst-first order for threshold survivors, applied BEFORE the
+ * investigation cap (see the triage-sentry skill, step 4). With the low
+ * `minEvents` floor, survivors routinely exceed `caps.maxInvestigationsPerRun`,
+ * so the cap must be taken from an ordered pool rather than an unordered one.
+ *
+ * Ordering (spec PRO-677 §Prioritization):
+ *   1. Tier A (`isRegressedOrEscalating`) before Tier B. The tier is FLAT —
+ *      no ranking between `regressed` and `escalating` (both set the flag).
+ *   2. Within a tier: `events` descending.
+ *   3. Tiebreak: `users` descending — boost-only. Attribution is a lower bound
+ *      (`users: 0` = unattributed, not unaffected), so it is never a primary
+ *      key or a penalty (mirrors the minAffectedUsers rationale).
+ *   4. Final tiebreak: `shortId` ascending — a total order so the result is
+ *      deterministic regardless of input order (not reliant on sort stability).
+ *
+ * Pure: returns a new array; does not mutate the input. Generic so callers can
+ * pass richer candidate objects and get them back reordered with all fields.
+ * Deliberately NO weighted score — with a cap of 5 and overflow deferral, tuned
+ * weights are false precision.
+ */
+export function prioritizeSentryCandidates<T extends SentryPriorityInput>(
+  candidates: readonly T[],
+): T[] {
+  return [...candidates].sort((a, b) => {
+    if (a.isRegressedOrEscalating !== b.isRegressedOrEscalating) {
+      return a.isRegressedOrEscalating ? -1 : 1
+    }
+    if (a.events !== b.events) return b.events - a.events
+    if (a.users !== b.users) return b.users - a.users
+    return a.shortId < b.shortId ? -1 : a.shortId > b.shortId ? 1 : 0
+  })
 }

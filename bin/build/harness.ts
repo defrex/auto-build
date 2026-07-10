@@ -10,6 +10,7 @@
 import { spawn } from "node:child_process"
 import { appendFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
+import { boundedConcat, safeAppend, safeStreamWrite } from "./safe-output"
 import type { HarnessEntry } from "./state"
 
 export type BuilderArgsOpts = {
@@ -69,11 +70,22 @@ export function reviewerArgs(
 
 export type RunResult = { code: number | null; output: string }
 
+/**
+ * Spawn options shared by kickoff's pass children. In monitor mode `detached`
+ * puts the child in its own process group so a terminal SIGINT to the monitor's
+ * foreground group doesn't reach it (the monitor finishes the in-flight pass).
+ */
+export function childGroupOptions(detached: boolean): { detached?: true } {
+  return detached ? { detached: true } : {}
+}
+
 export type RunHarnessArgs = {
   bin: string
   argv: string[]
   cwd: string
   logPath: string
+  /** Spawn the child in its own process group (monitor mode). Default false. */
+  detached?: boolean
 }
 
 /**
@@ -86,6 +98,7 @@ export function runHarness({
   argv,
   cwd,
   logPath,
+  detached,
 }: RunHarnessArgs): Promise<RunResult> {
   mkdirSync(dirname(logPath), { recursive: true })
   appendFileSync(logPath, `\n$ ${bin} ${argv.join(" ")}\n`)
@@ -94,21 +107,25 @@ export function runHarness({
     const child = spawn(bin, argv, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
+      ...childGroupOptions(detached ?? false),
     })
 
     let output = ""
 
     child.stdout.on("data", (chunk: Buffer) => {
       const text = chunk.toString()
-      process.stdout.write(text)
-      appendFileSync(logPath, text)
-      output += text
+      // Crash-proof: the echo to the background-shell pipe can EPIPE and the
+      // log append can fail; neither may take the orchestrator down. The
+      // in-memory copy is tail-bounded so a chatty child can't exhaust memory.
+      safeStreamWrite(process.stdout, text)
+      safeAppend(logPath, text)
+      output = boundedConcat(output, text)
     })
 
     child.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString()
-      process.stderr.write(text)
-      appendFileSync(logPath, text)
+      safeStreamWrite(process.stderr, text)
+      safeAppend(logPath, text)
     })
 
     child.on("error", reject)

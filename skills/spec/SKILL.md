@@ -1,75 +1,66 @@
 ---
 name: spec
-description: Design a feature through conversation, producing a design doc at build/[feature]/spec.md. Right-sizes the doc to the task — a few lines for something simple, a fuller structured spec for something larger. Infers the feature directory from the conversation — no argument needed. Accepts a Linear ticket ref (e.g. DIS-123) as the argument to seed the design from the ticket and sync the finished spec back to it. Stops after the design is written — switch to plan mode for implementation planning.
-argument-hint: "[feature-name | linear-ticket-ref] (optional)"
+description: Design a feature through conversation and capture it as a Linear ticket. Running /spec always means a Linear ticket should exist when you're done — pass a ticket ref (e.g. DIS-123) to work on that ticket, or pass nothing and the agent creates one in the Product team's Triage. Right-sizes the design to the task. Tickets that aren't fully defined get a needs-definition label; fully-defined ones don't. Stops after the design is written — switch to plan mode for implementation planning.
+argument-hint: "[linear-ticket-ref] (optional)"
 user-invocable: true
-allowed-tools: Read, Write, Edit, Glob, Grep, Bash(mkdir *), mcp__linear__get_issue, mcp__linear__list_comments, mcp__linear__save_issue
+allowed-tools: Read, Glob, Grep, mcp__linear__get_issue, mcp__linear__list_comments, mcp__linear__list_issue_labels, mcp__linear__save_issue
 ---
 
 # /spec
 
-Produce a feature design at `build/[feature]/spec.md`. Stop when the design is satisfactory — do not plan or implement. The user will switch to plan mode next.
+`/spec` designs a feature through conversation and captures the result as a **Linear ticket**. Running `/spec` always means a Linear ticket should exist when the design settles — either the one you were handed, or one you create. There is **no local file**: the ticket *is* the spec, and it's the source of truth other flows (`/kickoff`, `/build`) read from.
 
-**This is a requirements doc, not an implementation plan.** Its job is to specify *what* the feature must do and *why* — the behavior, constraints, and outcomes that define success — clearly enough that `/build` can take it from there. `/build` already owns the development planning: choosing files, functions, data structures, and the sequence of changes. So the design doc should not do that work. Describe the requirement, not the diff. When you find yourself enumerating specific files to edit or code to write, you've gone too far — pull back to the behavior that work needs to produce.
+Produce a design and **stop when it's satisfactory — do not plan or implement.** The user will switch to plan mode next.
 
-**Level the detail to the task.** A design doc is a tool, not a ceremony — its job is to capture exactly enough for `/build` to implement the feature well, and no more. Prefer the smallest doc that does that. A simple, well-understood change might need only a couple of sentences and a short bullet list; a large or subtle feature with real product decisions warrants the fuller structure below. Match the doc to the nature of the task so this process stays worth using for small work as well as large. Bias toward shorter: if a section isn't carrying a requirement, cut it.
+Two entry points, one destination:
 
-The `[feature]` directory name is normally **inferred from the conversation**, not supplied as an argument. An argument, when given, is an explicit override — either a feature name or a **Linear ticket ref** (see Step 1).
+- **Ticket given** — the argument is a Linear ticket ref (e.g. `DIS-123` or a Linear issue URL). Work on that ticket; its title and description are the starting brief.
+- **No ticket** — generate one. Anything you're handed that isn't a ticket ref (a feature name, a sentence of intent) is just the seed topic for the conversation. You'll **create the ticket in the Product team's Triage** when the design settles.
 
-## Step 1: Resolve the feature directory
+**This is a requirements doc, not an implementation plan.** Its job is to specify *what* the feature must do and *why* — the behavior, constraints, and outcomes that define success — clearly enough that `/build` can take it from there. `/build` already owns the development planning: choosing files, functions, data structures, and the sequence of changes. So the design should not do that work. Describe the requirement, not the diff. When you find yourself enumerating specific files to edit or code to write, you've gone too far — pull back to the behavior that work needs to produce.
 
-- **If the first argument is a Linear ticket ref** — an issue identifier like `DIS-123` (team key, dash, number) or a Linear issue URL — this is **ticket mode**:
-  1. Fetch the issue with `mcp__linear__get_issue` (and skim `mcp__linear__list_comments` for context that has accrued on the ticket).
-  2. The ticket's title and description are the starting brief — base the conversation on them. In Step 2, open by summarizing your reading of the ticket and asking what the user wants to clarify, change, or add, rather than asking them to explain from scratch.
-  3. Derive a short, descriptive kebab-case feature directory name from the ticket title, same as any other feature — e.g. DIS-123 "Make reads bounded" → `bounded-reads`. Don't embed the ticket id in the directory name; the ref lives inside the spec instead (Step 4). State the name so the user can correct it.
-  4. If `build/[feature]/spec.md` already exists for that directory, read it, summarize, and iterate (Step 5).
-  5. Ticket mode adds one obligation: when the design settles, **sync the finished spec back to the ticket** (Step 5). Carry the ticket ref through the session.
-- **If an argument is provided and is not a ticket ref**, use it (kebab-cased) as the feature directory name. If `build/[feature]/spec.md` already exists, read it, give a brief summary, and ask the user what they'd like to change — then iterate (Step 5). Otherwise proceed to Step 2.
-- **If no argument is provided**, don't pick a name yet — you'll infer it from the conversation in Step 3. Do not create any directory. Proceed to Step 2.
+**Level the detail to the task.** A design is a tool, not a ceremony — its job is to capture exactly enough for `/build` to implement the feature well, and no more. Prefer the smallest description that does that. A simple, well-understood change might need only a couple of sentences and a short bullet list; a large or subtle feature with real product decisions warrants the fuller structure below. Bias toward shorter: if a section isn't carrying a requirement, cut it.
+
+## Step 1: Resolve the target
+
+- **If the first argument is a Linear ticket ref** — an issue identifier like `DIS-123` (team key, dash, number) or a Linear issue URL — you're working on that **existing** ticket.
+  1. Fetch it with `mcp__linear__get_issue`, and skim `mcp__linear__list_comments` for context that has accrued on the ticket.
+  2. **Note its current labels and current state** — you'll need both in Step 5 (`save_issue` replaces the label set, so you must pass the full desired set).
+  3. The ticket's title and description are the starting brief. In Step 2, open by summarizing your reading of the ticket and asking what the user wants to clarify, change, or add — don't make them explain from scratch.
+- **If no argument is provided, or the argument is not a ticket ref** — you're creating a **new** ticket. Treat any non-ref argument as the seed topic for the conversation. **Do not create the ticket yet** — carry the topic into Step 2; you'll create the issue in Step 5 once the design has taken shape.
 
 ## Step 2: Discuss
 
 Ask the user to explain what they're looking for. Have a conversation to understand requirements, constraints, and goals before writing anything.
 
-In ticket mode, the ticket description already carries the initial requirements — lead with your summary of it and drive the discussion toward what's ambiguous, missing, or decision-shaped in the ticket.
+For an existing ticket, the description already carries the initial requirements — lead with your summary of it and drive the discussion toward what's ambiguous, missing, or decision-shaped.
 
-Do NOT explore the codebase, draft the design doc, or create any directory yet. Wait for the user to explain and for any discussion to resolve.
+Do NOT explore the codebase or draft the design yet. Wait for the user to explain and for any discussion to resolve.
 
-## Step 3: Name the feature and check for an existing design
+## Step 3: Explore and draft
 
 Once you understand what the user wants:
 
-1. **Settle the directory name** (if it wasn't given as an argument). Derive a short, descriptive kebab-case name from the task description — e.g. "add a snooze button to todos" → `todo-snooze`. State the name you've chosen in one line so the user can correct it before you write anything.
-2. **Check for an existing design** at `build/[feature]/spec.md`. If it exists, read it, summarize what's in it, and ask what they'd like to change — then iterate (Step 5) rather than drafting fresh.
-
-## Step 4: Explore and draft
-
-This step is for a **fresh** design. If `build/[feature]/spec.md` already existed (found in Step 1 or 3), skip it — the directory and doc are already there; go straight to Step 5 and iterate.
-
-Once you understand what the user wants and have a name:
-
 1. **Judge how much design the task actually needs.** Explore the codebase enough to write requirements that are grounded and unambiguous — to use the right names for existing concepts and to know what's already there — but scale that effort to the work. You're exploring to understand the problem, not to design the solution; resist drafting the implementation while you read.
-2. Create the `build/[feature]/` directory and draft a design doc at `build/[feature]/spec.md`, **sized to the task**. Write it in terms of requirements — what the feature must do, how it should behave, what constraints and edge cases matter, and how you'd know it's done:
-   - **Small / well-understood change** → keep it short. A sentence or two of intent plus a short bullet list of the required behavior is often the whole doc. Don't force in sections you have nothing to say under.
+2. Draft the design **as the content of the ticket description**, sized to the task (see Format notes). Write it in terms of requirements — what the feature must do, how it should behave, what constraints and edge cases matter, and how you'd know it's done. Keep the working draft in the conversation while you iterate; there is no local file.
+   - **Small / well-understood change** → keep it short. A sentence or two of intent plus a short bullet list of the required behavior is often the whole thing. Don't force in sections you have nothing to say under.
    - **Larger / subtle feature** → use the fuller structure:
      - **Overview**: what the feature does and why — the problem and the desired outcome
      - **Requirements**: the behavior it must exhibit, the constraints it must respect, and the edge cases it must handle. State the *what*, and the *why* where it isn't obvious; leave the *how* to `/build`.
-     - **Open Questions**: anything that needs user input or further thought
+     - **Open Questions**: anything that needs user input or further thought (these also drive the `needs-definition` call in Step 5)
    - Most tasks land in between — include the sections that earn their place and drop the rest.
 
-In ticket mode, the spec must carry the ticket ref: put a `Ticket: [DIS-123](https://linear.app/...)` line directly under the H1, linking to the issue. This is what ties the spec back to Linear for `/build`, branch naming, and the description sync.
-
-Where genuine product or architectural decisions exist — a real fork the implementer shouldn't be left to guess at — capture the decision and its rationale. That's a requirement, not an implementation detail. But don't pre-specify the routine mechanics: which files to touch, what to name a function, the shape of a helper. Point at the relevant area of the codebase for orientation when it helps (`convex/schema.ts`, "the todo row component"), rather than enumerating the edits to make.
+Where genuine product or architectural decisions exist — a real fork the implementer shouldn't be left to guess at — capture the decision and its rationale. That's a requirement, not an implementation detail. But don't pre-specify the routine mechanics: which files to touch, what to name a function, the shape of a helper. Point at the relevant area of the codebase for orientation when it helps (`convex/schema.ts`, "the todo row component") rather than enumerating the edits to make.
 
 ### Format notes
 
-The file is Markdown. Use standard Markdown — headings, lists, fenced code blocks, tables — and lean on it freely (tables for side-by-side comparisons, `<details>` for collapsible sections, fenced blocks for diagrams or code) when it clarifies the design. Don't add structure for its own sake; plain prose and lists are fine when that's all the content needs.
+The ticket description renders Markdown. Use standard Markdown — headings, lists, fenced code blocks, tables — and lean on it freely (tables for side-by-side comparisons, `<details>` for collapsible sections, fenced blocks for diagrams or code) when it clarifies the design. Don't add structure for its own sake; plain prose and lists are fine when that's all the content needs.
+
+**Don't open the description with an H1 title** — the ticket already has a title. Start at the first section (e.g. `## Overview`) or with the intro prose. And **don't add a `Ticket:` self-reference line** — the issue already is the source of truth.
 
 A short design might be as little as:
 
 ```md
-# todo-snooze
-
 Let users snooze a todo so it disappears from the active list until a time they pick, then reappears.
 
 - Snoozing is per-todo and reversible — the user can un-snooze before the time passes.
@@ -83,8 +74,6 @@ Note what it does *not* say: no schema field, no component file, no filter logic
 A fuller design uses headed sections:
 
 ```md
-# [feature]
-
 ## Overview
 
 ...
@@ -98,16 +87,49 @@ A fuller design uses headed sections:
 - ...
 ```
 
-## Step 5: Iterate
+## Step 4: Iterate
 
-Tell the user what you've drafted and ask for feedback. As they request changes, update `build/[feature]/spec.md` accordingly.
+Tell the user what you've drafted and ask for feedback. As they request changes, update the working draft accordingly.
 
-When the user is satisfied, stop. Suggest they switch to plan mode to continue.
+When the user is satisfied, go to Step 5 and write the ticket. Don't write to Linear on every draft tweak — do it once the design settles (and again on each later sign-off if the session resumes and the design changes).
 
-### Ticket mode: sync the spec back to Linear
+## Step 5: Write the ticket to Linear
 
-In ticket mode, once the design settles, update the Linear ticket so it carries the resolved spec — the ticket is the source of truth other flows (e.g. `/kickoff`) read from:
+The ticket is the artifact `/spec` produces. Once the design settles:
 
-- Use `mcp__linear__save_issue` to replace the issue description with the final `spec.md` contents. The spec was grounded in the original description and supersedes it; Linear keeps description history, so nothing is lost. Omit the `Ticket:` line when syncing — it would be a self-reference inside the issue.
-- Sync after the user signs off — not on every draft tweak. If the session resumes later and the spec changes again, re-sync on the next sign-off.
-- If the sync fails (auth, permissions), say so explicitly and give the user the spec path so they can paste it — don't silently skip it.
+### Assess whether the issue is fully defined
+
+A ticket is **fully defined** when its requirements are clear and unambiguous enough that `/build` could implement them without further product input — no open decisions, no "we'll figure this out later," nothing a human still has to resolve. If unresolved **Open Questions** or decision-shaped gaps remain, it is **not** fully defined.
+
+This drives one label, `needs-definition`:
+
+- **Not fully defined** → the ticket carries `needs-definition`. Keep the open questions in the description so the gap is visible. (`/kickoff` skips Ready issues with this label, so it won't be picked up until a human fleshes it out.)
+- **Fully defined** → the ticket must **not** carry `needs-definition` — don't add it on a fresh ticket, and remove it from an existing one.
+
+If you need the label's id, look it up with `mcp__linear__list_issue_labels`; `save_issue` also accepts label names directly.
+
+### New ticket
+
+Create it with `mcp__linear__save_issue`:
+
+- `team`: `"Product"`
+- `state`: `"Triage"` — new tickets land in Triage by default
+- `title`: a short, descriptive title
+- `description`: the final design (no H1, no `Ticket:` line)
+- `labels`: include `"needs-definition"` **only if** the issue is not fully defined (per the assessment above); otherwise omit it
+
+Report the created issue's identifier and URL back to the user.
+
+### Existing ticket
+
+Update it with `mcp__linear__save_issue` (pass the issue `id`):
+
+- **Replace the description** with the final design. The design was grounded in the original description and supersedes it; Linear keeps description history, so nothing is lost.
+- **Set the label set.** `save_issue` replaces labels wholesale, so pass the ticket's current labels (captured in Step 1) and then add or drop `needs-definition` according to the assessment above. Leave the ticket's state as-is unless the user asks to move it.
+
+### Either way
+
+- Do this after the user signs off — not on every draft tweak. If the session resumes later and the design changes again, re-write on the next sign-off.
+- If the write fails (auth, permissions), say so explicitly and give the user the full design text so they can paste it into Linear themselves — don't silently skip it.
+
+When the ticket is written, stop. Suggest the user switch to plan mode to continue.

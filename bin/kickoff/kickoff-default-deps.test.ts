@@ -1,33 +1,22 @@
 /**
- * Integration coverage for `defaultDeps().runSelect` — the production wiring
- * that spawns the select+claim agent and reads its result file back. The spawn
- * layer (`runHarness`) is stubbed via constructor DI, so no subprocess runs.
- *
- * `runSelect` computes the result/log paths internally, so the test recomputes
- * the expected paths and pins them: if the writer's and reader's paths ever
- * drift apart, the read-back hits a missing file and the test fails.
+ * Integration coverage for `defaultDeps().runSelect` and
+ * `defaultRestoreDeps().runRestoreSelect` — the production wiring that threads
+ * the injected Linear GraphQL client into the deterministic select/restore
+ * runners. The transport is faked via constructor DI, so no network call runs;
+ * this pins that the wiring forwards through and maps the contracts back.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs"
-import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
-import type { RunHarnessArgs, RunResult } from "../build/harness"
+import { describe, expect, test } from "bun:test"
 import { type KickoffConfig, resolveConfig } from "./config"
-import { defaultDeps } from "./kickoff"
+import { defaultDeps, defaultRestoreDeps } from "./kickoff"
+import type { LinearGraphql } from "./linear-client"
 
 const LINEAR = {
   teamId: "t",
-  projectId: "p",
+  projectId: "",
   triageStateId: "s_t",
-  readyStateId: "s_r",
-  inProgressStateId: "s_p",
+  readyStateId: "s_ready",
+  inProgressStateId: "s_inprog",
   doneStateId: "s_d",
   rejectedStateIds: [],
   sourceObservationsLabelId: "l_o",
@@ -43,116 +32,112 @@ const config: KickoffConfig = resolveConfig({
   worktree: { provider: "git" },
 })
 
-/** Build a `typeof runHarness` fake: records its args, optionally writes a
- * fixture, returns a caller-supplied result. */
-function makeFakeHarness(opts: {
-  onCall?: (args: RunHarnessArgs) => void
-  write?: { path: string; contents: string }
-  result: RunResult
-}): {
-  fn: (args: RunHarnessArgs) => Promise<RunResult>
-  calls: RunHarnessArgs[]
+const empty = { hasNextPage: false, endCursor: null }
+
+/** A GraphQL fake that routes by operation name to a canned payload. */
+function fakeGraphql(routes: Record<string, unknown>): {
+  graphql: LinearGraphql
 } {
-  const calls: RunHarnessArgs[] = []
-  const fn = async (args: RunHarnessArgs): Promise<RunResult> => {
-    calls.push(args)
-    opts.onCall?.(args)
-    if (opts.write) writeFileSync(opts.write.path, opts.write.contents)
-    return opts.result
-  }
-  return { fn, calls }
+  const graphql = (async (query: string) => {
+    for (const [key, value] of Object.entries(routes)) {
+      if (query.includes(key)) return value
+    }
+    throw new Error(`unexpected query: ${query.slice(0, 40)}`)
+  }) as unknown as LinearGraphql
+  return { graphql }
 }
 
-const VALID_RESULT = JSON.stringify({
-  inProgressCount: 0,
-  issueId: "DIS-1",
-  issueUuid: "u-1",
-  title: "t",
-  brief: "b",
-  source: "observations",
-})
-
 describe("defaultDeps.runSelect", () => {
-  let repoRoot: string
-  let expected: string
-  let logPath: string
-  beforeEach(() => {
-    repoRoot = mkdtempSync(join(tmpdir(), "kickoff-deps-"))
-    expected = join(
-      repoRoot,
-      "build",
-      "kickoff",
-      ".kickoff",
-      "select-result.json",
-    )
-    logPath = join(repoRoot, "build", "kickoff", ".kickoff", "select.log")
-  })
-  afterEach(() => {
-    rmSync(repoRoot, { recursive: true, force: true })
-  })
-
-  test("happy round-trip: creates dir, forwards cwd/logPath, parses result back", async () => {
-    const { fn, calls } = makeFakeHarness({
-      onCall: (args) => {
-        expect(args.cwd).toBe(repoRoot)
-        expect(args.logPath).toBe(logPath)
-        expect(args.bin).toBe("claude")
+  test("threads the graphql client and maps a claimed SelectResult", async () => {
+    const { graphql } = fakeGraphql({
+      KickoffInProgressCount: { issues: { nodes: [], pageInfo: empty } },
+      KickoffReadyCandidates: {
+        issues: {
+          nodes: [
+            {
+              id: "uuid-1",
+              identifier: "DIS-1",
+              title: "t",
+              description: "b",
+              priority: 2,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              labels: { nodes: [{ id: "l_o" }] },
+              inverseRelations: { nodes: [] },
+            },
+          ],
+          pageInfo: empty,
+        },
       },
-      write: { path: expected, contents: VALID_RESULT },
-      result: { code: 0, output: "" },
+      KickoffClaimIssue: {
+        issueUpdate: { success: true, issue: { id: "uuid-1" } },
+      },
     })
 
-    const result = await defaultDeps(repoRoot, config, fn).runSelect({
-      repoRoot,
-      config,
-    })
+    const result = await defaultDeps("/x", config, {
+      graphql,
+    }).runSelect({ repoRoot: "/x", config })
 
-    expect(calls).toHaveLength(1)
     expect(result).toEqual({
       inProgressCount: 0,
       issueId: "DIS-1",
-      issueUuid: "u-1",
+      issueUuid: "uuid-1",
       title: "t",
       brief: "b",
       source: "observations",
     })
   })
 
-  test("stale-clear: pre-existing valid result is removed before the agent runs", async () => {
-    // A FULLY valid stale result: if rmSync were dropped, read-back would parse
-    // this successfully and return the wrong issue. The `existsSync` check in
-    // `onCall` is the primary pin (it fires the moment stale-clear breaks); the
-    // "wrote no result" rejection below is the downstream consequence when the
-    // fake then writes nothing.
-    const { fn } = makeFakeHarness({
-      onCall: () => {
-        expect(existsSync(expected)).toBe(false)
+  test("at capacity short-circuits to {none, atCapacity}", async () => {
+    const { graphql } = fakeGraphql({
+      KickoffInProgressCount: {
+        issues: { nodes: [{ id: "a" }], pageInfo: empty },
       },
-      result: { code: 0, output: "" },
     })
-    // Seed a stale, fully-valid result before the run.
-    mkdirSync(dirname(expected), { recursive: true })
-    writeFileSync(expected, VALID_RESULT)
-
-    await expect(
-      defaultDeps(repoRoot, config, fn).runSelect({ repoRoot, config }),
-    ).rejects.toThrow("exited 0 but wrote no result")
+    const result = await defaultDeps("/x", config, { graphql }).runSelect({
+      repoRoot: "/x",
+      config,
+    })
+    expect(result).toEqual({ none: true, atCapacity: true })
   })
 
-  test("non-zero exit throws (failure, not empty queue)", async () => {
-    const { fn } = makeFakeHarness({ result: { code: 4, output: "" } })
+  test("a Linear API failure surfaces (not an empty queue)", async () => {
+    const graphql = (async () => {
+      throw new Error("boom")
+    }) as unknown as LinearGraphql
     await expect(
-      defaultDeps(repoRoot, config, fn).runSelect({ repoRoot, config }),
-    ).rejects.toThrow("select agent exited 4")
+      defaultDeps("/x", config, { graphql }).runSelect({
+        repoRoot: "/x",
+        config,
+      }),
+    ).rejects.toThrow("boom")
   })
+})
 
-  test("malformed JSON throws", async () => {
-    const { fn } = makeFakeHarness({
-      write: { path: expected, contents: "{not json" },
-      result: { code: 0, output: "" },
+describe("defaultRestoreDeps.runRestoreSelect", () => {
+  test("threads the graphql client and maps RestoreTicket[]", async () => {
+    const { graphql } = fakeGraphql({
+      KickoffRestoreAssigned: {
+        viewer: {
+          id: "me",
+          assignedIssues: {
+            nodes: [
+              {
+                id: "u1",
+                identifier: "DIS-9",
+                title: "nine",
+                attachments: { nodes: [] },
+              },
+            ],
+            pageInfo: empty,
+          },
+        },
+      },
     })
-    await expect(
-      defaultDeps(repoRoot, config, fn).runSelect({ repoRoot, config }),
-    ).rejects.toThrow("malformed JSON")
+    const result = await defaultRestoreDeps("/x", config, {
+      graphql,
+    }).runRestoreSelect()
+    expect(result).toEqual([
+      { issueId: "DIS-9", issueUuid: "u1", title: "nine", branch: null },
+    ])
   })
 })

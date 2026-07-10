@@ -2,7 +2,22 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { builderArgs, reviewerArgs, runHarness } from "./harness"
+import {
+  builderArgs,
+  childGroupOptions,
+  reviewerArgs,
+  runHarness,
+} from "./harness"
+import { CHILD_OUTPUT_CAP } from "./safe-output"
+
+describe("childGroupOptions", () => {
+  test("detached → own process group", () => {
+    expect(childGroupOptions(true)).toEqual({ detached: true })
+  })
+  test("not detached → no detached key (one-shot unchanged)", () => {
+    expect(childGroupOptions(false)).toEqual({})
+  })
+})
 
 describe("builderArgs", () => {
   test("claude --print headless with model and prompt", () => {
@@ -104,5 +119,21 @@ describe("runHarness", () => {
       logPath: join(dir, "build.log"),
     })
     expect(result.code).toBe(3)
+  })
+
+  test("bounds captured stdout to the tail cap while keeping the sentinel", async () => {
+    const result = await runHarness({
+      bin: "bash",
+      argv: [
+        "-c",
+        'head -c 2000000 /dev/zero | tr "\\0" x; echo; echo PLAN_DONE',
+      ],
+      cwd: dir,
+      logPath: join(dir, "build.log"),
+    })
+    expect(result.code).toBe(0)
+    expect(result.output.length).toBeLessThanOrEqual(CHILD_OUTPUT_CAP)
+    // Bounding is verdict-safe: the trailing sentinel is always retained.
+    expect(result.output).toContain("PLAN_DONE")
   })
 })

@@ -99,4 +99,47 @@ describe("runValidate", () => {
     expect(r.pass).toBe(false)
     expect(r.failureText).toContain("flow broke")
   })
+
+  test("runs both e2e and evals after the deterministic checks; evals runs after e2e", async () => {
+    const order: string[] = []
+    const run: RunCommand = async () => ({ code: 0, output: "ok" })
+    const r = await runValidate({
+      repoRoot: "/repo",
+      logPath: "/dev/null",
+      runCommand: run,
+      e2e: async () => {
+        order.push("e2e")
+        return { name: "e2e", ok: true, output: "" }
+      },
+      evals: async () => {
+        order.push("evals")
+        return { name: "evals", ok: true, output: "" }
+      },
+    })
+    expect(r.pass).toBe(true)
+    expect(order).toEqual(["e2e", "evals"])
+    expect(r.results.map((c) => c.name)).toEqual([
+      "typecheck",
+      "lint",
+      "test",
+      "e2e",
+      "evals",
+    ])
+  })
+
+  test("a failing evals step fails the gate", async () => {
+    const run: RunCommand = async () => ({ code: 0, output: "ok" })
+    const r = await runValidate({
+      repoRoot: "/repo",
+      logPath: "/dev/null",
+      runCommand: run,
+      evals: async () => ({
+        name: "evals",
+        ok: false,
+        output: "gmail/reply regressed",
+      }),
+    })
+    expect(r.pass).toBe(false)
+    expect(r.failureText).toContain("gmail/reply regressed")
+  })
 })

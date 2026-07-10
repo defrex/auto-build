@@ -47,6 +47,30 @@ describe("parseObservationsFile", () => {
     )
     expect(weird[0].kind).toBeNull()
   })
+
+  test("recognises the e2e-infra kind", () => {
+    const signals = parseObservationsFile(
+      "build/x/observations.md",
+      "## No local stand-in for Stripe webhook\n- **kind:** e2e-infra\n",
+    )
+    expect(signals[0].kind).toBe("e2e-infra")
+  })
+
+  test("recognises the schema-narrow kind", () => {
+    const signals = parseObservationsFile(
+      "build/x/observations.md",
+      "## Drop deprecated avatarUrl field\n- **kind:** schema-narrow\n",
+    )
+    expect(signals[0].kind).toBe("schema-narrow")
+  })
+
+  test("recognises the eval-infra kind", () => {
+    const signals = parseObservationsFile(
+      "build/x/observations.md",
+      "## No eval driver for outlook sessions\n- **kind:** eval-infra\n",
+    )
+    expect(signals[0].kind).toBe("eval-infra")
+  })
 })
 
 describe("signalIdFor", () => {

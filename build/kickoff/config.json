@@ -5,6 +5,7 @@
     "triageStateId": "",
     "readyStateId": "",
     "inProgressStateId": "",
+    "inReviewStateId": "",
     "doneStateId": "",
     "rejectedStateIds": [],
     "sourceObservationsLabelId": "",
@@ -21,7 +22,8 @@
   },
   "caps": {
     "maxNewIssuesPerRun": 5,
-    "maxInvestigationsPerRun": 3
+    "maxInvestigationsPerRun": 3,
+    "adversarialReviewRounds": 3
   },
   "worktree": {
     "provider": "git",

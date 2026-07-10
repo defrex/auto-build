@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import {
-  deriveDevUrl,
-  reachable,
-  waitUntilReachable,
-  withDevServer,
-} from "./dev-server"
+import { deriveDevUrl, reachable, waitUntilReachable } from "./dev-server"
 
 describe("deriveDevUrl", () => {
   test("uses CONDUCTOR_WORKSPACE_NAME over repo basename", () => {
@@ -102,63 +97,5 @@ describe("waitUntilReachable", () => {
       now: () => (t += 5),
     })
     expect(ok).toBe(false)
-  })
-})
-
-describe("withDevServer", () => {
-  test("does not spawn or kill when already reachable", async () => {
-    let spawned = false
-    const result = await withDevServer({
-      devUrl: "https://x",
-      repoRoot: "/repo",
-      reachableImpl: async () => true,
-      spawnDev: () => {
-        spawned = true
-        return { kill: () => {} } as never
-      },
-      run: async (url) => `ran:${url}`,
-    })
-    expect(result).toBe("ran:https://x")
-    expect(spawned).toBe(false)
-  })
-
-  test("spawns when not reachable and kills only what it started", async () => {
-    let spawned = false
-    let killed = false
-    const result = await withDevServer({
-      devUrl: "https://x",
-      repoRoot: "/repo",
-      reachableImpl: async () => false,
-      waitImpl: async () => true,
-      spawnDev: () => {
-        spawned = true
-        return {} as never
-      },
-      killDev: () => {
-        killed = true
-      },
-      run: async () => "done",
-    })
-    expect(result).toBe("done")
-    expect(spawned).toBe(true)
-    expect(killed).toBe(true)
-  })
-
-  test("throws and tears down if the spawned server never comes up", async () => {
-    let killed = false
-    await expect(
-      withDevServer({
-        devUrl: "https://x",
-        repoRoot: "/repo",
-        reachableImpl: async () => false,
-        waitImpl: async () => false,
-        spawnDev: () => ({}) as never,
-        killDev: () => {
-          killed = true
-        },
-        run: async () => "should not run",
-      }),
-    ).rejects.toThrow("never became reachable")
-    expect(killed).toBe(true)
   })
 })

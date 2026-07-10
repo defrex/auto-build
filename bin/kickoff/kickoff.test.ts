@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { join } from "node:path"
+import { slugify } from "./branch"
 import { resolveConfig } from "./config"
 import {
   type BuildRunResult,
@@ -8,6 +9,7 @@ import {
   kickoff,
   parseSelectResult,
   runBuildWithProvider,
+  runKickoffPass,
   type SelectResult,
   uniqueSlug,
 } from "./kickoff"
@@ -57,6 +59,14 @@ function makeDeps(
       return next
     },
     buildDirExists: (slug) => buildExists.has(slug),
+    // Deterministic stand-in for the LLM slug generator: the real `deriveSlug`
+    // falls back to exactly this when the model is unavailable.
+    deriveSlug: async ({ title }) => ({
+      slug: slugify(title),
+      usedFallback: true,
+      model: "test-model",
+      durationMs: 0,
+    }),
     createWorktree: async ({ slug, branch, base }) => {
       events.push(`createWorktree:slug=${slug}:${branch}:base=${base}`)
       return worktreePathFor(slug)
@@ -64,6 +74,9 @@ function makeDeps(
     writeSpec: (specPath, contents) => {
       events.push(`writeSpec:${specPath}`)
       specs.set(specPath, contents)
+    },
+    writeIdentity: (path, ids) => {
+      events.push(`writeIdentity:${path}:${ids.issueId}:${ids.issueUuid}`)
     },
     runBuild: async ({ slug, worktreePath }) => {
       // Assert the build can read the spec from its cwd at spawn time.
@@ -159,7 +172,7 @@ describe("kickoff", () => {
     const { events, deps } = makeDeps(ready)
     await kickoff(REPO, config, deps)
     const wt = events.find((e) => e.startsWith("createWorktree"))
-    expect(wt).toContain("kickoff/dis-123-make-reads-bounded")
+    expect(wt).toContain("dis-123-make-reads-bounded")
   })
 
   test("worktree is based off the canonical base ref, not current HEAD", async () => {
@@ -300,6 +313,73 @@ describe("kickoff", () => {
   })
 })
 
+describe("runKickoffPass", () => {
+  test("lock acquired → runs kickoff → returns {code} and releases", async () => {
+    const { deps } = makeDeps({ none: true }) // drives kickoff to code 0
+    let released = 0
+    const outcome = await runKickoffPass(REPO, config, {
+      acquireLock: () => true,
+      releaseLock: () => {
+        released++
+      },
+      makeDeps: () => deps,
+    })
+    expect(outcome).toEqual({ code: 0 })
+    expect(released).toBe(1)
+  })
+
+  test("lock contention → {skipped:true}, kickoff NOT run, release NOT called", async () => {
+    let madeDeps = 0
+    let released = 0
+    const outcome = await runKickoffPass(REPO, config, {
+      acquireLock: () => false,
+      releaseLock: () => {
+        released++
+      },
+      makeDeps: () => {
+        madeDeps++
+        return makeDeps({ none: true }).deps
+      },
+    })
+    expect(outcome).toEqual({ skipped: true })
+    expect(madeDeps).toBe(0)
+    expect(released).toBe(0)
+  })
+
+  test("lock always released even on a non-zero (code 3) pass", async () => {
+    const { deps } = makeDeps([], {
+      runSelect: async () => {
+        throw new Error("select agent exited 1")
+      },
+    })
+    let released = 0
+    const outcome = await runKickoffPass(REPO, config, {
+      acquireLock: () => true,
+      releaseLock: () => {
+        released++
+      },
+      makeDeps: () => deps,
+    })
+    expect(outcome).toEqual({ code: 3 })
+    expect(released).toBe(1)
+  })
+
+  test("fresh deps per pass (makeDeps called once per pass)", async () => {
+    let madeDeps = 0
+    const opts = {
+      acquireLock: () => true,
+      releaseLock: () => {},
+      makeDeps: () => {
+        madeDeps++
+        return makeDeps({ none: true }).deps
+      },
+    }
+    await runKickoffPass(REPO, config, opts)
+    await runKickoffPass(REPO, config, opts)
+    expect(madeDeps).toBe(2)
+  })
+})
+
 describe("parseSelectResult", () => {
   test("accepts a none result and a full ready result", () => {
     expect(parseSelectResult({ none: true, atCapacity: true }, "f")).toEqual({
@@ -307,6 +387,15 @@ describe("parseSelectResult", () => {
       atCapacity: true,
     })
     expect(parseSelectResult({ ...ready }, "f")).toEqual(ready)
+  })
+
+  test("accepts every source enum (observations/sentry/groomed)", () => {
+    for (const source of ["observations", "sentry", "groomed"] as const) {
+      expect(parseSelectResult({ ...ready, source }, "f")).toEqual({
+        ...ready,
+        source,
+      })
+    }
   })
 
   test("rejects well-formed JSON with missing/blank required fields", () => {
@@ -351,6 +440,49 @@ describe("runBuildWithProvider", () => {
         headless: async () => 0,
       }),
     ).toEqual({ mode: "sync", code: 0 })
+  })
+
+  test("fires onLaunch('detached') at the spawn point", async () => {
+    const launches: string[] = []
+    await runBuildWithProvider({
+      ...args,
+      provider: { startVisibleBuild: async () => true },
+      headless: async () => 0,
+      onLaunch: (mode) => launches.push(mode),
+    })
+    expect(launches).toEqual(["detached"])
+  })
+
+  test("fires onLaunch('sync') BEFORE the blocking headless build resolves", async () => {
+    const order: string[] = []
+    await runBuildWithProvider({
+      ...args,
+      provider: { startVisibleBuild: async () => false },
+      headless: async () => {
+        order.push("headless")
+        return 0
+      },
+      onLaunch: (mode) => order.push(`launch:${mode}`),
+    })
+    // launch latency, not build runtime — onLaunch must precede headless.
+    expect(order).toEqual(["launch:sync", "headless"])
+  })
+
+  test("does NOT fire onLaunch when the launch throws (state unknown)", async () => {
+    const launches: string[] = []
+    await expect(
+      runBuildWithProvider({
+        ...args,
+        provider: {
+          startVisibleBuild: async () => {
+            throw new Error("CLI crashed mid-launch")
+          },
+        },
+        headless: async () => 0,
+        onLaunch: (mode) => launches.push(mode),
+      }),
+    ).rejects.toThrow(/crashed/)
+    expect(launches).toEqual([])
   })
 
   test("propagates a launch throw WITHOUT running headless (state unknown — no blind retry)", async () => {

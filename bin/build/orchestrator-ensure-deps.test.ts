@@ -16,6 +16,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { noopAnalytics } from "../analytics/pipeline-analytics"
 import type { RunHarnessArgs, RunResult } from "./harness"
 import { type Ctx, defaultEnsureDeps } from "./orchestrator"
 
@@ -31,6 +32,7 @@ function makeCtx(tmp: string): Ctx {
     baseBranch: "main",
     env: process.env,
     now: () => "t",
+    analytics: noopAnalytics(),
   }
 }
 

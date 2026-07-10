@@ -101,16 +101,27 @@ describe("transition — pr / monitor", () => {
       transition({ phase: "pr", verdict: { kind: "escalate", reason: "x" } }),
     ).toEqual({ phase: "pr", status: "blocked" })
   })
-  test("monitor done → done/done", () => {
-    expect(transition({ phase: "monitor", done: true })).toEqual({
-      phase: "done",
-      status: "done",
+  test("monitor done + merged → cleanup/running", () => {
+    expect(transition({ phase: "monitor", done: true, merged: true })).toEqual({
+      phase: "cleanup",
+      status: "running",
     })
+  })
+  test("monitor done + not merged (closed) → done/done", () => {
+    expect(transition({ phase: "monitor", done: true, merged: false })).toEqual(
+      { phase: "done", status: "done" },
+    )
   })
   test("monitor not done → keep polling", () => {
     expect(transition({ phase: "monitor", done: false })).toEqual({
       phase: "monitor",
       status: "running",
+    })
+  })
+  test("cleanup done → done/done", () => {
+    expect(transition({ phase: "cleanup", done: true })).toEqual({
+      phase: "done",
+      status: "done",
     })
   })
 })

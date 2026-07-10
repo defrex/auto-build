@@ -4,7 +4,7 @@
  * `record-outcomes.ts` calls this in the SAME run that created the Linear issues,
  * so the ledger mutation is persisted to git immediately — a fresh checkout or a
  * clean reset never re-mints duplicates. Modeled on `bin/build/repo.ts`'s
- * `commitAndPushArtifacts` (injectable `exec` for hermetic tests).
+ * `commitArtifacts` / `publishArtifacts` (injectable `exec` for hermetic tests).
  *
  * Single-writer (design "Idempotency"): a rejected push means someone landed a
  * ledger change in between; the caller logs the orphaned commit and the next run

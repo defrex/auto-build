@@ -60,6 +60,41 @@ hard-stops on unset config.)
    matters**, and a **suggested direction**. The brief must be rich enough to
    become a `spec.md` without re-deriving everything.
 
+   **`e2e-infra` observations** (the kind the build pipeline's e2e stages emit when
+   a flow can't be e2e-tested locally — a service that should be mockable but isn't,
+   a missing fixture/seed, un-settable local state, an external dependency with no
+   local stand-in) cluster toward **"make more of the product e2e-testable"**
+   investment: group them by the missing capability (e.g. several "no local
+   stand-in for &lt;service&gt;" notes → one "build a local test harness for
+   &lt;service&gt;" project) rather than scattering them across unrelated feature
+   issues.
+
+   **`eval-infra` observations** (the kind the build pipeline's `evals` stages emit
+   when a changed model-facing prompt is hard to eval-cover because the harness
+   lacks a driver, fixture, or seed for that automation/session surface) cluster
+   toward **"make more of the agent eval-coverable"** investment: group them by the
+   missing driver/fixture/automation surface (e.g. several "no eval driver for
+   &lt;automation&gt; sessions" notes → one "add an eval driver for
+   &lt;automation&gt;" project), mirroring the broad-merge `e2e-infra` default above
+   rather than scattering them across unrelated feature issues.
+
+   **`schema-narrow` observations** are the deferred **narrow** of a Convex
+   widen→migrate→narrow migration: an orphaned deprecated field or dead union
+   literal left in `apps/web/convex/schema.ts` after the widen+migrate landed,
+   along with its `@deprecated` / "narrow to required in a follow-up deploy"
+   comment. Each narrow is an **independent, safe-to-do** task. Cluster
+   **narrowly**: group only narrows for the **same migration/table** into one
+   "complete the narrow of &lt;table.field&gt;" Triage ticket. **Do NOT collapse
+   unrelated migrations into one mega-ticket** — this is the *opposite* of the
+   `e2e-infra` default above (which merges broadly by missing capability); here
+   over-merging produces an un-actionable grab-bag, so keep distinct migrations in
+   distinct tickets. The filed brief MUST carry forward: (a) the **safety
+   precondition** — "verify nothing still reads/writes the deprecated field and the
+   backfill completed before deleting" — (b) the **widen+migrate origin**
+   (PR/commit/migration), and (c) the pointer to the `convex/schema.ts`
+   deprecation comment, so the implementer (and `/build`) can confirm no remaining
+   readers before deleting.
+
 5. **Create Linear issues (MCP).** Create each cluster as an issue in the **Triage**
    state (`triageStateId`), with:
    - the `source:observations` label (`sourceObservationsLabelId`),

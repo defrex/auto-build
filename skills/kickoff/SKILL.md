@@ -29,16 +29,27 @@ select+claim), hard-capped at `maxConcurrentBuilds` launches per run:
 1. **Select + claim** — spawns one agent per iteration to pick exactly one issue
    in **Ready** that does **not** carry `needs-definition`, never one already
    In-Progress/terminal, and **immediately moves it to In-Progress** (claims it
-   before building, so a re-run/crash can't double-launch). Reports
-   at-capacity when In-Progress count reaches `maxConcurrentBuilds`, which ends
-   the loop.
+   before building, so a re-run/crash can't double-launch). It also **skips any
+   Ready issue blocked by an unfinished issue** — a `blocked by` relation only
+   clears when the blocker reaches a completed-type state, so a blocked candidate
+   is passed over (not failed) and picked up on a later run once its blockers
+   complete. It likewise **skips any Ready issue carrying a future
+   `<!-- defer-until: … -->` marker** in its description (an absolute instant;
+   date-only resolves to start of day UTC) — the deferred ticket stays a visible
+   Ready candidate, is passed over (not failed), and is picked up automatically on
+   the first run at/after that time. Deferral composes with blocked-by (skipped
+   until both clear); a malformed defer value is treated as not deferred and
+   logged. Reports at-capacity when In-Progress count reaches
+   `maxConcurrentBuilds`, which ends the loop.
 2. **Worktree first** — provisions a worktree on branch
-   `kickoff/<dis-id>-<slug>` off `main`, via the provider configured at
-   `worktree.provider` (`git` = `git worktree add ../.kickoff-worktrees/<slug>`;
-   `superset` = `superset workspaces create`, landing at
-   `~/.superset/worktrees/<projectId>/<branch>`, opened in the app — see
-   `bin/kickoff/worktree-provider.ts`). The Linear id in the branch is the
-   loop-closer: the eventual PR auto-links the issue and merging auto-resolves it.
+   `<dis-id>-<slug>` off `main`, via the provider configured at
+   `worktree.provider` (`git`/`herdr` = `gwt add <branch>`, landing at a sibling
+   `<project>-<safe-branch>` dir and running `worktree-init.sh` for full project
+   setup — env symlinks, `bun install`, Convex/Vercel config; `superset` =
+   `superset workspaces create`, landing at `~/.superset/worktrees/<projectId>/<branch>`,
+   opened in the app — see `bin/kickoff/worktree-provider.ts`). The Linear id in
+   the branch is the loop-closer: the eventual PR auto-links the issue and merging
+   auto-resolves it.
 3. **Design inside the worktree** — writes `build/<slug>/spec.md` into that
    worktree from the issue's brief.
 4. **Launch detached** — starts a user-visible `claude "/build <slug>"`
@@ -76,9 +87,11 @@ select+claim), hard-capped at `maxConcurrentBuilds` launches per run:
   Watch builds — and answer escalations — live in the Superset app.
 - When the PR merges, Linear auto-resolves the issue; the **next** ingester run's
   reconcile step records the `done` outcome in the ledger.
-- Prune the worktree after merge: `git worktree remove
-  ../.kickoff-worktrees/<slug>` (provider `git`) or `superset workspaces
-  delete <workspace-id>` (provider `superset`; the id is logged at launch time).
+- Prune the worktree after merge: `gwt rm <branch>` (providers `git`/`herdr`,
+  which removes the `<project>-<safe-branch>` sibling and deletes the local
+  branch) or `superset workspaces delete <workspace-id>` (provider `superset`;
+  the id is logged at launch time). Post-merge teardown is normally automatic via
+  the orchestrator's cleanup phase / `kickoff --cleanup`.
 
 ## Concurrency
 

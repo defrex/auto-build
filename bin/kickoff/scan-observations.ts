@@ -23,6 +23,7 @@ import {
   readLedger,
 } from "./ledger"
 import { LEDGER_PATH } from "./ledger-commit"
+import { latestObservationTimes } from "./observation-recency"
 import {
   collectObservationSignals,
   type ObservationSignal,
@@ -34,6 +35,8 @@ export type ObservationCandidate = ObservationSignal & {
   source: "observations"
   /** Human-readable origin, e.g. `build/payg/observations.md#make-reads-bounded`. */
   ref: string
+  /** Epoch ms the source file last changed — drives newest-first ordering. */
+  recencyMs?: number
 }
 
 export type ObservationPacket = {
@@ -50,13 +53,16 @@ export function buildObservationPacket(
   cap: number,
   ledger: LedgerRow[],
 ): ObservationPacket {
-  const signals: ObservationCandidate[] = collectObservationSignals(
-    repoRoot,
-  ).map((s) => ({
+  const parsed = collectObservationSignals(repoRoot)
+  const recency = latestObservationTimes(repoRoot, [
+    ...new Set(parsed.map((s) => s.sourcePath)),
+  ])
+  const signals: ObservationCandidate[] = parsed.map((s) => ({
     ...s,
     signalId: signalIdFor(s),
     source: "observations" as const,
     ref: `${s.sourcePath}#${slugify(s.title)}`,
+    recencyMs: recency.get(s.sourcePath),
   }))
   const { packet, updates, skipped } = selectCandidates(signals, ledger, cap)
   return {

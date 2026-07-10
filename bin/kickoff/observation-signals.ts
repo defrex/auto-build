@@ -5,7 +5,7 @@
  * The entry format is exactly what the build agents write (`bin/build/prompts.ts`):
  *
  *   ## <short title>
- *   - **kind:** bug | refactor | tech-debt | test-gap | perf
+ *   - **kind:** bug | refactor | tech-debt | test-gap | perf | e2e-infra | eval-infra | schema-narrow
  *   - **where:** path/to/file.ts:42
  *   - **why out of scope:** <one line>
  *   - **suggestion:** <what a future engineer should do>
@@ -27,6 +27,9 @@ export type ObservationKind =
   | "tech-debt"
   | "test-gap"
   | "perf"
+  | "e2e-infra"
+  | "eval-infra"
+  | "schema-narrow"
 
 export type ObservationSignal = {
   /** Repo-relative source path, e.g. `build/payg/observations.md`. */
@@ -49,6 +52,9 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set([
   "tech-debt",
   "test-gap",
   "perf",
+  "e2e-infra",
+  "eval-infra",
+  "schema-narrow",
 ])
 
 /** Collapse whitespace so a reflowed-but-identical entry hashes the same. */
