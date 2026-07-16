@@ -275,6 +275,21 @@ describe('Dispatcher dispatch', () => {
     expect(h.launches).toEqual(['add-rate-limiting'])
   })
 
+  test('readyState narrows the scan: only tickets in that state dispatch', async () => {
+    const ready = readyTicket('T-1', { state: 'Ready' })
+    const backlog = readyTicket('T-2', { title: 'Backlog idea', state: 'Backlog' })
+    const h = harness({
+      tickets: [ready, backlog],
+      toml: ['[dispatcher]', 'capacity = 2', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    expect(report.dispatched).toBe(1)
+    const builds = await h.store.listBuilds()
+    expect(builds.map((b) => b.slug)).toEqual(['add-rate-limiting'])
+  })
+
   test('claim race: lost claim skips the ticket without building', async () => {
     const h = harness({ tickets: [readyTicket('T-1')] })
     await h.tickets.claim('T-1') // another dispatcher won the claim

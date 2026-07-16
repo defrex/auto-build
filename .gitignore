@@ -4,3 +4,6 @@ node_modules/
 # local store default location when overridden into the repo for dev
 .autobuild/
 *.local.db
+
+# local secrets
+.env

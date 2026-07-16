@@ -482,7 +482,12 @@ export class Dispatcher {
     let capacity = config.dispatcher.capacity - active
     if (capacity <= 0) return
 
-    const ready = await tickets.listReady({ labels: config.dispatcher.readyLabels })
+    const ready = await tickets.listReady({
+      labels: config.dispatcher.readyLabels,
+      ...(config.dispatcher.readyState !== undefined
+        ? { state: config.dispatcher.readyState }
+        : {}),
+    })
     for (const ticket of ready) {
       if (capacity <= 0) break
       // Claim-before-launch (§12): losing the claim means another dispatcher

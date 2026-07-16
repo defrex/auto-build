@@ -140,8 +140,31 @@ export const dispatcherSchema = z.strictObject({
   capacity: z.number().int().positive().default(1),
   /** Ticket labels that mark a ticket ready for dispatch (§3.3). */
   readyLabels: z.array(z.string().min(1)).default(['autobuild']),
+  /** Workflow state a ticket must additionally sit in to be dispatchable;
+   * absent = any state (labels alone decide). */
+  readyState: z.string().min(1).optional(),
 })
 export type DispatcherConfig = z.infer<typeof dispatcherSchema>
+
+// ── [tickets] ────────────────────────────────────────────────────────────────
+//
+// Optional table: which TicketSource the dispatcher drives (§3.2, §13).
+// Declarative only — the Linear API key is a secret and comes from the
+// LINEAR_API_KEY environment variable, never from this file.
+
+export const ticketsSchema = z.strictObject({
+  source: z.enum(['linear', 'file']),
+  /** Linear team key (e.g. "ENG") — required when source = "linear". */
+  teamKey: z.string().min(1).optional(),
+  /** Workflow state claim() moves an issue to (§12); Linear only. */
+  claimedState: z.string().min(1).optional(),
+  /** State create() files new tickets into. Absent = the provider's default
+   * (Linear: the team's default state, e.g. Backlog; file: Triage). */
+  createState: z.string().min(1).optional(),
+  /** Directory of `<id>.md` ticket files — required when source = "file". */
+  dir: z.string().min(1).optional(),
+})
+export type TicketsConfig = z.infer<typeof ticketsSchema>
 
 // ── [outer] ──────────────────────────────────────────────────────────────────
 //
@@ -163,6 +186,7 @@ const configTableSchema = z.strictObject({
   roles: z.record(z.string().min(1), roleSchema).prefault({}),
   policy: policySchema.prefault({}),
   dispatcher: dispatcherSchema.prefault({}),
+  tickets: ticketsSchema.optional(),
   outer: z.record(z.string().min(1), outerScheduleSchema).prefault({}),
 })
 
@@ -220,6 +244,46 @@ export const configSchema = configTableSchema.superRefine((config, ctx) => {
           `[verify.${step}].needsServer = true requires a [server] table (start, url) — ` +
           `add [server] or set needsServer = false`,
       })
+    }
+  }
+
+  if (config.tickets !== undefined) {
+    const tickets = config.tickets
+    if (tickets.source === 'linear') {
+      if (tickets.teamKey === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tickets', 'teamKey'],
+          message:
+            '[tickets].source = "linear" requires teamKey — the Linear team key (e.g. "ENG")',
+        })
+      }
+      if (tickets.dir !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tickets', 'dir'],
+          message:
+            '[tickets].dir applies only to source = "file" — remove it or set source = "file"',
+        })
+      }
+    } else {
+      if (tickets.dir === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['tickets', 'dir'],
+          message:
+            '[tickets].source = "file" requires dir — the directory holding <id>.md ticket files',
+        })
+      }
+      for (const key of ['teamKey', 'claimedState'] as const) {
+        if (tickets[key] !== undefined) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['tickets', key],
+            message: `[tickets].${key} applies only to source = "linear" — remove it or set source = "linear"`,
+          })
+        }
+      }
     }
   }
 })

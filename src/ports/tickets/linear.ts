@@ -57,6 +57,7 @@ export class LinearTicketSource implements TicketSource {
   private readonly apiKey: string
   private readonly teamKey: string
   private readonly claimedState: string
+  private readonly createState: string | undefined
   private readonly fetchFn: LinearFetch
 
   /** identifier → Linear UUID, cached per instance. */
@@ -74,10 +75,14 @@ export class LinearTicketSource implements TicketSource {
     fetchFn?: LinearFetch
     /** Workflow state claim() moves the issue to (claim-before-launch, §12). */
     claimedState?: string
+    /** Workflow state create() files new issues into; absent = Linear's team
+     * default (whatever the team's default state is, e.g. Backlog). */
+    createState?: string
   }) {
     this.apiKey = opts.apiKey
     this.teamKey = opts.teamKey
     this.claimedState = opts.claimedState ?? 'In Progress'
+    this.createState = opts.createState
     this.fetchFn = opts.fetchFn ?? ((url, init) => fetch(url, init))
   }
 
@@ -161,16 +166,25 @@ export class LinearTicketSource implements TicketSource {
       }
       return labelId
     })
+    const input: Record<string, unknown> = {
+      teamId: team.teamId,
+      title: draft.title,
+      description: draft.body,
+      labelIds,
+    }
+    if (this.createState !== undefined) {
+      const stateId = team.stateIds.get(this.createState)
+      if (!stateId) {
+        throw new Error(
+          `linear create: no workflow state "${this.createState}" in team ` +
+            `${this.teamKey} (known: ${[...team.stateIds.keys()].join(', ')})`,
+        )
+      }
+      input['stateId'] = stateId
+    }
     const data = await this.gql<{
       issueCreate: { success: boolean; issue: GqlIssue | null }
-    }>('create', CREATE_ISSUE_MUTATION, {
-      input: {
-        teamId: team.teamId,
-        title: draft.title,
-        description: draft.body,
-        labelIds,
-      },
-    })
+    }>('create', CREATE_ISSUE_MUTATION, { input })
     if (!data.issueCreate.success || !data.issueCreate.issue) {
       throw new Error(`linear create: issueCreate failed for "${draft.title}"`)
     }

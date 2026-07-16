@@ -5,7 +5,9 @@
  * auth from the environment (D8), the store from AB_STORE (local path or
  * http(s) URL), the GitHub forge, real exec, wall clock, random ids.
  */
+import { join } from 'node:path'
 import { runCli } from '../src/cli/main'
+import { loadDotEnv } from '../src/cli/dotenv'
 import { resolveCliEnv } from '../src/cli/env'
 import { resolveStore } from '../src/cli/store-ref'
 import { RemoteBuildStore } from '../src/store/remote/client'
@@ -15,21 +17,38 @@ import { randomIds } from '../src/ids'
 import { systemClock } from '../src/store/types'
 
 async function main(): Promise<number> {
+  // Local .env supplies developer-set secrets (e.g. LINEAR_API_KEY); real
+  // environment variables always win over .env values.
+  loadDotEnv(join(process.cwd(), '.env'), process.env)
+
   const argv = process.argv.slice(2)
   const command = argv[0]
 
-  // init/upgrade/help run OUTSIDE build sessions (SPEC §16.3): they take a
-  // repo path, not a build, so they must work with no AB_* environment set.
+  // init/upgrade/ticket/dispatch/help run OUTSIDE build sessions (SPEC §16.3,
+  // §8.8, §3.3): they take a repo path, not a build, so they must work with no
+  // AB_* environment set.
   if (
     command === undefined ||
-    ['init', 'upgrade', 'help', '--help', '-h'].includes(command)
+    ['init', 'upgrade', 'ticket', 'dispatch', 'help', '--help', '-h'].includes(command)
   ) {
-    return runCli(argv, {
-      workspacePath: process.cwd(),
-      exec: spawnExec,
-      stdout: (line) => console.log(line),
-      stderr: (line) => console.error(line),
-    })
+    // The dispatch watch loop runs until SIGINT; abort the signal so it exits
+    // cleanly at the next tick boundary (§15.6-C: in-flight leases expire and
+    // a future dispatch re-attaches).
+    const controller = new AbortController()
+    const onSigint = (): void => controller.abort()
+    process.once('SIGINT', onSigint)
+    try {
+      return await runCli(argv, {
+        workspacePath: process.cwd(),
+        exec: spawnExec,
+        processEnv: process.env,
+        signal: controller.signal,
+        stdout: (line) => console.log(line),
+        stderr: (line) => console.error(line),
+      })
+    } finally {
+      process.removeListener('SIGINT', onSigint)
+    }
   }
 
   let cliEnv

@@ -216,6 +216,85 @@ describe('parseConfig — cross-validation', () => {
   })
 })
 
+describe('parseConfig — [tickets]', () => {
+  test('a valid linear source parses, claimedState optional', () => {
+    const config = parseConfig('[tickets]\nsource = "linear"\nteamKey = "ENG"\n')
+    expect(config.tickets).toEqual({ source: 'linear', teamKey: 'ENG' })
+  })
+
+  test('a valid file source parses', () => {
+    const config = parseConfig('[tickets]\nsource = "file"\ndir = "tickets"\n')
+    expect(config.tickets).toEqual({ source: 'file', dir: 'tickets' })
+  })
+
+  test('the table is optional — absent means no ticket source configured', () => {
+    expect(parseConfig('').tickets).toBeUndefined()
+  })
+
+  test('linear without teamKey is an error with path and remedy', () => {
+    const error = parseError('[tickets]\nsource = "linear"\n')
+    expect(error.message).toContain('tickets.teamKey')
+    expect(error.message).toContain('requires teamKey')
+  })
+
+  test('file without dir is an error', () => {
+    const error = parseError('[tickets]\nsource = "file"\n')
+    expect(error.message).toContain('tickets.dir')
+    expect(error.message).toContain('requires dir')
+  })
+
+  test('dir on a linear source is rejected', () => {
+    const error = parseError(
+      '[tickets]\nsource = "linear"\nteamKey = "ENG"\ndir = "tickets"\n',
+    )
+    expect(error.message).toContain('tickets.dir')
+    expect(error.message).toContain('applies only to source = "file"')
+  })
+
+  test('teamKey and claimedState on a file source are rejected', () => {
+    const error = parseError(
+      '[tickets]\nsource = "file"\ndir = "tickets"\nteamKey = "ENG"\nclaimedState = "Doing"\n',
+    )
+    expect(error.message).toContain('tickets.teamKey')
+    expect(error.message).toContain('tickets.claimedState')
+    expect(error.message).toContain('applies only to source = "linear"')
+  })
+
+  test('an unknown source is rejected', () => {
+    const error = parseError('[tickets]\nsource = "jira"\n')
+    expect(error.message).toContain('tickets.source')
+  })
+
+  test('createState is accepted on both sources — absent means provider default', () => {
+    const linear = parseConfig(
+      '[tickets]\nsource = "linear"\nteamKey = "ENG"\ncreateState = "Triage"\n',
+    )
+    expect(linear.tickets?.createState).toBe('Triage')
+    const file = parseConfig(
+      '[tickets]\nsource = "file"\ndir = "tickets"\ncreateState = "Backlog"\n',
+    )
+    expect(file.tickets?.createState).toBe('Backlog')
+    expect(
+      parseConfig('[tickets]\nsource = "linear"\nteamKey = "ENG"\n').tickets
+        ?.createState,
+    ).toBeUndefined()
+  })
+})
+
+describe('parseConfig — [dispatcher] readiness', () => {
+  test('readyState is optional and absent by default — labels alone decide', () => {
+    expect(parseConfig('').dispatcher.readyState).toBeUndefined()
+  })
+
+  test('readyState parses alongside readyLabels', () => {
+    const config = parseConfig(
+      '[dispatcher]\nreadyLabels = []\nreadyState = "Ready"\n',
+    )
+    expect(config.dispatcher.readyState).toBe('Ready')
+    expect(config.dispatcher.readyLabels).toEqual([])
+  })
+})
+
 describe('parseConfig — strictness (a typo must not silently disable a verifier)', () => {
   test('unknown top-level table is rejected, naming the known tables', () => {
     const error = parseError('[polcy]\nstallRounds = 3\n')

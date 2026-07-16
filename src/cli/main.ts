@@ -17,11 +17,13 @@ import type { Exec } from '../ports/workspace/git-worktree'
 import type { IdSource } from '../ids'
 import { artifactGet, artifactPut } from './artifact'
 import { buildContext, type ContextManifest } from './context'
+import { abDispatch } from './dispatch'
 import type { CliEnv } from './env'
 import { abInit } from './init'
 import { observe } from './observe'
 import { ServerControl } from './server-control'
 import { done, escalate, verdict } from './terminals'
+import { abTicketCreate } from './ticket'
 import { abUpgrade } from './upgrade'
 
 export interface CliDeps {
@@ -49,6 +51,13 @@ export interface SessionlessCliDeps {
   workspacePath: string
   stdout: (line: string) => void
   stderr: (line: string) => void
+  /** Process environment for sessionless commands that need adapter secrets
+   * (ticket create, dispatch — §8.8); distinct from `env`, the resolved
+   * ambient auth. */
+  processEnv?: Record<string, string | undefined>
+  /** Stop signal for long-running sessionless commands (`ab dispatch`'s watch
+   * loop); the binary aborts it on SIGINT. */
+  signal?: AbortSignal
   store?: BuildStore
   env?: CliEnv
   forge?: Forge
@@ -95,11 +104,15 @@ const HELP = [
   '',
   '  ab init [target] [--force]             vendor the default skills into a repo as ab-* + autobuild.toml (§16.3; runs outside sessions)',
   '  ab upgrade [target]                    three-way merge vendored ab-* skills with the new defaults (§16.3; runs outside sessions)',
+  '  ab ticket create <title> --body <file> [--labels a,b]',
+  '                                         file a ticket to the configured [tickets] source (§8.8; runs outside sessions)',
+  '  ab dispatch [--once] [--interval <s>] [--store <ref>]',
+  '                                         run the outer loop for this repo — janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
   '',
   'Every phase ends with exactly one terminal command (D5).',
 ].join('\n')
 
-const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report'])
+const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report', 'body', 'labels'])
 const BOOLEAN_FLAGS = new Set(['json'])
 
 interface ParsedArgs {
@@ -235,6 +248,75 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         targetRepo: target ?? deps.workspacePath,
         stdout,
         ...(deps.exec !== undefined ? { exec: deps.exec } : {}),
+      })
+      return 0
+    }
+
+    // ticket runs OUTSIDE build sessions too (§8.8): it files to the repo's
+    // configured TicketSource, before any build exists.
+    case 'ticket': {
+      const [sub, ...more] = rest
+      const usage = 'usage: ab ticket create <title> --body <file> [--labels a,b] (§8.8)'
+      if (sub !== 'create') {
+        throw new Error(usage)
+      }
+      const parsed = parseArgs(more)
+      const title = parsed.positionals.join(' ')
+      const bodyFile = stringFlag(parsed, 'body')
+      if (title === '' || bodyFile === undefined) {
+        throw new Error(usage)
+      }
+      const labels = listFlag(parsed, 'labels')
+      await abTicketCreate({
+        targetRepo: deps.workspacePath,
+        title,
+        bodyFile,
+        ...(labels !== undefined ? { labels } : {}),
+        env: deps.processEnv ?? {},
+        stdout,
+      })
+      return 0
+    }
+
+    // dispatch runs OUTSIDE build sessions (§3.3, §12): it serves a repo, not
+    // a build, so it routes before any store/env requirement and does its own
+    // heavy wiring (like ticket create). One dispatcher per repo (§12).
+    case 'dispatch': {
+      const usage = 'usage: ab dispatch [--once] [--interval <seconds>] [--store <ref>] (§3.3)'
+      let once = false
+      let intervalMs: number | undefined
+      let storeRef: string | undefined
+      for (let i = 0; i < rest.length; i += 1) {
+        const arg = rest[i]!
+        if (arg === '--once') {
+          once = true
+        } else if (arg === '--interval') {
+          const value = rest[(i += 1)]
+          const seconds = value === undefined ? NaN : Number(value)
+          if (!Number.isFinite(seconds) || seconds <= 0) {
+            throw new Error(`--interval requires a positive number of seconds — ${usage}`)
+          }
+          intervalMs = Math.round(seconds * 1000)
+        } else if (arg === '--store') {
+          storeRef = rest[(i += 1)]
+          if (storeRef === undefined) throw new Error(`--store requires a value — ${usage}`)
+        } else {
+          throw new Error(`unknown argument "${arg}" — ${usage}`)
+        }
+      }
+      if (deps.exec === undefined) {
+        throw new Error("'ab dispatch' needs an exec seam — this is a wiring bug in the ab binary")
+      }
+      await abDispatch({
+        targetRepo: deps.workspacePath,
+        env: deps.processEnv ?? {},
+        exec: deps.exec,
+        stdout,
+        stderr,
+        once,
+        ...(intervalMs !== undefined ? { intervalMs } : {}),
+        ...(storeRef !== undefined ? { storeRef } : {}),
+        ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
       })
       return 0
     }

@@ -282,6 +282,66 @@ describe('LinearTicketSource', () => {
     expect(created.labels).toEqual(['autobuild'])
   })
 
+  test('create with createState resolves the state id and files the issue there', async () => {
+    const { fetchFn, calls } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: { issueCreate: { success: true, issue: gqlIssue() } },
+        },
+      },
+    ])
+    const source = new LinearTicketSource({
+      apiKey: 'lin_api_test',
+      teamKey: 'ENG',
+      fetchFn,
+      createState: 'Ready',
+    })
+
+    await source.create({ title: 'X', body: 'y' })
+
+    expect(calls[1]?.variables).toEqual({
+      input: {
+        teamId: 'team-uuid',
+        title: 'X',
+        description: 'y',
+        labelIds: [],
+        stateId: 'st-ready',
+      },
+    })
+  })
+
+  test('create without createState sends no stateId — the team default applies', async () => {
+    const { fetchFn, calls } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: { issueCreate: { success: true, issue: gqlIssue() } },
+        },
+      },
+    ])
+
+    await makeSource(fetchFn).create({ title: 'X', body: 'y' })
+
+    const input = (calls[1]?.variables as { input: Record<string, unknown> }).input
+    expect(input['stateId']).toBeUndefined()
+  })
+
+  test('create with a createState the team lacks throws with the known states', async () => {
+    const { fetchFn, calls } = fakeLinear([TEAM_INFO_RESPONSE])
+    const source = new LinearTicketSource({
+      apiKey: 'lin_api_test',
+      teamKey: 'ENG',
+      fetchFn,
+      createState: 'Icebox',
+    })
+
+    await expect(source.create({ title: 'X', body: 'y' })).rejects.toThrow(
+      /no workflow state "Icebox".*Ready, In Progress, Done/,
+    )
+    expect(calls).toHaveLength(1) // resolved team info, mutated nothing
+  })
+
   test('create with an unknown label name throws before mutating', async () => {
     const { fetchFn, calls } = fakeLinear([TEAM_INFO_RESPONSE])
 

@@ -68,11 +68,11 @@ readyLabels = ["autobuild"] # labels that mark a ticket dispatchable ([] = no la
 # Ticket source the dispatcher drives (§3.2, §13). The Linear API key is a
 # secret — set the LINEAR_API_KEY environment variable (a local .env works),
 # never put it in this file.
-#[tickets]
-#source = "linear"
-#teamKey = "ENG"                 # Linear team key
-#claimedState = "In Progress"    # workflow state claim() moves an issue to
-#createState = "Triage"          # state new tickets are filed into (absent = provider default)
+[tickets]
+source = "linear"
+teamKey = "AUT"                 # Linear team key ("Auto-build")
+claimedState = "In Progress"    # workflow state claim() moves an issue to
+#createState = "Triage"         # state new tickets are filed into (absent = provider default)
 # — or file-based: source = "file" with dir = "tickets"
 
 # Cron schedules for outer-loop processes (§12).
