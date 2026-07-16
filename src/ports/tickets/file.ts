@@ -23,6 +23,9 @@ const frontmatterSchema = z.strictObject({
   title: z.string().min(1),
   state: z.string().min(1),
   labels: z.array(z.string()),
+  /** This source's native dependency representation. Absent — as in every
+   * ticket written before dependencies existed — means no dependencies. */
+  blockedBy: z.array(z.string().min(1)).optional(),
   claimedBy: z.string().optional(),
 })
 type Frontmatter = z.infer<typeof frontmatterSchema>
@@ -65,6 +68,11 @@ function serializeTicketFile(front: Frontmatter, body: string): string {
     state: front.state,
     labels: front.labels,
   }
+  // Written only when there is something to say, so a dependency-free ticket
+  // round-trips byte-stably through claim/transition rewrites.
+  if (front.blockedBy !== undefined && front.blockedBy.length > 0) {
+    data.blockedBy = front.blockedBy
+  }
   if (front.claimedBy !== undefined) data.claimedBy = front.claimedBy
   // smol-toml stringify ends with a newline; the closing fence follows it.
   return `${OPEN_FENCE}${stringifyToml(data)}+++\n${body}`
@@ -77,6 +85,7 @@ export class FileTicketSource implements TicketSource {
   private readonly clock: Clock
   private readonly claimant: string
   private readonly createState: string
+  private readonly doneState: string
 
   constructor(opts: {
     dir: string
@@ -86,11 +95,19 @@ export class FileTicketSource implements TicketSource {
     claimant?: string
     /** State assigned by create — proposals land in Triage (SPEC §12). */
     createState?: string
+    /**
+     * This source's native "resolved" state — the whole of what `complete`
+     * means for file tickets (SPEC §13). Defaults to 'Done', deliberately
+     * matching `DispatcherOpts.doneState`'s default so the two agree out of
+     * the box.
+     */
+    doneState?: string
   }) {
     this.dir = opts.dir
     this.clock = opts.clock ?? systemClock
     this.claimant = opts.claimant ?? 'dispatcher'
     this.createState = opts.createState ?? 'Triage'
+    this.doneState = opts.doneState ?? 'Done'
   }
 
   async listReady(criteria: {
@@ -153,11 +170,13 @@ export class FileTicketSource implements TicketSource {
     const existing = new Set(await readdir(this.dir))
     let n = 1
     while (existing.has(`file-${n}.md`)) n += 1
+    const blockedBy = draft.blockedBy ?? []
     const front: Frontmatter = {
       id: `file-${n}`,
       title: draft.title,
       state: this.createState,
       labels: [...(draft.labels ?? [])],
+      ...(blockedBy.length > 0 ? { blockedBy: [...blockedBy] } : {}),
     }
     await this.write(front.id, front, draft.body)
     return this.toTicket(front, draft.body)
@@ -223,6 +242,8 @@ export class FileTicketSource implements TicketSource {
       body,
       state: front.state,
       labels: [...front.labels],
+      blockedBy: [...(front.blockedBy ?? [])],
+      complete: front.state === this.doneState,
     }
   }
 }

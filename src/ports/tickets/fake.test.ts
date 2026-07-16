@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import type { Ticket } from '../types'
-import { FakeTicketSource } from './fake'
+import { runTicketSourceContract } from './contract'
+import { FakeTicketSource, type TicketSeed } from './fake'
 
-function ticket(id: string, over: Partial<Omit<Ticket, 'ref'>> = {}): Ticket {
+function ticket(id: string, over: Partial<Omit<TicketSeed, 'ref'>> = {}): TicketSeed {
   return {
     ref: { source: 'fake', id },
     title: over.title ?? `Ticket ${id}`,
@@ -126,3 +126,8 @@ describe('FakeTicketSource', () => {
     expect(await source.get('nope')).toBeNull()
   })
 })
+
+runTicketSourceContract('fake', async () => ({
+  source: new FakeTicketSource(),
+  doneState: 'Done',
+}))

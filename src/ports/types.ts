@@ -18,12 +18,33 @@ export interface Ticket {
   body: string
   state?: string
   labels: string[]
+  /**
+   * Source-local ids of the tickets that block this one, mapped from whatever
+   * the provider natively stores (Linear `blocks` relations, file frontmatter
+   * `blockedBy`). Required: `[]` means "no dependencies" — an adapter that
+   * cannot answer must say so explicitly, never by omission.
+   */
+  blockedBy: string[]
+  /**
+   * Is this ticket resolved *according to the source's own lifecycle*? Linear
+   * answers from its workflow state type; the file source answers from its
+   * done-state. Auto-build never models resolution itself — it only reads the
+   * provider's answer (SPEC §13; redefining completed/canceled is out of
+   * scope).
+   */
+  complete: boolean
 }
 
 export interface TicketDraft {
   title: string
   body: string
   labels?: string[]
+  /**
+   * Creation-time blockers, as source-local ids. Every adapter MUST
+   * materialize these natively or throw — silently discarding a requested
+   * dependency would make the ticket dispatchable too early.
+   */
+  blockedBy?: string[]
 }
 
 export interface TicketSource {

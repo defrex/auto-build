@@ -6,6 +6,15 @@
  */
 import type { Ticket, TicketDraft, TicketSource } from '../types'
 
+/**
+ * A seed literal: the dependency fields are provider-native answers, so the
+ * fake derives them when a test does not care — `blockedBy` defaults to none,
+ * and `complete` to "the seed state is the done-state". Tests that DO care
+ * state either explicitly.
+ */
+export type TicketSeed = Omit<Ticket, 'blockedBy' | 'complete'> &
+  Partial<Pick<Ticket, 'blockedBy' | 'complete'>>
+
 function cloneTicket(ticket: Ticket): Ticket {
   return {
     ref: { ...ticket.ref },
@@ -13,6 +22,8 @@ function cloneTicket(ticket: Ticket): Ticket {
     body: ticket.body,
     state: ticket.state,
     labels: [...ticket.labels],
+    blockedBy: [...ticket.blockedBy],
+    complete: ticket.complete,
   }
 }
 
@@ -26,19 +37,36 @@ export class FakeTicketSource implements TicketSource {
   private readonly tickets = new Map<string, Ticket>()
   private readonly claimed = new Set<string>()
   private readonly createState: string
+  private readonly doneState: string
   private nextId = 1
 
   constructor(
-    seed: Ticket[] = [],
+    seed: TicketSeed[] = [],
     opts: {
       /** State assigned by create — proposals land in Triage (SPEC §12). */
       createState?: string
+      /** This source's native "resolved" state — what `complete` means here. */
+      doneState?: string
     } = {},
   ) {
-    for (const ticket of seed) {
-      this.tickets.set(ticket.ref.id, cloneTicket(ticket))
-    }
     this.createState = opts.createState ?? 'Triage'
+    this.doneState = opts.doneState ?? 'Done'
+    for (const ticket of seed) {
+      this.tickets.set(ticket.ref.id, this.normalize(ticket))
+    }
+  }
+
+  private normalize(seed: TicketSeed): Ticket {
+    return cloneTicket({
+      ...seed,
+      blockedBy: seed.blockedBy ?? [],
+      complete: seed.complete ?? seed.state === this.doneState,
+    })
+  }
+
+  /** True exactly when the ticket has been claimed — for seam assertions. */
+  isClaimed(id: string): boolean {
+    return this.claimed.has(id)
   }
 
   async listReady(criteria: {
@@ -72,9 +100,11 @@ export class FakeTicketSource implements TicketSource {
     this.comments.push({ id, body })
   }
 
+  /** Completion is native (SPEC §13): reaching the done-state resolves it. */
   async transition(id: string, state: string): Promise<void> {
     const ticket = this.require(id, 'transition')
     ticket.state = state
+    ticket.complete = state === this.doneState
     this.transitions.push({ id, state })
   }
 
@@ -86,6 +116,8 @@ export class FakeTicketSource implements TicketSource {
       body: draft.body,
       state: this.createState,
       labels: [...(draft.labels ?? [])],
+      blockedBy: [...(draft.blockedBy ?? [])],
+      complete: this.createState === this.doneState,
     }
     this.tickets.set(id, ticket)
     return cloneTicket(ticket)

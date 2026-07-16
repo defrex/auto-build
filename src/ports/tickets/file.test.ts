@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { manualClock } from '../../testing/fixed'
+import { runTicketSourceContract } from './contract'
 import { FileTicketSource } from './file'
 
 let dir: string
@@ -218,8 +219,85 @@ describe('FileTicketSource', () => {
     expect(got?.body).toBe('evidence…')
   })
 
+  test('blockedBy serializes into TOML frontmatter and re-parses (§13)', async () => {
+    const src = source()
+    const blocker = await src.create({ title: 'Blocker', body: 'b' })
+    const created = await src.create({
+      title: 'Dependent',
+      body: 'b',
+      blockedBy: [blocker.ref.id, 'file-9'],
+    })
+
+    const raw = await readFile(join(dir, `${created.ref.id}.md`), 'utf8')
+    expect(raw).toContain('blockedBy = [ "file-1", "file-9" ]')
+    expect((await src.get(created.ref.id))?.blockedBy).toEqual(['file-1', 'file-9'])
+  })
+
+  test('a legacy ticket without blockedBy stays valid and has no dependencies', async () => {
+    // Exactly what every ticket written before this feature looks like.
+    await writeFile(
+      join(dir, 'file-1.md'),
+      '+++\nid = "file-1"\ntitle = "Legacy"\nstate = "Ready"\nlabels = []\n+++\nbody\n',
+    )
+    const ticket = await source().get('file-1')
+    expect(ticket?.blockedBy).toEqual([])
+    expect(ticket?.title).toBe('Legacy')
+  })
+
+  test('a dependency-free ticket does not gain a blockedBy key on rewrite', async () => {
+    const src = source()
+    const created = await src.create({ title: 'No deps', body: 'body\n' })
+    const before = await readFile(join(dir, `${created.ref.id}.md`), 'utf8')
+    expect(before).not.toContain('blockedBy')
+
+    // Byte-stability: an untouched dependency field must not materialize just
+    // because some other write went past it.
+    await src.transition(created.ref.id, 'Ready')
+    const after = await readFile(join(dir, `${created.ref.id}.md`), 'utf8')
+    expect(after).not.toContain('blockedBy')
+    expect(after).toBe(before.replace('state = "Triage"', 'state = "Ready"'))
+  })
+
+  test('blockedBy survives claim and transition rewrites', async () => {
+    const src = source()
+    const created = await src.create({ title: 'Dependent', body: 'b', blockedBy: ['file-9'] })
+    await src.claim(created.ref.id)
+    await src.transition(created.ref.id, 'In Progress')
+    expect((await src.get(created.ref.id))?.blockedBy).toEqual(['file-9'])
+  })
+
+  test('complete is true only in the done state, which is native and configurable', async () => {
+    const src = source()
+    const created = await src.create({ title: 'Lifecycle', body: 'b' })
+    expect(created.complete).toBe(false)
+
+    await src.transition(created.ref.id, 'In Progress')
+    expect((await src.get(created.ref.id))?.complete).toBe(false)
+
+    await src.transition(created.ref.id, 'Done')
+    expect((await src.get(created.ref.id))?.complete).toBe(true)
+
+    // A source configured with a different native done-state answers by ITS
+    // lifecycle, not a hardcoded 'Done'.
+    const shipped = source({ doneState: 'Shipped' })
+    expect((await shipped.get(created.ref.id))?.complete).toBe(false)
+    await shipped.transition(created.ref.id, 'Shipped')
+    expect((await shipped.get(created.ref.id))?.complete).toBe(true)
+  })
+
   test('ids that escape the ticket directory are rejected', async () => {
     const tickets = source()
     await expect(tickets.get('../escape')).rejects.toThrow('invalid ticket id')
   })
+})
+
+// Its own tmpdir per case: the suite's factory owns the lifecycle, so it does
+// not ride on this file's beforeEach/afterEach.
+runTicketSourceContract('file', async () => {
+  const contractDir = await mkdtemp(join(tmpdir(), 'ab-file-contract-'))
+  return {
+    source: new FileTicketSource({ dir: contractDir }),
+    doneState: 'Done',
+    cleanup: () => rm(contractDir, { recursive: true, force: true }),
+  }
 })
