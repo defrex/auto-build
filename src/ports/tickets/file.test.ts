@@ -37,12 +37,15 @@ const SPEC_BODY = [
 /** Seed `<state>/<id>.md` — the state is the directory, so it's a param of the path. */
 async function seedTicket(
   id: string,
-  over: { state?: string; labels?: string[]; body?: string } = {},
+  over: { state?: string; labels?: string[]; body?: string; blockedBy?: string[] } = {},
 ): Promise<string> {
   const state = (over.state ?? 'ready').toLowerCase()
   const lines = ['+++', `id = ${JSON.stringify(id)}`, `title = "Ticket ${id}"`]
   if (over.labels !== undefined) {
     lines.push(`labels = [ ${over.labels.map((l) => JSON.stringify(l)).join(', ')} ]`)
+  }
+  if (over.blockedBy !== undefined) {
+    lines.push(`blockedBy = [ ${over.blockedBy.map((b) => JSON.stringify(b)).join(', ')} ]`)
   }
   lines.push('+++')
   const content = `${lines.join('\n')}\n${over.body ?? SPEC_BODY}`
@@ -408,5 +411,129 @@ describe('FileTicketSource', () => {
 
   test('ids that escape the ticket directory are rejected', async () => {
     await expect(source().get('../escape')).rejects.toThrow('invalid ticket id')
+  })
+
+  // ── Dependencies (§13) ─────────────────────────────────────────────────────
+
+  test('blockedBy round-trips through TOML frontmatter', async () => {
+    await seedTicket('file-1', { blockedBy: ['file-2', 'file-3'] })
+    const tickets = source()
+
+    expect((await tickets.get('file-1'))?.blockedBy).toEqual(['file-2', 'file-3'])
+  })
+
+  test('create records blockedBy in the frontmatter and reports it back', async () => {
+    const tickets = source()
+
+    const created = await tickets.create({
+      title: 'Dependent',
+      body: 'body',
+      blockedBy: ['file-9'],
+    })
+
+    expect(created.blockedBy).toEqual(['file-9'])
+    const written = await readFile(path('triage', created.ref.id), 'utf8')
+    expect(written).toContain('blockedBy = [ "file-9" ]')
+  })
+
+  test('a ticket without blockedBy is valid and reports no dependencies', async () => {
+    await seedTicket('file-1')
+    const tickets = source()
+
+    const ticket = await tickets.get('file-1')
+
+    expect(ticket?.blockedBy).toBeUndefined()
+    expect(await tickets.dependencyStates(['file-1'])).toEqual([
+      { id: 'file-1', exists: true, resolved: false, blockedBy: [] },
+    ])
+  })
+
+  /** The churn guard: a file that never declared blockers must not sprout
+   * `blockedBy = []`, or every existing ticket rewrites. A transition is a
+   * rename, so the content must arrive at the new state byte-identically —
+   * this pins that the dependency field added no rewrite path of its own. */
+  test('a file without blockedBy survives a transition byte-identically', async () => {
+    const original = await seedTicket('file-1', { state: 'Ready', labels: ['autobuild'] })
+    const tickets = source()
+
+    await tickets.transition('file-1', 'Doing')
+    const after = await readFile(path('doing', 'file-1'), 'utf8')
+
+    expect(after).toBe(original)
+    expect(after).not.toContain('blockedBy')
+  })
+
+  test('create without blockedBy writes no blockedBy key', async () => {
+    const tickets = source()
+    const created = await tickets.create({ title: 'Plain', body: 'body' })
+
+    const written = await readFile(path('triage', created.ref.id), 'utf8')
+    expect(written).not.toContain('blockedBy')
+  })
+
+  test('dependencyStates: only the done state resolves; every other state blocks', async () => {
+    await seedTicket('file-1', { state: 'Done' })
+    await seedTicket('file-2', { state: 'Ready' })
+    await seedTicket('file-3', { state: 'Doing' })
+    await seedTicket('file-4', { state: 'Triage' })
+    const tickets = source()
+
+    const states = await tickets.dependencyStates([
+      'file-1',
+      'file-2',
+      'file-3',
+      'file-4',
+    ])
+
+    expect(states.map((s) => s.resolved)).toEqual([true, false, false, false])
+  })
+
+  /** The done state is configurable, but only within the closed set of state
+   * directories — `doneState` is canonicalized like every other state name,
+   * so it can rename which directory means complete, never invent a fifth. */
+  test('dependencyStates honors a custom doneState', async () => {
+    await seedTicket('file-1', { state: 'Doing' })
+    const tickets = source({ doneState: 'Doing' })
+
+    expect((await tickets.dependencyStates(['file-1']))[0]?.resolved).toBe(true)
+    // …and the default no longer resolves it.
+    expect((await source().dependencyStates(['file-1']))[0]?.resolved).toBe(false)
+  })
+
+  test('an unknown doneState is a loud error, not a silently dead gate', async () => {
+    expect(() => source({ doneState: 'Shipped' })).toThrow(/unknown state "Shipped"/)
+  })
+
+  test('dependencyStates covers every requested id, in request order', async () => {
+    await seedTicket('file-2', { state: 'Done', blockedBy: ['file-7'] })
+    const tickets = source()
+
+    const states = await tickets.dependencyStates(['file-404', 'file-2'])
+
+    expect(states).toEqual([
+      { id: 'file-404', exists: false, resolved: false, blockedBy: [] },
+      { id: 'file-2', exists: true, resolved: true, blockedBy: ['file-7'] },
+    ])
+  })
+
+  /** A bad reference is a missing dependency, not a crashed tick. */
+  test('dependencyStates reports an unusable id as missing rather than throwing', async () => {
+    const tickets = source()
+
+    expect(await tickets.dependencyStates(['../escape'])).toEqual([
+      { id: '../escape', exists: false, resolved: false, blockedBy: [] },
+    ])
+  })
+
+  /** …but a malformed file IS operator error about a real ticket: it throws,
+   * and the dispatcher confines the damage to the ticket that referenced it. */
+  test('dependencyStates throws on a malformed blocker file', async () => {
+    await mkdir(join(dir, 'ready'), { recursive: true })
+    await writeFile(path('ready', 'file-1'), '+++\nnot toml =\n+++\nbody\n')
+    const tickets = source()
+
+    await expect(tickets.dependencyStates(['file-1'])).rejects.toThrow(
+      /file-1\.md: malformed TOML frontmatter/,
+    )
   })
 })

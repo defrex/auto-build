@@ -28,13 +28,20 @@ async function writeRepo(configToml: string): Promise<void> {
   await writeFile(join(tmp, 'autobuild.toml'), configToml)
 }
 
-/** A capturing fake: records the draft and config it was constructed from. */
-function fakeFactory(created: {
-  config?: TicketsConfig
-  env?: Record<string, string | undefined>
-  targetRepo?: string
-  draft?: TicketDraft
-}) {
+/**
+ * A capturing fake: records the draft and config it was constructed from.
+ * `known` is the set of ids `dependencyStates` reports as existing — how the
+ * blocker-validation tests distinguish a real blocker from a typo.
+ */
+function fakeFactory(
+  created: {
+    config?: TicketsConfig
+    env?: Record<string, string | undefined>
+    targetRepo?: string
+    draft?: TicketDraft
+  },
+  known: string[] = [],
+) {
   return (
     config: TicketsConfig,
     env: Record<string, string | undefined>,
@@ -50,6 +57,15 @@ function fakeFactory(created: {
       claim: () => Promise.resolve(false),
       comment: () => Promise.resolve(),
       transition: () => Promise.resolve(),
+      dependencyStates: (ids: string[]) =>
+        Promise.resolve(
+          ids.map((id) => ({
+            id,
+            exists: known.includes(id),
+            resolved: false,
+            blockedBy: [],
+          })),
+        ),
       create: (draft: TicketDraft): Promise<Ticket> => {
         created.draft = draft
         return Promise.resolve({
@@ -58,6 +74,7 @@ function fakeFactory(created: {
           body: draft.body,
           state: 'Triage',
           labels: draft.labels ?? [],
+          ...(draft.blockedBy !== undefined ? { blockedBy: draft.blockedBy } : {}),
         })
       },
     }
@@ -156,6 +173,96 @@ describe('abTicketCreate', () => {
     expect(lines).toEqual(['ticket created: file:file-1 (Triage)'])
   })
 
+  test('--blocked-by reaches the draft and the success line names the blockers', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    const created: Parameters<typeof fakeFactory>[0] = {}
+    const out: string[] = []
+
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Dependent work',
+      bodyFile,
+      blockedBy: ['AUT-8', 'AUT-9'],
+      env: {},
+      stdout: (line) => out.push(line),
+      sourceFactory: fakeFactory(created, ['AUT-8', 'AUT-9']),
+    })
+
+    expect(created.draft?.blockedBy).toEqual(['AUT-8', 'AUT-9'])
+    expect(out).toEqual([
+      'ticket created: fake:fake-1 (Triage) — blocked by AUT-8, AUT-9 — https://example.test/fake-1',
+    ])
+  })
+
+  test('an unknown blocker is an actionable error and NO ticket is created', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    const created: Parameters<typeof fakeFactory>[0] = {}
+
+    await expect(
+      abTicketCreate({
+        targetRepo: tmp,
+        title: 'Dependent work',
+        bodyFile,
+        blockedBy: ['AUT-8', 'AUT-99'],
+        env: {},
+        stdout: () => {},
+        sourceFactory: fakeFactory(created, ['AUT-8']),
+      }),
+    ).rejects.toThrow(/--blocked-by: no ticket "AUT-99" in the configured fake/)
+    // Validation precedes creation: nothing was filed.
+    expect(created.draft).toBeUndefined()
+  })
+
+  test('duplicate blocker ids are deduped rather than rejected', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    const created: Parameters<typeof fakeFactory>[0] = {}
+
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Dependent work',
+      bodyFile,
+      blockedBy: ['AUT-8', 'AUT-8'],
+      env: {},
+      stdout: () => {},
+      sourceFactory: fakeFactory(created, ['AUT-8']),
+    })
+
+    expect(created.draft?.blockedBy).toEqual(['AUT-8'])
+  })
+
+  test('with source = "file", --blocked-by records the blocker in TOML frontmatter', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'blocker body\n')
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Blocker',
+      bodyFile,
+      env: {},
+      stdout: () => {},
+    })
+
+    const out: string[] = []
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Dependent',
+      bodyFile,
+      blockedBy: ['file-1'],
+      env: {},
+      stdout: (line) => out.push(line),
+    })
+
+    expect(out).toEqual(['ticket created: file:file-2 (Triage) — blocked by file-1'])
+    const written = await readFile(join(tmp, 'tickets', 'triage', 'file-2.md'), 'utf8')
+    expect(written).toContain('blockedBy = [ "file-1" ]')
+  })
+
   test('a missing body file is an error naming the path', async () => {
     await writeRepo(FILE_TICKETS_TOML)
     expect(
@@ -204,5 +311,34 @@ describe('runCli — ticket routing', () => {
     const { deps, out } = sessionlessDeps()
     expect(await runCli(['ticket', 'create', 'A', 'title', '--body', bodyFile], deps)).toBe(0)
     expect(out.join('\n')).toContain('ticket created: file:file-1')
+  })
+
+  test('--blocked-by parses comma-separated ids and reaches the source', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    const { deps, out } = sessionlessDeps()
+    expect(await runCli(['ticket', 'create', 'Blocker', '--body', bodyFile], deps)).toBe(0)
+    expect(
+      await runCli(
+        ['ticket', 'create', 'Dependent', '--body', bodyFile, '--blocked-by', 'file-1'],
+        deps,
+      ),
+    ).toBe(0)
+    expect(out.join('\n')).toContain('ticket created: file:file-2 (Triage) — blocked by file-1')
+  })
+
+  test('an unknown --blocked-by id exits nonzero with the actionable error', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    const { deps, err } = sessionlessDeps()
+    expect(
+      await runCli(
+        ['ticket', 'create', 'Dependent', '--body', bodyFile, '--blocked-by', 'file-404'],
+        deps,
+      ),
+    ).toBe(1)
+    expect(err.join('\n')).toContain('--blocked-by: no ticket "file-404"')
   })
 })

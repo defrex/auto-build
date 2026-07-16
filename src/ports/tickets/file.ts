@@ -24,7 +24,7 @@ import { join } from 'node:path'
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
 import { z } from 'zod'
 import { systemClock, type Clock } from '../../store/types'
-import type { Ticket, TicketDraft, TicketSource } from '../types'
+import type { DependencyState, Ticket, TicketDraft, TicketSource } from '../types'
 
 /**
  * The canonical states, in workflow order. This set is closed: the states are
@@ -62,6 +62,9 @@ const frontmatterSchema = z.strictObject({
   id: z.string().min(1),
   title: z.string().min(1),
   labels: z.array(z.string()).default([]),
+  /** Source-local blocker ids (§13). Absent ≡ no dependencies, which keeps
+   * every pre-existing ticket file valid. */
+  blockedBy: z.array(z.string()).optional(),
 })
 type Frontmatter = z.infer<typeof frontmatterSchema>
 
@@ -99,6 +102,11 @@ function parseTicketFile(
 function serializeTicketFile(front: Frontmatter, body: string): string {
   const data: Record<string, unknown> = { id: front.id, title: front.title }
   if (front.labels.length > 0) data.labels = front.labels
+  // Only when nonempty: a file that never declared blockers must round-trip
+  // byte-identically rather than sprouting `blockedBy = []` on every write.
+  if (front.blockedBy !== undefined && front.blockedBy.length > 0) {
+    data.blockedBy = front.blockedBy
+  }
   // smol-toml stringify ends with a newline; the closing fence follows it.
   return `${OPEN_FENCE}${stringifyToml(data)}+++\n${body}`
 }
@@ -116,6 +124,7 @@ export class FileTicketSource implements TicketSource {
   private readonly dir: string
   private readonly clock: Clock
   private readonly createState: TicketState
+  private readonly doneState: TicketState
   private readonly selfIgnore: boolean
 
   constructor(opts: {
@@ -124,6 +133,13 @@ export class FileTicketSource implements TicketSource {
     clock?: Clock
     /** State assigned by create — proposals land in Triage (SPEC §12). */
     createState?: string
+    /**
+     * The state this source considers complete, for dependency resolution
+     * (§13: this adapter's native lifecycle). Default 'Done' — and, like every
+     * state here, it names a directory, so it is canonicalized rather than
+     * compared raw.
+     */
+    doneState?: string
     /**
      * Write a self-excluding `<dir>/.gitignore`. Set ONLY for the defaulted
      * `.autobuild/tickets` backlog (see createTicketSource): an explicitly
@@ -135,6 +151,7 @@ export class FileTicketSource implements TicketSource {
     this.dir = opts.dir
     this.clock = opts.clock ?? systemClock
     this.createState = stateDir(opts.createState ?? 'Triage')
+    this.doneState = stateDir(opts.doneState ?? 'Done')
     this.selfIgnore = opts.selfIgnore ?? false
   }
 
@@ -223,12 +240,56 @@ export class FileTicketSource implements TicketSource {
       id: `file-${n}`,
       title: draft.title,
       labels: [...(draft.labels ?? [])],
+      ...(draft.blockedBy !== undefined && draft.blockedBy.length > 0
+        ? { blockedBy: [...draft.blockedBy] }
+        : {}),
     }
     await writeFile(
       this.pathIn(this.createState, front.id),
       serializeTicketFile(front, draft.body),
     )
     return this.toTicket(front, draft.body, this.createState)
+  }
+
+  /**
+   * Dependency nodes (§13). Resolution is this source's own lifecycle, and
+   * this source's lifecycle is the filesystem: a blocker is complete when its
+   * file sits in the done directory. Nothing is read from the frontmatter to
+   * decide it — there is no `state` field to disagree with the directory.
+   *
+   * An id that cannot name a file (path traversal) is reported as
+   * `exists: false` rather than thrown: a bad reference is a missing
+   * dependency, and one ticket's typo must not abort the whole tick. A
+   * *malformed* file still throws — that is operator error about a real
+   * ticket, and the dispatcher confines the blast radius to the one ticket
+   * that referenced it.
+   */
+  async dependencyStates(ids: string[]): Promise<DependencyState[]> {
+    const states: DependencyState[] = []
+    for (const id of ids) {
+      let found: Located | null
+      try {
+        found = await this.locate(id)
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('invalid ticket id')) {
+          states.push({ id, exists: false, resolved: false, blockedBy: [] })
+          continue
+        }
+        throw error
+      }
+      if (found === null) {
+        states.push({ id, exists: false, resolved: false, blockedBy: [] })
+        continue
+      }
+      const loaded = await this.loadAt(found)
+      states.push({
+        id,
+        exists: true,
+        resolved: found.state === this.doneState,
+        blockedBy: [...(loaded.front.blockedBy ?? [])],
+      })
+    }
+    return states
   }
 
   /**
@@ -339,6 +400,9 @@ export class FileTicketSource implements TicketSource {
       body,
       state,
       labels: [...front.labels],
+      ...(front.blockedBy !== undefined && front.blockedBy.length > 0
+        ? { blockedBy: [...front.blockedBy] }
+        : {}),
     }
   }
 }
