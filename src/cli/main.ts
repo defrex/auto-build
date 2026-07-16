@@ -22,9 +22,33 @@ import type { CliEnv } from './env'
 import { abInit } from './init'
 import { observe } from './observe'
 import { ServerControl } from './server-control'
+import { abBuilds, abBuildStatus } from './status'
 import { done, escalate, verdict } from './terminals'
 import { abTicketCreate } from './ticket'
 import { abUpgrade } from './upgrade'
+
+/**
+ * Commands that run OUTSIDE build sessions (§16.3, §8.8, §3.3) — they take a
+ * repo path, not a build, so they must work with no AB_* environment set.
+ *
+ * `bin/ab.ts` routes on this set: a command absent from it goes through
+ * `resolveCliEnv`, which REQUIRES AB_STORE/AB_BUILD/AB_PHASE/AB_SESSION and
+ * exits 1 before routing. It lives here, beside the `switch` that implements
+ * these commands, so the next sessionless command has one obvious place to
+ * register — and so the list is unit-testable, which a literal inside the
+ * binary is not.
+ */
+export const SESSIONLESS_COMMANDS = new Set([
+  'init',
+  'upgrade',
+  'ticket',
+  'dispatch',
+  'builds',
+  'build',
+  'help',
+  '--help',
+  '-h',
+])
 
 export interface CliDeps {
   store: BuildStore
@@ -110,6 +134,12 @@ const HELP = [
   '                                         (e.g. AUT-8 for linear, file-1 for file); dispatch waits for all of them.',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>]',
   '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
+  '  ab builds [--queued] [--all] [--json] [--store <ref>]',
+  '                                         list this repo\'s builds — default: running, paused, blocked; --queued adds queued;',
+  '                                         --all every status (§15.5; read-only, runs outside sessions)',
+  '  ab build status <slug> [--events <n>] [--json] [--store <ref>]',
+  '                                         detailed state for one build — escalations, sessions, verify, PR, lease;',
+  '                                         --events <n> appends the newest n events (read-only, runs outside sessions)',
   '',
   'Every phase ends with exactly one terminal command (D5).',
 ].join('\n')
@@ -323,6 +353,106 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         ...(intervalMs !== undefined ? { intervalMs } : {}),
         ...(storeRef !== undefined ? { storeRef } : {}),
         ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+      })
+      return 0
+    }
+
+    // builds/build status run OUTSIDE build sessions (§16.3) like dispatch:
+    // they query a repo's builds, so they route before any store/env
+    // requirement and resolve their own store (--store > AB_STORE > default).
+    // Arg parsing is local, exactly as dispatch's is: main's parseArgs uses
+    // module-global VALUE_FLAGS/BOOLEAN_FLAGS, so registering --store/--events
+    // there would silently make `ab done --store x` legal.
+    case 'builds': {
+      const usage = 'usage: ab builds [--queued] [--all] [--json] [--store <ref>] (§8.2)'
+      let queued = false
+      let all = false
+      let json = false
+      let storeRef: string | undefined
+      for (let i = 0; i < rest.length; i += 1) {
+        const arg = rest[i]!
+        if (arg === '--queued') {
+          queued = true
+        } else if (arg === '--all') {
+          all = true
+        } else if (arg === '--json') {
+          json = true
+        } else if (arg === '--store') {
+          storeRef = rest[(i += 1)]
+          if (storeRef === undefined) throw new Error(`--store requires a value — ${usage}`)
+        } else {
+          throw new Error(`unknown argument "${arg}" — ${usage}`)
+        }
+      }
+      if (deps.exec === undefined) {
+        throw new Error("'ab builds' needs an exec seam — this is a wiring bug in the ab binary")
+      }
+      await abBuilds({
+        targetRepo: deps.workspacePath,
+        env: deps.processEnv ?? {},
+        exec: deps.exec,
+        stdout,
+        queued,
+        all,
+        json,
+        ...(storeRef !== undefined ? { storeRef } : {}),
+        ...(deps.clock !== undefined ? { now: deps.clock } : {}),
+      })
+      return 0
+    }
+
+    case 'build': {
+      const usage =
+        'usage: ab build status <slug> [--events <n>] [--json] [--store <ref>] (§8.2)'
+      const [sub, ...more] = rest
+      // Only `status` today; the subcommand shape keeps room for `ab build <verb>`.
+      if (sub !== 'status') {
+        throw new Error(usage)
+      }
+      let slug: string | undefined
+      let events: number | undefined
+      let json = false
+      let storeRef: string | undefined
+      for (let i = 0; i < more.length; i += 1) {
+        const arg = more[i]!
+        if (arg === '--json') {
+          json = true
+        } else if (arg === '--events') {
+          const value = more[(i += 1)]
+          const count = value === undefined ? NaN : Number(value)
+          if (!Number.isInteger(count) || count <= 0) {
+            throw new Error(
+              `--events requires a positive integer, got "${value ?? ''}" — ${usage}`,
+            )
+          }
+          events = count
+        } else if (arg === '--store') {
+          storeRef = more[(i += 1)]
+          if (storeRef === undefined) throw new Error(`--store requires a value — ${usage}`)
+        } else if (arg.startsWith('--')) {
+          throw new Error(`unknown argument "${arg}" — ${usage}`)
+        } else if (slug === undefined) {
+          slug = arg
+        } else {
+          throw new Error(`unexpected argument "${arg}" — ${usage}`)
+        }
+      }
+      if (slug === undefined) {
+        throw new Error(usage)
+      }
+      if (deps.exec === undefined) {
+        throw new Error("'ab build' needs an exec seam — this is a wiring bug in the ab binary")
+      }
+      await abBuildStatus({
+        targetRepo: deps.workspacePath,
+        env: deps.processEnv ?? {},
+        exec: deps.exec,
+        stdout,
+        slug,
+        json,
+        ...(events !== undefined ? { events } : {}),
+        ...(storeRef !== undefined ? { storeRef } : {}),
+        ...(deps.clock !== undefined ? { now: deps.clock } : {}),
       })
       return 0
     }
