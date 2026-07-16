@@ -116,6 +116,9 @@ export interface DependencyVerdict {
  * Walks back from `from` looking for a node already on `path`; returns the
  * cycle (first repeated node → … → itself) or null. `explored` prunes nodes
  * proven acyclic on an earlier branch, so a wide graph cannot blow up.
+ *
+ * Note the repeat test is against `path`, not `nodes` — which is why closing a
+ * cycle back onto the ticket under analysis needs no entry for it in `nodes`.
  */
 function findCycle(
   from: string,
@@ -135,17 +138,26 @@ function findCycle(
 }
 
 /**
- * Whether `ticketId` may be dispatched, given the dependency graph `nodes`
- * (which must be closed over the ticket's reachable blockers — see
- * `loadDependencyGraph`). Pure and total: a node the walk cannot find is
- * treated as already-reported-missing rather than throwing. Exported for
- * testing, like `specConformance`.
+ * Whether the ticket `ticketId`, which declares `blockedBy`, may be
+ * dispatched — given `nodes`, closed over its reachable blockers (see
+ * `loadDependencyGraph`).
+ *
+ * The ticket's own blockers are a PARAMETER, not a lookup in `nodes`: they
+ * come from the ticket itself, which is authoritative for them. `nodes` holds
+ * only facts fetched from the source, so nothing here has to fabricate an
+ * entry for the ticket under analysis — a fabrication that, in a cache shared
+ * across a tick, is indistinguishable from a fact about a *blocker* when the
+ * next ticket looks it up.
+ *
+ * Pure and total: a node the walk cannot find is treated as
+ * already-reported-missing rather than throwing. Exported for testing, like
+ * `specConformance`.
  */
 export function analyzeDependencies(
   ticketId: string,
+  blockedBy: string[],
   nodes: Map<string, DependencyState>,
 ): DependencyVerdict {
-  const blockedBy = nodes.get(ticketId)?.blockedBy ?? []
   const unresolved: string[] = []
   const diagnostics: string[] = []
 
@@ -687,7 +699,11 @@ export class Dispatcher {
         let verdict: DependencyVerdict
         try {
           await this.loadDependencyGraph(ticket, nodes)
-          verdict = analyzeDependencies(ticket.ref.id, nodes)
+          verdict = analyzeDependencies(
+            ticket.ref.id,
+            ticket.blockedBy ?? [],
+            nodes,
+          )
         } catch (error) {
           // A broken graph is this ticket's problem, not the tick's: skip it
           // and let unrelated eligible tickets dispatch normally.
@@ -801,34 +817,29 @@ export class Dispatcher {
    * level, skipping ids already cached — the common case (a blocker or two,
    * none of them blocked themselves) is a single call.
    *
-   * The ticket's own node is seeded so a cycle can close back onto it. Its
-   * `resolved: false` is never read as a fact about the ticket: the analyzer
-   * only ever reads a node's `blockedBy` for the ticket itself.
+   * INVARIANT: `nodes` contains only states actually returned by the source.
+   * The cache is shared across the tick's tickets, so a node this ticket
+   * invents is a node the *next* ticket will trust as a fact about its own
+   * blocker. Nothing is seeded here for that reason (f_8bc9ee0c); the
+   * analyzer takes the ticket's own blockers as an argument instead, and
+   * `findCycle` closes a cycle via its path rather than the map.
+   *
+   * A provider-side cycle terminates the walk: an id already in `nodes` is
+   * never re-queued, so every reachable node is fetched exactly once.
    */
   private async loadDependencyGraph(
     ticket: Ticket,
     nodes: Map<string, DependencyState>,
   ): Promise<void> {
-    nodes.set(ticket.ref.id, {
-      id: ticket.ref.id,
-      exists: true,
-      resolved: false,
-      blockedBy: [...(ticket.blockedBy ?? [])],
-    })
-    const seen = new Set<string>([ticket.ref.id])
     let frontier = [...new Set(ticket.blockedBy ?? [])].filter(
       (id) => !nodes.has(id),
     )
     while (frontier.length > 0) {
       const states = await this.deps.tickets.dependencyStates(frontier)
-      for (const state of states) {
-        nodes.set(state.id, state)
-        seen.add(state.id)
-      }
-      // A provider-side cycle terminates here: every node is visited once.
-      frontier = [
-        ...new Set(states.flatMap((state) => state.blockedBy)),
-      ].filter((id) => !seen.has(id) && !nodes.has(id))
+      for (const state of states) nodes.set(state.id, state)
+      frontier = [...new Set(states.flatMap((state) => state.blockedBy))].filter(
+        (id) => !nodes.has(id),
+      )
     }
   }
 
