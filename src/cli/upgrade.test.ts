@@ -9,7 +9,15 @@
  * real distribution only anchors init.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -77,6 +85,56 @@ function installedForm(name: string, body: string): string {
 async function install(): Promise<void> {
   await abInit({ targetRepo: target, distRoot: distV1 })
 }
+
+describe('abUpgrade — legacy project path migration', () => {
+  test('moves the complete .agent tree before upgrading and repairs Claude links', async () => {
+    const local = installedForm('alpha', BODY.replace('intro line one', 'intro line one (local)'))
+    const pristine = installedForm('alpha', BODY)
+    const oldRoot = join(target, '.agent', 'skills')
+    const oldLive = join(oldRoot, 'ab-alpha', 'SKILL.md')
+    const oldPristine = join(oldRoot, '.ab-pristine', 'ab-alpha', 'SKILL.md')
+    const oldCustom = join(oldRoot, 'ab-custom', 'SKILL.md')
+    await mkdir(dirname(oldLive), { recursive: true })
+    await mkdir(dirname(oldPristine), { recursive: true })
+    await mkdir(dirname(oldCustom), { recursive: true })
+    await writeFile(oldLive, local)
+    await writeFile(join(dirname(oldLive), 'notes.md'), 'supporting file\n')
+    await writeFile(oldPristine, pristine)
+    await writeFile(oldCustom, '---\nname: ab-custom\n---\nlocal addition\n')
+
+    const claudeRoot = join(target, '.claude', 'skills')
+    await mkdir(claudeRoot, { recursive: true })
+    await symlink('../../.agent/skills/ab-alpha', join(claudeRoot, 'ab-alpha'), 'dir')
+    await symlink('../../.agent/skills/ab-custom', join(claudeRoot, 'ab-custom'), 'dir')
+    await writeDist(distV2, { alpha: BODY })
+
+    const report = await abUpgrade({ targetRepo: target, distRoot: distV2 })
+
+    expect(report.skills).toEqual([
+      { skill: 'ab-alpha', action: 'current' },
+      {
+        skill: 'ab-custom',
+        action: 'unknown',
+        detail: 'not in the distribution — left alone (local addition)',
+      },
+    ])
+    expect(await readFile(installedSkillPath(target, 'ab-alpha'), 'utf8')).toBe(local)
+    expect(await readFile(pristineSkillPath(target, 'ab-alpha'), 'utf8')).toBe(pristine)
+    expect(
+      await readFile(join(dirname(installedSkillPath(target, 'ab-alpha')), 'notes.md'), 'utf8'),
+    ).toBe('supporting file\n')
+    expect(await readFile(installedSkillPath(target, 'ab-custom'), 'utf8')).toContain(
+      'local addition',
+    )
+    expect(existsSync(join(target, '.agent'))).toBe(false)
+    expect(await readlink(join(claudeRoot, 'ab-alpha'))).toBe(
+      '../../.agents/skills/ab-alpha',
+    )
+    expect(await readlink(join(claudeRoot, 'ab-custom'))).toBe(
+      '../../.agents/skills/ab-custom',
+    )
+  })
+})
 
 describe('abUpgrade — the four pristine-based cases', () => {
   test('new default == pristine → local stands (current), even when edited', async () => {

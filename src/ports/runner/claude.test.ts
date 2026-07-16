@@ -40,6 +40,8 @@ interface RecordedCall {
     env: Record<string, string>
     model?: string
     resume?: string
+    permissionMode: 'bypassPermissions'
+    allowDangerouslySkipPermissions: true
   }
 }
 
@@ -93,6 +95,15 @@ describe('ClaudeAgentRunner.start', () => {
     expect(calls[0]?.options.model).toBe('claude-opus-4')
     expect(calls[0]?.options.resume).toBeUndefined()
     expect(session.model).toBe('claude-opus-4')
+  })
+
+  test('bypasses interactive SDK permissions for unattended sessions', async () => {
+    const { calls, queryFn } = fakeQuery([[sdkResult('sdk-1', 1, 1)]])
+    const runner = new ClaudeAgentRunner({ queryFn })
+    await runner.start(startOpts())
+
+    expect(calls[0]?.options.permissionMode).toBe('bypassPermissions')
+    expect(calls[0]?.options.allowDangerouslySkipPermissions).toBe(true)
   })
 
   test('merges ambient-auth env over process.env (D8)', async () => {
@@ -160,6 +171,8 @@ describe('ClaudeAgentRunner.continue', () => {
     expect(calls[1]?.options.resume).toBe('sdk-1')
     expect(calls[1]?.options.cwd).toBe('/ws/auth-rate-limit')
     expect(calls[1]?.options.model).toBe('claude-opus-4')
+    expect(calls[1]?.options.permissionMode).toBe('bypassPermissions')
+    expect(calls[1]?.options.allowDangerouslySkipPermissions).toBe(true)
     expect(calls[1]?.options.env['AB_BUILD']).toBe('auth-rate-limit')
     expect(result).toEqual({
       text: 'revised',

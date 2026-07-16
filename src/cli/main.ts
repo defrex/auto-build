@@ -107,7 +107,7 @@ const HELP = [
   '  ab ticket create <title> --body <file> [--labels a,b]',
   '                                         file a ticket to the configured [tickets] source (§8.8; runs outside sessions)',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>]',
-  '                                         run the outer loop for this repo — janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
+  '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
   '',
   'Every phase ends with exactly one terminal command (D5).',
 ].join('\n')

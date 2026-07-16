@@ -2,8 +2,10 @@
  * `ab dispatch` — the operator's entry into the outer loop (SPEC §3.3, §12).
  * Runs OUTSIDE build sessions like init/upgrade/ticket (§16.3): it takes a
  * repo, not a build, loads its autobuild.toml, wires the real ports, and runs
- * the dispatcher's `tick()` — janitor → lease sweep → dispatch — either once
- * (`--once`) or on a watch loop until interrupted.
+ * the dispatcher's `tick()` — janitor → startup resume → lease sweep →
+ * dispatch — either once (`--once`) or on a watch loop until interrupted.
+ * Startup resume runs once per invocation and attempts every current build;
+ * later watch ticks preserve deliberate policy parks.
  *
  * It is the SAME `ab` binary agents use (§8): install is `ab` + `ab init`, and
  * everyone — agents and operators — attaches to this one surface. The heavy
@@ -266,7 +268,7 @@ class DispatchLoop {
     const capacity = this.config.dispatcher.capacity
     if (this.opts.once) {
       this.opts.stdout(`ab dispatch — one pass over ${this.opts.targetRepo} (capacity ${capacity})`)
-      const report = await this.dispatcher.tick()
+      const report = await this.dispatcher.tick({ resumeCurrent: true })
       this.printReport(report)
       await this.drainInFlight()
       return
@@ -279,9 +281,11 @@ class DispatchLoop {
       `ab dispatch — watching ${this.opts.targetRepo} (capacity ${capacity}, ` +
         `every ${Math.round(intervalMs / 1000)}s) — Ctrl-C to stop`,
     )
+    let startup = true
     while (!this.stopped) {
       try {
-        this.printReport(await this.dispatcher.tick())
+        this.printReport(await this.dispatcher.tick({ resumeCurrent: startup }))
+        startup = false
       } catch (error) {
         this.opts.stderr(
           `tick failed: ${error instanceof Error ? error.message : String(error)}`,

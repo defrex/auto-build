@@ -27,18 +27,18 @@
  *
  * Like init, upgrade runs OUTSIDE build sessions — no AB_* environment.
  */
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Exec } from '../ports/workspace/git-worktree'
 import { spawnExec } from '../ports/workspace/git-worktree'
 import {
-  AGENT_SKILLS_DIR,
-  SKILL_NAMESPACE,
   defaultDistRoot,
   ensureClaudeSkillLink,
   installSkillFiles,
   installedSkillPath,
+  listInstalledSkills,
+  migrateLegacyAgentSkills,
   migrateLegacySkill,
   pristineSkillPath,
   readDistSkills,
@@ -111,25 +111,6 @@ async function mergeFile(
   }
 }
 
-/** Installed `ab-*` skill dirs under `<target>/.agent/skills/`, sorted. */
-async function listInstalledSkills(targetRepo: string): Promise<string[]> {
-  const dir = join(targetRepo, AGENT_SKILLS_DIR)
-  let entries
-  try {
-    entries = await readdir(dir, { withFileTypes: true })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw error
-  }
-  const names: string[] = []
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(SKILL_NAMESPACE)) continue
-    if ((await readIfExists(join(dir, entry.name, 'SKILL.md'))) === undefined) continue
-    names.push(entry.name)
-  }
-  return names.sort()
-}
-
 export async function abUpgrade(opts: {
   targetRepo: string
   distRoot?: string
@@ -141,6 +122,10 @@ export async function abUpgrade(opts: {
   const exec = opts.exec ?? spawnExec
   const stdout = opts.stdout ?? (() => {})
   const { targetRepo } = opts
+
+  // Normalize old installations first so pristine bases, local additions,
+  // and supporting files participate in the normal upgrade flow.
+  await migrateLegacyAgentSkills(targetRepo)
 
   const skills: UpgradeReport['skills'] = []
   const report = (skill: string, action: UpgradeSkillAction, detail?: string): void => {
@@ -223,7 +208,7 @@ export async function abUpgrade(opts: {
       report(name, 'conflicted', merge.text)
       stdout(
         `${name}: conflicted — local edits collide with the new default; ` +
-          `kept your local file (merge by hand against .agent/skills/.ab-pristine/${name}/SKILL.md)`,
+          `kept your local file (merge by hand against .agents/skills/.ab-pristine/${name}/SKILL.md)`,
       )
     }
   }

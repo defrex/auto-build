@@ -10,7 +10,16 @@
  * bin/ab.ts must work with no AB_* environment set at all.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -58,7 +67,7 @@ function splitFrontmatter(content: string): { front: string[]; body: string } {
 }
 
 describe('abInit — fresh install', () => {
-  test('installs all 8 skills under .agent and links Claude discovery to the same copies', async () => {
+  test('installs all 8 skills under .agents and links Claude discovery to the same copies', async () => {
     const report = await abInit({ targetRepo: target })
 
     expect(report.config).toBe('written')
@@ -71,7 +80,7 @@ describe('abInit — fresh install', () => {
       expect(pristine).toBe(installed)
       const claude = claudeSkillPath(target, `ab-${name}`)
       expect((await lstat(claude)).isSymbolicLink()).toBe(true)
-      expect(await readlink(claude)).toBe(`../../.agent/skills/ab-${name}`)
+      expect(await readlink(claude)).toBe(`../../.agents/skills/ab-${name}`)
       expect(await readFile(join(claude, 'SKILL.md'), 'utf8')).toBe(installed)
     }
   })
@@ -129,6 +138,53 @@ describe('abInit — fresh install', () => {
 })
 
 describe('abInit — idempotence and safety', () => {
+  test('migrates .agent skills, pristine bases, local additions, and Claude links', async () => {
+    const name = 'ab-plan'
+    const customName = 'ab-custom'
+    const oldRoot = join(target, '.agent', 'skills')
+    const oldLive = join(oldRoot, name, 'SKILL.md')
+    const oldPristine = join(oldRoot, '.ab-pristine', name, 'SKILL.md')
+    const oldCustom = join(oldRoot, customName, 'SKILL.md')
+    await mkdir(dirname(oldLive), { recursive: true })
+    await mkdir(dirname(oldPristine), { recursive: true })
+    await mkdir(dirname(oldCustom), { recursive: true })
+    await writeFile(oldLive, 'locally customized plan\n')
+    await writeFile(join(dirname(oldLive), 'notes.md'), 'local supporting file\n')
+    await writeFile(oldPristine, 'old pristine plan\n')
+    await writeFile(oldCustom, '---\nname: ab-custom\n---\nlocal addition\n')
+
+    const claudeRoot = join(target, '.claude', 'skills')
+    await mkdir(claudeRoot, { recursive: true })
+    await symlink(`../../.agent/skills/${name}`, join(claudeRoot, name), 'dir')
+    await symlink(`../../.agent/skills/${customName}`, join(claudeRoot, customName), 'dir')
+
+    const report = await abInit({ targetRepo: target })
+
+    expect(report.skills.find((skill) => skill.skill === name)).toEqual({
+      skill: name,
+      action: 'kept',
+    })
+    expect(await readFile(installedSkillPath(target, name), 'utf8')).toBe(
+      'locally customized plan\n',
+    )
+    expect(await readFile(pristineSkillPath(target, name), 'utf8')).toBe(
+      'old pristine plan\n',
+    )
+    expect(
+      await readFile(join(dirname(installedSkillPath(target, name)), 'notes.md'), 'utf8'),
+    ).toBe('local supporting file\n')
+    expect(await readFile(installedSkillPath(target, customName), 'utf8')).toContain(
+      'local addition',
+    )
+    expect(existsSync(join(target, '.agent'))).toBe(false)
+    expect(await readlink(claudeSkillPath(target, name))).toBe(
+      `../../.agents/skills/${name}`,
+    )
+    expect(await readlink(claudeSkillPath(target, customName))).toBe(
+      `../../.agents/skills/${customName}`,
+    )
+  })
+
   test('migrates a legacy .claude install, preserving local edits and its pristine base', async () => {
     const name = 'ab-plan'
     const legacyLive = join(target, '.claude', 'skills', name, 'SKILL.md')
@@ -164,6 +220,7 @@ describe('abInit — idempotence and safety', () => {
     expect(await readFile(join(claudeSkillPath(target, name), 'SKILL.md'), 'utf8')).toBe(
       'locally customized legacy plan\n',
     )
+    expect(existsSync(dirname(legacyPristine))).toBe(false)
   })
 
   test('re-init reports every skill unchanged and config skipped', async () => {

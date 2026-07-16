@@ -75,7 +75,9 @@ Small, independently runnable, crash-safe:
   once builds run in remote sandboxes.
 - **dispatcher** — watches the TicketSource for Ready tickets (label/state
   conditions), claims, provisions a workspace, launches build-runners up to a
-  capacity limit. Cron-friendly.
+  capacity limit. On process startup it also attempts every current build for
+  its repo, so re-running `ab dispatch` resumes durable work rather than only
+  looking for new tickets. Cron-friendly.
 - **ingesters** — outer-loop processes turning signals into proposals (§12).
 - **operator** — UI process(es); see §14.
 
@@ -494,6 +496,12 @@ builds with the question and an answer channel (an `escalation.answered`
 event — commands are events, §15.2.7). The durable record is in the store
 like everything else.
 
+Policy escalations caused by an exhausted bounded retry/round budget are the
+narrow exception to the human-answer rule: a fresh `ab dispatch` invocation
+answers them with `resolution: retry` and attempts the build from durable
+state. This is an explicit process-restart retry boundary, not a watch-tick
+loop; agent and stall escalations remain human judgment gates.
+
 ## 12. The outer loop
 
 ```
@@ -663,7 +671,7 @@ janitor, `reconcile.*` by a re-attached build-runner)
 |---|---|---|
 | `observation.recorded` | agent | `{id, kind: followup \| refactor \| latent-bug, summary, files?, refs?}` |
 | `escalation.raised` | agent, kernel | `{id, phase, round?, source: agent \| stall \| policy, question, refs?}` |
-| `escalation.answered` | human | `{id, answer, resolution: guidance \| dismiss-finding \| revise-spec \| abort}` |
+| `escalation.answered` | human; dispatcher for policy retry | `{id, answer, resolution: guidance \| dismiss-finding \| revise-spec \| abort \| retry}` |
 | `phase.failed` | kernel | `{phase, round?, attempt, error, willRetry}` (infra failure — distinct from verdicts) |
 
 ### 15.4 Finding schema and stall mechanics [D4]
@@ -732,6 +740,14 @@ reducer says implement r2 started-not-completed → re-run the phase from its
 start: fetch the branch at round 1's pushed `head` [D3], `ab context`
 rehydrates scratch from the store, fresh session. Uncommitted round-2 work
 is lost by design (§7.3 — phase boundaries are the resume points).
+
+A new `ab dispatch` process does not wait for the ordinary stale-lease sweep
+to discover work: on its first tick it attempts every actionable,
+non-terminal build in its repo. Lease claiming remains the exclusivity gate,
+so an old runner that is genuinely alive wins harmlessly. Pauses, PR/spec
+waits, and agent/stall escalations remain parked. An all-policy escalation
+set is recorded as `escalation.answered {resolution: retry}` before launch,
+re-arming the bounded phase-failure budget once for this invocation.
 
 ### 15.7 Post-PR lifecycle [D1 — confirmed]
 
@@ -866,12 +882,13 @@ This project ships the **canonical default skills** (`plan`, `plan-review`,
 `spec`, and the outer-loop skills). `ab init` installs into a repo:
 
 - Writes an `autobuild.toml` template.
-- **Copies** the default skills into the harness-neutral repo skill directory,
-  namespaced `ab-*` (e.g. `.agent/skills/ab-code-review/`). Copies, not
-  references — per-repo customization is the point: this repo's code-review
-  standards and e2e driving instructions live in the vendored skill. Harness-
-  specific discovery paths are symlinks to this canonical copy; initially,
-  `.claude/skills/ab-*` symlinks to `.agent/skills/ab-*`.
+- **Copies** the default skills into the Agent Skills standard project
+  directory, namespaced `ab-*` (e.g. `.agents/skills/ab-code-review/`). Copies,
+  not references — per-repo customization is the point: this repo's code-review
+  standards and e2e driving instructions live in the vendored skill. Pi
+  discovers the canonical copy directly; harness-specific discovery paths are
+  symlinks to it, with `.claude/skills/ab-*` pointing to
+  `.agents/skills/ab-*`.
 - Marks skills **non-agent-invocable** (`disable-model-invocation`) except
   `ab-spec` — phase skills are invoked explicitly by the runner or a human,
   never auto-triggered by a model pattern-matching a description.

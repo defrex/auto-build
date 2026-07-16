@@ -283,6 +283,30 @@ export function describeBuildStoreContract(
           expect((await store.getEvents('val-actor')).length).toBe(1)
         })
       })
+
+      test('dispatcher escalation answers are limited to the retry resolution', async () => {
+        await withStore(factory, undefined, async (store) => {
+          await store.createBuild(sampleBuildInput('val-dispatcher-answer'))
+          const err = await store
+            .append('val-dispatcher-answer', {
+              actor: DISPATCHER,
+              type: 'escalation.answered',
+              payload: { id: 'esc_1', answer: 'continue', resolution: 'guidance' },
+            })
+            .catch((e: unknown) => e)
+          expect(err).toBeInstanceOf(EventValidationError)
+          expect(await store.getEvents('val-dispatcher-answer')).toEqual([])
+
+          await store.append('val-dispatcher-answer', {
+            actor: DISPATCHER,
+            type: 'escalation.answered',
+            payload: { id: 'esc_1', answer: 'retry', resolution: 'retry' },
+          })
+          expect((await store.getEvents('val-dispatcher-answer')).map((e) => e.type)).toEqual([
+            'escalation.answered',
+          ])
+        })
+      })
     })
 
     describe('getEvents', () => {

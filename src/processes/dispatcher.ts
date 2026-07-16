@@ -10,10 +10,12 @@
  * Order within a tick (deliberate):
  *   a. JANITOR   — settles finished work first, releasing capacity that the
  *                  dispatch step below can immediately reuse.
- *   b. LEASE SWEEP — re-attaches runners to builds whose runner died.
- *   c. DISPATCH  — fills remaining capacity from Ready tickets.
+ *   b. STARTUP RESUME (first CLI tick only) — attempts every actionable
+ *                  current build, including policy-exhausted infra failures.
+ *   c. LEASE SWEEP — re-attaches runners to builds whose runner died.
+ *   d. DISPATCH  — fills remaining capacity from Ready tickets.
  * A build launched in an earlier step is never launched again by a later
- * one (per-tick launch dedupe); a build dispatched in step (c) is not swept
+ * one (per-tick launch dedupe); a build dispatched in step (d) is not swept
  * in the same tick because the sweep already ran.
  *
  * The dispatcher itself never runs agents (§15.7) — conflicted PRs and
@@ -115,6 +117,8 @@ export interface TickReport {
   conflicted: number
   /** Janitor: aborted builds cleaned up and completed as abandoned. */
   abandoned: number
+  /** Dispatch-command startup: current builds for which a runner was launched. */
+  resumed: number
   /** Lease sweep (§15.6-C): runners re-attached to stale builds. */
   swept: number
   /** Dispatch (§12): builds created and launched. */
@@ -133,6 +137,7 @@ export function emptyTickReport(): TickReport {
     closed: 0,
     conflicted: 0,
     abandoned: 0,
+    resumed: 0,
     swept: 0,
     dispatched: 0,
     authored: 0,
@@ -161,6 +166,16 @@ export interface DispatcherOpts {
   triageState?: string
   /** Ticket state for merged builds. Default 'Done'. */
   doneState?: string
+}
+
+export interface TickOpts {
+  /**
+   * Attempt every actionable, non-terminal build for this repo before the
+   * ordinary stale-lease sweep. `ab dispatch` sets this only on its first
+   * tick: a process restart is an explicit retry boundary, not an endless
+   * reset of the per-phase failure budget on every watch tick.
+   */
+  resumeCurrent?: boolean
 }
 
 export interface DispatcherDeps {
@@ -230,13 +245,18 @@ export class Dispatcher {
     this.doneState = deps.opts?.doneState ?? 'Done'
   }
 
-  /** One cron-friendly pass (§3.3): janitor → lease sweep → dispatch. */
-  async tick(): Promise<TickReport> {
+  /**
+   * One cron-friendly pass (§3.3): janitor → optional startup resume → lease
+   * sweep → dispatch. Startup resume is opt-in because the CLI invokes it
+   * once per command, while ordinary watch ticks must preserve policy parks.
+   */
+  async tick(opts: TickOpts = {}): Promise<TickReport> {
     const report = emptyTickReport()
-    /** Builds already launched this tick — a janitor re-attach must not be
-     * doubled by the sweep, nor a fresh dispatch by anything. */
+    /** Builds already launched this tick — a janitor/startup re-attach must
+     * not be doubled by the sweep, nor a fresh dispatch by anything. */
     const launched = new Set<string>()
     await this.janitor(report, launched)
+    if (opts.resumeCurrent === true) await this.resumeCurrent(report, launched)
     await this.leaseSweep(report, launched)
     await this.dispatch(report, launched)
     return report
@@ -424,7 +444,64 @@ export class Dispatcher {
     return sha
   }
 
-  // ── b. Lease sweep (SPEC §15.6-C) ──────────────────────────────────────────
+  // ── b. Dispatch-command startup resume (SPEC §2.2, §15.6-C) ────────────────
+
+  /**
+   * A fresh `ab dispatch` invocation attempts every current build for this
+   * repo, even when its old lease has not expired yet. Lease claiming remains
+   * the exclusivity gate: a genuinely live runner wins and the attempted
+   * replacement harmlessly skips.
+   *
+   * `decideNext` keeps human judgment gates intact. Paused builds, builds
+   * awaiting a PR/spec, and agent/stall escalations remain parked. The one
+   * automatic unpark is an all-policy escalation set: `phase.failed` retry
+   * exhaustion describes an infrastructure budget, and restarting dispatch
+   * is the operator's explicit request to re-arm that budget. Each policy
+   * raise gets an auditable dispatcher-authored `escalation.answered{retry}`.
+   */
+  private async resumeCurrent(
+    report: TickReport,
+    launched: Set<string>,
+  ): Promise<void> {
+    const { store, config } = this.deps
+    for (const record of await store.listBuilds()) {
+      if (record.repo !== this.deps.repo || launched.has(record.slug)) continue
+
+      let events = await store.getEvents(record.slug)
+      const state = reduceBuild(events)
+      if (state.status === 'done' || state.status === 'aborted') continue
+
+      let decision = decideNext(events, config)
+      if (
+        decision.kind === 'wait' &&
+        decision.reason === 'blocked' &&
+        state.openEscalations.length > 0 &&
+        state.openEscalations.every((escalation) => escalation.source === 'policy')
+      ) {
+        for (const escalation of state.openEscalations) {
+          await store.append(record.slug, {
+            actor: DISPATCHER,
+            type: 'escalation.answered',
+            payload: {
+              id: escalation.id,
+              answer: 'ab dispatch restarted this build from durable state',
+              resolution: 'retry',
+            },
+          } satisfies EventWrite<'escalation.answered'>)
+        }
+        events = await store.getEvents(record.slug)
+        decision = decideNext(events, config)
+      }
+
+      // Human pauses and judgment escalations are not "failures" for dispatch
+      // to override; awaiting-pr/spec and terminal states have no runner work.
+      if (decision.kind === 'wait') continue
+      await this.launch(record.slug, launched)
+      report.resumed += 1
+    }
+  }
+
+  // ── c. Lease sweep (SPEC §15.6-C) ──────────────────────────────────────────
 
   /**
    * Predicate: lease expired or absent + the engine has runner work →
@@ -466,7 +543,7 @@ export class Dispatcher {
     }
   }
 
-  // ── c. Dispatch (SPEC §12, §6.3) ───────────────────────────────────────────
+  // ── d. Dispatch (SPEC §12, §6.3) ───────────────────────────────────────────
 
   private async dispatch(report: TickReport, launched: Set<string>): Promise<void> {
     const { store, tickets, config } = this.deps

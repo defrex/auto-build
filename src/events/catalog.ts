@@ -82,7 +82,9 @@ export const allowedActorKinds: Record<EventType, readonly ActorKind[]> = {
 
   'observation.recorded': ['agent'],
   'escalation.raised': ['agent', 'kernel'],
-  'escalation.answered': ['human'],
+  // Dispatcher-authored answers are restricted to `retry` below; matching
+  // them to open policy raises requires log context and lives in Dispatcher.
+  'escalation.answered': ['human', 'dispatcher'],
   'phase.failed': ['kernel'],
 }
 
@@ -138,6 +140,15 @@ export function validateEventWrite(input: {
     throw new EventValidationError(
       `invalid payload for "${input.type}": ${payloadResult.error.message}`,
       payloadResult.error.issues,
+    )
+  }
+  if (
+    input.type === 'escalation.answered' &&
+    actor.kind === 'dispatcher' &&
+    (payloadResult.data as EventPayload<'escalation.answered'>).resolution !== 'retry'
+  ) {
+    throw new EventValidationError(
+      'dispatcher may only emit "escalation.answered" with resolution "retry"',
     )
   }
 

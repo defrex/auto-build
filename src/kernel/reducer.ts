@@ -39,7 +39,9 @@ export interface OpenEscalation {
 /** Answered escalations keep their resolution because the engine routes on it
  * (§15.6-B, §6.3): `guidance` feeds the next producer round as authoritative
  * feedback, `dismiss-finding` marks the chain human-resolved for the next
- * reviewer, `revise-spec` restarts the build from plan, `abort` ends it. */
+ * reviewer, `revise-spec` restarts the build from plan, `abort` ends it, and
+ * dispatcher-authored `retry` re-arms a policy-exhausted budget without
+ * inventing human guidance. */
 export interface AnsweredEscalation extends OpenEscalation {
   answer: string
   resolution: EscalationResolution
