@@ -89,17 +89,21 @@ export async function readIfExists(path: string): Promise<string | undefined> {
 
 /**
  * The skills a model may trigger from its description (§16.3). Everything else
- * is a phase skill: invoked explicitly by the runner, never auto-triggered.
- * These two are the human/agent-facing surfaces — `spec` is the conversation
- * that writes a spec, `tickets` is how "move ticket X to ready" becomes an
- * action — so model invocation is precisely the point.
+ * gets `disable-model-invocation: true`: phase skills are invoked explicitly by
+ * the runner or a human, and a model must never start a pipeline phase by
+ * pattern-matching a description. Membership here is reserved for skills that
+ * drive NO phase — `spec` is the conversation that writes a spec before a build
+ * exists, `tickets` is how "move ticket X to ready" becomes an action, and
+ * `guide` is read-only reference material about the system. For these, model
+ * invocation is precisely the point. Keep this set small; widening it needs the
+ * §16.3 criterion, not convenience.
  */
-export const MODEL_INVOCABLE_SKILLS = new Set(['spec', 'tickets'])
+export const MODEL_INVOCABLE_SKILLS = new Set(['spec', 'tickets', 'guide'])
 
 /**
  * Rewrite a canonical skill's YAML frontmatter for installation (§16.3):
  * `name` becomes the namespaced `ab-<name>`, and every skill outside
- * MODEL_INVOCABLE_SKILLS gets `disable-model-invocation: true`. The
+ * `MODEL_INVOCABLE_SKILLS` gets `disable-model-invocation: true`. The
  * description and the body below the frontmatter are preserved verbatim.
  * Deliberately minimal and line-based: two known keys do not justify a YAML
  * dependency.
