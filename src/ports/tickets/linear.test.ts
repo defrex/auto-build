@@ -34,16 +34,26 @@ function makeSource(fetchFn: LinearFetch, claimedState?: string) {
   })
 }
 
+/** Mirrors what ISSUE_FIELDS actually selects — `state.type` and
+ * `inverseRelations` included, so every canned issue looks like a real one. */
 function gqlIssue(over: Record<string, unknown> = {}) {
   return {
+    id: 'uuid-42',
     identifier: 'ENG-42',
     title: 'Rate-limit auth',
     description: '# Spec\n\nToken bucket on /auth/*.',
     url: 'https://linear.app/acme/issue/ENG-42',
-    state: { name: 'Ready' },
+    state: { name: 'Ready', type: 'unstarted' },
     labels: { nodes: [{ name: 'autobuild' }] },
+    inverseRelations: { nodes: [] },
     ...over,
   }
+}
+
+/** A `blocks` relation as it appears on the BLOCKED issue: the relation's
+ * `issue` side is the blocker. */
+function blocksRelation(blockerIdentifier: string) {
+  return { type: 'blocks', issue: { identifier: blockerIdentifier } }
 }
 
 const TEAM_INFO_RESPONSE = {
@@ -375,5 +385,322 @@ describe('LinearTicketSource', () => {
     await expect(makeSource(fetchFn).comment('ENG-404', 'hi')).rejects.toThrow(
       'unknown ticket "ENG-404"',
     )
+  })
+
+  // ── Dependencies (§13) ─────────────────────────────────────────────────────
+
+  test('toTicket maps inverse blocks-relations to blockedBy, ignoring other types', async () => {
+    const { fetchFn } = fakeLinear([
+      {
+        body: {
+          data: {
+            issue: gqlIssue({
+              inverseRelations: {
+                nodes: [
+                  blocksRelation('ENG-8'),
+                  { type: 'related', issue: { identifier: 'ENG-77' } },
+                  { type: 'duplicate', issue: { identifier: 'ENG-78' } },
+                  blocksRelation('ENG-9'),
+                ],
+              },
+            }),
+          },
+        },
+      },
+    ])
+
+    const ticket = await makeSource(fetchFn).get('ENG-42')
+
+    expect(ticket?.blockedBy).toEqual(['ENG-8', 'ENG-9'])
+  })
+
+  test('an issue with no relations reports no blockedBy at all', async () => {
+    const { fetchFn } = fakeLinear([{ body: { data: { issue: gqlIssue() } } }])
+
+    const ticket = await makeSource(fetchFn).get('ENG-42')
+
+    expect(ticket?.blockedBy).toBeUndefined()
+  })
+
+  /**
+   * The direction guard. Linear's `blocks` relation reads "issueId blocks
+   * relatedIssueId", so recording "the new issue is blocked by ENG-8" means
+   * issueId = ENG-8's uuid and relatedIssueId = the NEW issue's uuid.
+   * Transposing these records the exact inverse relationship — and no other
+   * test in this file would notice.
+   */
+  test('create with blockedBy issues issueRelationCreate with the BLOCKER as issueId', async () => {
+    const { fetchFn, calls } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: {
+            issueCreate: { success: true, issue: gqlIssue({ id: 'uuid-new' }) },
+          },
+        },
+      },
+      { body: { data: { issue: { id: 'uuid-blocker-8' } } } }, // resolve ENG-8
+      { body: { data: { issueRelationCreate: { success: true } } } },
+    ])
+
+    const created = await makeSource(fetchFn).create({
+      title: 'X',
+      body: 'y',
+      blockedBy: ['ENG-8'],
+    })
+
+    expect(calls).toHaveLength(4)
+    expect(calls[2]?.variables).toEqual({ id: 'ENG-8' })
+    expect(calls[3]?.query).toContain('issueRelationCreate')
+    expect(calls[3]?.query).toContain('type: "blocks"')
+    expect(calls[3]?.variables).toEqual({
+      issueId: 'uuid-blocker-8', // the blocker blocks…
+      relatedIssueId: 'uuid-new', // …the newly created issue
+    })
+    expect(created.blockedBy).toEqual(['ENG-8'])
+  })
+
+  test('create with several blockers records one relation per blocker', async () => {
+    const { fetchFn, calls } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: {
+            issueCreate: { success: true, issue: gqlIssue({ id: 'uuid-new' }) },
+          },
+        },
+      },
+      { body: { data: { issue: { id: 'uuid-8' } } } },
+      { body: { data: { issueRelationCreate: { success: true } } } },
+      { body: { data: { issue: { id: 'uuid-9' } } } },
+      { body: { data: { issueRelationCreate: { success: true } } } },
+    ])
+
+    const created = await makeSource(fetchFn).create({
+      title: 'X',
+      body: 'y',
+      blockedBy: ['ENG-8', 'ENG-9'],
+    })
+
+    expect(calls[3]?.variables).toEqual({
+      issueId: 'uuid-8',
+      relatedIssueId: 'uuid-new',
+    })
+    expect(calls[5]?.variables).toEqual({
+      issueId: 'uuid-9',
+      relatedIssueId: 'uuid-new',
+    })
+    expect(created.blockedBy).toEqual(['ENG-8', 'ENG-9'])
+  })
+
+  test('a failed relation throws rather than silently discarding the blocker', async () => {
+    const { fetchFn } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: {
+            issueCreate: { success: true, issue: gqlIssue({ id: 'uuid-new' }) },
+          },
+        },
+      },
+      { body: { data: { issue: { id: 'uuid-8' } } } },
+      { body: { data: { issueRelationCreate: { success: false } } } },
+    ])
+
+    await expect(
+      makeSource(fetchFn).create({ title: 'X', body: 'y', blockedBy: ['ENG-8'] }),
+    ).rejects.toThrow(/issueRelationCreate failed.*"ENG-8".*not recorded/)
+  })
+
+  test('an unknown blocker throws while resolving it', async () => {
+    const { fetchFn } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: {
+            issueCreate: { success: true, issue: gqlIssue({ id: 'uuid-new' }) },
+          },
+        },
+      },
+      { body: { data: { issue: null } } },
+    ])
+
+    await expect(
+      makeSource(fetchFn).create({ title: 'X', body: 'y', blockedBy: ['ENG-404'] }),
+    ).rejects.toThrow('unknown ticket "ENG-404"')
+  })
+
+  test('dependencyStates maps Linear state types to resolution, failing closed', async () => {
+    const types: Array<[string, boolean]> = [
+      ['completed', true],
+      ['canceled', true],
+      ['started', false],
+      ['unstarted', false],
+      ['backlog', false],
+      ['someFutureType', false], // unrecognized fails CLOSED
+    ]
+    const { fetchFn } = fakeLinear(
+      types.map(([type]) => ({
+        body: { data: { issue: gqlIssue({ state: { name: type, type } }) } },
+      })),
+    )
+
+    const states = await makeSource(fetchFn).dependencyStates(
+      types.map(([type]) => type),
+    )
+
+    expect(states.map((s) => [s.id, s.resolved])).toEqual(
+      types.map(([type, resolved]) => [type, resolved]),
+    )
+    expect(states.every((s) => s.exists)).toBe(true)
+  })
+
+  /**
+   * The shape below is copied from a LIVE Linear response, not guessed: an
+   * unknown identifier comes back HTTP 200 with a GraphQL `errors` array
+   * (`Entity not found: Issue`, extensions.code INPUT_ERROR) and `data: null`
+   * — NOT the `{issue: null}` the query's shape implies. Before checking
+   * against the real API, this adapter turned a typo'd blocker into a thrown
+   * dependency check instead of an actionable "does not exist" diagnostic.
+   */
+  const ENTITY_NOT_FOUND = {
+    body: {
+      data: null,
+      errors: [
+        {
+          message: 'Entity not found: Issue',
+          path: ['issue'],
+          extensions: {
+            type: 'invalid input',
+            code: 'INPUT_ERROR',
+            userPresentableMessage: 'Could not find referenced Issue.',
+          },
+        },
+      ],
+    },
+  }
+
+  test('dependencyStates maps a live "Entity not found" error to exists: false', async () => {
+    const { fetchFn } = fakeLinear([ENTITY_NOT_FOUND])
+
+    expect(await makeSource(fetchFn).dependencyStates(['AUT-99999'])).toEqual([
+      { id: 'AUT-99999', exists: false, resolved: false, blockedBy: [] },
+    ])
+  })
+
+  test('a not-found for one blocker does not stop the rest from resolving', async () => {
+    const { fetchFn } = fakeLinear([
+      ENTITY_NOT_FOUND,
+      {
+        body: {
+          data: { issue: gqlIssue({ state: { name: 'Done', type: 'completed' } }) },
+        },
+      },
+    ])
+
+    const states = await makeSource(fetchFn).dependencyStates(['AUT-99999', 'ENG-42'])
+
+    expect(states.map((s) => [s.id, s.exists, s.resolved])).toEqual([
+      ['AUT-99999', false, false],
+      ['ENG-42', true, true],
+    ])
+  })
+
+  /** The discrimination that matters: a real outage must NOT read as "the
+   * ticket does not exist" — that would dispatch on a false diagnostic. */
+  test('dependencyStates rethrows a non-not-found GraphQL error rather than reporting absence', async () => {
+    const { fetchFn } = fakeLinear([
+      {
+        body: {
+          errors: [
+            { message: 'rate limited', extensions: { code: 'RATELIMITED' } },
+          ],
+        },
+      },
+    ])
+
+    await expect(makeSource(fetchFn).dependencyStates(['ENG-42'])).rejects.toThrow(
+      'rate limited',
+    )
+  })
+
+  test('a mixed error set (not-found + rate limit) is a failure, not an absence', async () => {
+    const { fetchFn } = fakeLinear([
+      {
+        body: {
+          errors: [
+            {
+              message: 'Entity not found: Issue',
+              extensions: { code: 'INPUT_ERROR' },
+            },
+            { message: 'rate limited', extensions: { code: 'RATELIMITED' } },
+          ],
+        },
+      },
+    ])
+
+    await expect(makeSource(fetchFn).dependencyStates(['ENG-42'])).rejects.toThrow(
+      'rate limited',
+    )
+  })
+
+  test('an unknown blocker on create surfaces the adapter message, not raw GraphQL prose', async () => {
+    const { fetchFn } = fakeLinear([
+      TEAM_INFO_RESPONSE,
+      {
+        body: {
+          data: {
+            issueCreate: { success: true, issue: gqlIssue({ id: 'uuid-new' }) },
+          },
+        },
+      },
+      ENTITY_NOT_FOUND,
+    ])
+
+    await expect(
+      makeSource(fetchFn).create({ title: 'X', body: 'y', blockedBy: ['ENG-404'] }),
+    ).rejects.toThrow('linear create: unknown ticket "ENG-404"')
+  })
+
+  test('dependencyStates reports a missing issue as exists: false, in request order', async () => {
+    const { fetchFn } = fakeLinear([
+      { body: { data: { issue: null } } },
+      {
+        body: {
+          data: {
+            issue: gqlIssue({
+              state: { name: 'Done', type: 'completed' },
+              inverseRelations: { nodes: [blocksRelation('ENG-1')] },
+            }),
+          },
+        },
+      },
+    ])
+
+    const states = await makeSource(fetchFn).dependencyStates(['ENG-404', 'ENG-42'])
+
+    expect(states).toEqual([
+      { id: 'ENG-404', exists: false, resolved: false, blockedBy: [] },
+      { id: 'ENG-42', exists: true, resolved: true, blockedBy: ['ENG-1'] },
+    ])
+  })
+
+  test('dependencyStates re-reads every call — a completion between ticks is seen', async () => {
+    const { fetchFn } = fakeLinear([
+      {
+        body: {
+          data: { issue: gqlIssue({ state: { name: 'Ready', type: 'unstarted' } }) },
+        },
+      },
+      {
+        body: {
+          data: { issue: gqlIssue({ state: { name: 'Done', type: 'completed' } }) },
+        },
+      },
+    ])
+    const source = makeSource(fetchFn)
+
+    expect((await source.dependencyStates(['ENG-42']))[0]?.resolved).toBe(false)
+    expect((await source.dependencyStates(['ENG-42']))[0]?.resolved).toBe(true)
   })
 })
