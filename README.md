@@ -25,8 +25,9 @@ queryable paper trail.
 
 1. **Grooming** a ticket to [the spec standard](docs/spec-standard.md) — what
    and why, acceptance criteria, out of scope. auto-build never grooms its own
-   work: a ticket becomes dispatchable only once it carries your
-   `[dispatcher].readyLabels`, and applying that label is a human act.
+   work: a ticket becomes dispatchable only when it passes your ready gate —
+   moved into `ready/` with the file tracker, or labelled `autobuild` on Linear
+   — and that act is a human one.
 2. **Answering escalations** — the questions a build parks on rather than
    deciding alone.
 3. **Reviewing and merging the PR.** auto-build opens it; you land it.
@@ -40,8 +41,8 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
       epilogue: (pr.conflicted → reconcile → verify:*)* → merged or closed
 ```
 
-1. **spec** — the dispatcher claims a ready ticket (one carrying your
-   `readyLabels`) and imports its body as the build's spec. The spec is the
+1. **spec** — the dispatcher claims a ready ticket (one that passes your ready
+   gate) and imports its body as the build's spec. The spec is the
    contract for everything downstream.
 2. **plan ⇄ plan-review** — a planner writes an implementation plan; a
    reviewer approves it or sends it back with findings. The loop runs until
@@ -180,9 +181,9 @@ is an error, so a typo cannot silently disable a verifier.
 | `[finalize]` | `steps = [...]` — optional post-PR steps, failure-tolerant | `[]` |
 | `[roles]` | Role → `{ runner, model? }`. Only `claude` is registered as a runner. | — |
 | `[policy]` | `stallRounds`, `maxVerifyAttempts`, `maxReconcileAttempts`, `maxReviewRounds` | `3`, `3`, `3`, `5` |
-| `[dispatcher]` | `capacity`, `readyLabels`, optional `readyState` | `1`, `["autobuild"]` |
+| `[dispatcher]` | `capacity`, optional `readyLabels`, optional `readyState` | `1`; ready gate defaults to the ticket source's own (see below) |
 | `[server]` | Optional. `start` + `url` required; `readyTimeout` in seconds | `readyTimeout = 60` |
-| `[tickets]` | Which ticket source to drive — see below | — |
+| `[tickets]` | Optional. Which ticket source to drive — see below | absent = the local file tracker at `.autobuild/tickets` |
 | `[outer]` | Map of outer-loop process name → `{ cron = "…" }` | — |
 
 The generated template ships a working `[verify]` pair:
@@ -202,40 +203,35 @@ command = "test"
 
 ### 3. Point at a ticket source and set up auth
 
-The `[tickets]` table is what the dispatcher watches. Secrets never go in this
-file.
+The `[tickets]` table is what the dispatcher watches. It is **optional**, and
+secrets never go in this file.
 
-**Linear:**
+**The local file tracker (the default — no table, no config, no secret).** Omit
+`[tickets]` entirely and you get a file tracker at `.autobuild/tickets`. That is
+the zero-config path: a repo dispatches without you configuring a ticket source
+at all.
 
-```toml
-[tickets]
-source = "linear"
-teamKey = "ENG"                # required
-claimedState = "In Progress"   # optional; this is the adapter's default
-createState = "Triage"         # optional; absent = the team's default state
+The tracker is four state directories, and **a ticket's state is the directory
+it sits in**:
+
+```text
+.autobuild/tickets/
+  triage/   ready/   doing/   done/
 ```
 
-The API key comes from `LINEAR_API_KEY`, in your environment or a local `.env`.
+`ls ready/` answers "what's dispatchable", and `mv triage/x.md ready/`
+dispatches it. The defaulted directory writes a self-excluding `.gitignore`, so
+it stays out of git on its own.
 
-**File-based** (no secret, useful for trying auto-build out):
-
-```toml
-[tickets]
-source = "file"
-dir = "tickets"          # required; resolved against the repo root
-createState = "Triage"   # optional; "Triage" is the default
-```
-
-Tickets are `<id>.md` files with `+++`-fenced TOML frontmatter — `id`, `title`,
-`state`, `labels`, and optionally `claimedBy` — followed by the body. A ticket
-the dispatcher would pick up, at `tickets/file-1.md`:
+Tickets are `<id>.md` files with `+++`-fenced TOML frontmatter — exactly `id`,
+`title`, and optional `labels` — followed by the body. There is **no `state`
+field**: the directory is the state. The frontmatter is strict, so an unknown
+key is a parse error. A dispatchable ticket at `.autobuild/tickets/ready/file-1.md`:
 
 ```markdown
 +++
 id = "file-1"
 title = "Throttle repeated failed logins"
-state = "Ready"
-labels = ["autobuild"]
 +++
 
 ## What and why
@@ -248,8 +244,31 @@ labels = ["autobuild"]
 - …
 ```
 
-`ab ticket create` names the files it writes `file-<n>.md`; hand-written
-tickets can use any id, as long as the filename matches it.
+`ab ticket create` names the files it writes `file-<n>.md` and files them into
+`triage/`; hand-written tickets can use any id, as long as the filename matches
+it. Claiming a ticket renames it into `doing/`.
+
+To put the tracker somewhere else — note that an **explicit `dir` is your
+directory**, so auto-build does not gitignore it for you:
+
+```toml
+[tickets]
+source = "file"
+dir = "tickets"          # optional; default ".autobuild/tickets"
+createState = "Triage"   # optional; "Triage" is the default
+```
+
+**Linear:**
+
+```toml
+[tickets]
+source = "linear"
+teamKey = "ENG"                # required
+claimedState = "In Progress"   # optional; this is the adapter's default
+createState = "Triage"         # optional; absent = the team's default state
+```
+
+The API key comes from `LINEAR_API_KEY`, in your environment or a local `.env`.
 
 **GitHub** auth is whatever `gh` resolves. There is no auto-build environment
 variable for it.
@@ -292,9 +311,15 @@ what was missing. No build is created — failure lands at the cheapest point.
 ### Grooming (your step)
 
 The `ab-spec` skill is the conversational surface over the standard: it designs
-a spec with you and files or updates the ticket. It is the **only** vendored
-skill a model may invoke on its own; every other `ab-*` skill is installed with
-`disable-model-invocation: true` and is invoked by the runner or by you.
+a spec with you and files or updates the ticket.
+
+It is one of three vendored skills a model may invoke on its own — the three
+that drive **no** pipeline phase: `ab-spec` (the conversation that writes a spec
+before a build exists), `ab-tickets` (drives the local file tracker — "move
+ticket X to ready"), and `ab-guide` (read-only reference material about the
+system). Every other `ab-*` skill is a phase skill, installed with
+`disable-model-invocation: true` and invoked by the runner or by you — a model
+must never start a pipeline phase by pattern-matching a description.
 
 To file a groomed ticket by hand:
 
@@ -324,21 +349,24 @@ Each tick runs in this order:
 4. **dispatch** — claims and launches new work.
 
 Dispatch gates a ticket in this order: **capacity** (blocked and paused builds
-still hold a slot) → **`readyLabels`** (all must be present) and **`readyState`**
-if set → **claim-before-launch** → the **spec gate**.
+still hold a slot) → the **ready gate** (`readyLabels`, all of which must be
+present, and `readyState`) → **claim-before-launch** → the **spec gate**.
 
-> **The label is the gate, not the state.** With the defaults
-> (`readyLabels = ["autobuild"]`, no `readyState`), *any* ticket carrying the
-> `autobuild` label is dispatchable no matter what state it sits in —
-> including Triage. If you want a state gate too, set `readyState`. Treat
-> applying the label as the act of saying "build this."
+> **The ready gate defaults to the ticket source's own.** Leaving `readyLabels`
+> unset does not mean "no gate" — it means "the gate that source already has":
 >
-> `readyLabels` defaults to `["autobuild"]` in the **schema**, not just in the
-> generated template — deleting the key, or the whole `[dispatcher]` table,
-> leaves the label gate in force. To dispatch on state alone, set it
-> explicitly empty: `readyLabels = []`. Getting this wrong is quiet rather than
-> loud: the config stays valid, nothing matches, and every tick just reports
-> `tick: idle`.
+> - **File tracker** — no label is required, and `readyState` defaults to
+>   `Ready`. The `ready/` **directory is the gate**: `mv triage/x.md ready/` is
+>   the act that says "build this."
+> - **Linear** — `readyLabels` defaults to `["autobuild"]`, with no state gate
+>   unless you set `readyState`. *Any* ticket carrying the label is
+>   dispatchable no matter what state it sits in, including Triage. Applying
+>   the label is the act that says "build this."
+>
+> Set `readyLabels` only to require labels **on top of** that default. With the
+> file tracker, setting it means moving a ticket into `ready/` is no longer
+> enough on its own. Getting this wrong is quiet rather than loud: the config
+> stays valid, nothing matches, and every tick just reports `tick: idle`.
 
 Each tick prints a report of its nonzero counters:
 
@@ -455,7 +483,11 @@ Under `~/.autobuild` by default:
 ### Keep uncommitted
 
 - `.ab/` — per-phase agent scratch, disposable by construction
-- `.autobuild/` — only if you point the store into the repo for local dev
+- `.autobuild/` — the default file tracker at `.autobuild/tickets` writes its
+  own self-excluding `.gitignore`, so it stays out of git without your help.
+  (An explicit `[tickets].dir` is *your* directory — auto-build does not
+  gitignore it.) Also covers the store, if you point it into the repo for
+  local dev.
 - `*.local.db`
 - `.env`
 
@@ -501,16 +533,12 @@ Each line is `  <path>: <message>`. Common causes:
 - **`needsServer` with no server** — `[verify.<s>].needsServer = true requires a
   [server] table (start, url)…`. Add `[server]` or set `needsServer = false`.
 
-### `autobuild.toml has no [tickets] table`
+### I never configured `[tickets]` — where are my tickets going?
 
-```text
-autobuild.toml has no [tickets] table — 'ab dispatch' watches the configured
-TicketSource for Ready tickets (§3.3); add [tickets] with source = "linear"
-(teamKey = "…") or source = "file" (dir = "…")
-```
-
-The template ships `[tickets]` commented out. Uncomment and fill it in.
-`ab ticket create` reports the same thing in its own words.
+To `.autobuild/tickets`. Omitting `[tickets]` is not an error: it selects the
+local file tracker, which needs no config and no secret. Look for
+`triage/ ready/ doing/ done/` there, and see
+[Ticket source and authentication](#ticket-source-and-authentication).
 
 ### `<repo>/autobuild.toml: not found`
 
@@ -522,11 +550,16 @@ You are not at the repo root. `ab dispatch` and `ab ticket create` read
 `tick: idle` means no ticket passed the dispatch gates. There is no error,
 because nothing failed — the gates just didn't match. Work down the gates:
 
-- **`readyLabels`** — every label must be present on the ticket. This defaults
-  to `["autobuild"]` **in the schema**, so removing the key (or the whole
-  `[dispatcher]` table) does *not* remove the gate. `readyLabels = []` is the
-  only way to turn it off.
-- **`readyState`** — if you set it, the ticket's state must match exactly.
+- **The ready gate** — unset `readyLabels` means the ticket source's own gate,
+  not "no gate". With the **file tracker**, the ticket must be in `ready/`
+  (`readyState` defaults to `Ready`) — a ticket sitting in `triage/` will never
+  dispatch. With **Linear**, the `autobuild` label must be present
+  (`readyLabels` defaults to `["autobuild"]`).
+- **`readyLabels`, if you set it** — every listed label must *also* be present.
+  With the file tracker this is an extra gate on top of `ready/`, so a ticket in
+  `ready/` without the label stays put.
+- **`readyState`** — if you set it, the ticket's state must match exactly (for
+  the file tracker, the state is its directory).
 - **`capacity`** — blocked and paused builds still hold their slots. At
   `capacity = 1`, one escalated build stalls all new dispatch.
 - **The spec gate** — a ticket missing `## Acceptance criteria` (with a list
