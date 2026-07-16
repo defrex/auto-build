@@ -9,8 +9,8 @@ it to the code.
 
 1. **Judgment in skills, determinism in code.** Agents never decide phase
    transitions, signal identity, or state.
-2. **Resumability is not a feature.** Re-running a build resumes it; every
-   phase is a function of durable state.
+2. **Resumability is not a feature.** Re-running `ab dispatch` attempts every
+   current build; each phase resumes as a function of durable state.
 3. **Ingesters propose, humans dispatch.** Nothing auto-generated passes
    Triage without a human grooming it to Ready.
 4. **Every step leaves a paper trail** — queryable, not carried in the repo.
@@ -37,7 +37,7 @@ points, declared per-repo in `autobuild.toml`.
 | `src/cli/` | The `ab` CLI — the only agent↔store channel | §8 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty) | §3.3, §15.7 |
 | `src/config/` | `autobuild.toml` parsing and validation | §16.1 |
-| `skills/` | Canonical default skills, vendored into repos by `ab init` | §16.3 |
+| `skills/` | Canonical defaults; `ab init` vendors them to `.agents/skills/ab-*` (Pi/Agent Skills) and links `.claude/skills/ab-*` | §16.3 |
 | `docs/spec-standard.md` | The definition of "buildable" every ticket surface cites | §6.1 |
 | `templates/` | What `ab init` installs | §16.3 |
 

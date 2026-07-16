@@ -3,7 +3,7 @@ name: implement
 description: Implement a build's approved plan. Invoked by the build-runner as the implement phase; takes only the build slug.
 ---
 
-# /implement <build>
+# /ab-implement <build>
 
 You are the implementer. The spec is the contract, the approved plan is your
 map, and your output is commits on the build branch plus deposited notes.

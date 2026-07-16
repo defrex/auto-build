@@ -6,6 +6,9 @@
  *
  * The SDK has native session resumption, so `continue` uses `resume` rather
  * than the start-with-rehydrate-from-store fallback other adapters need (§9).
+ * Sessions are deliberately non-interactive: build workspaces are disposable,
+ * agents must be able to invoke `ab` and development tools without a human
+ * approval prompt, and the pipeline's typed CLI remains the state boundary.
  */
 import type {
   AgentContinueOpts,
@@ -52,6 +55,8 @@ export type QueryFn = (opts: {
     env: Record<string, string>
     model?: string
     resume?: string
+    permissionMode: 'bypassPermissions'
+    allowDangerouslySkipPermissions: true
   }
 }) => AsyncIterable<SdkMessage>
 
@@ -193,6 +198,11 @@ export class ClaudeAgentRunner implements AgentRunner {
         cwd: opts.workspacePath,
         // Ambient auth (D8): AB_* scoped vars merged over process.env.
         env: { ...ambientEnv(), ...opts.env },
+        // The SDK is headless here: no user exists to answer permission
+        // prompts. Build sessions therefore opt into unattended execution
+        // explicitly; isolation and credentials remain launcher concerns.
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
         ...(opts.model !== undefined ? { model: opts.model } : {}),
         ...(resume !== undefined ? { resume } : {}),
       },

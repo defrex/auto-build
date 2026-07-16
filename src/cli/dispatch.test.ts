@@ -136,7 +136,7 @@ async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fix
   }
   const agents = new ScriptedAgentRunner({
     script: async (ctx) => {
-      const handler = handlers[ctx.opts.skill]
+      const handler = handlers[ctx.opts.skill] ?? handlers[ctx.opts.skill.replace(/^ab-/, '')]
       if (handler === undefined) throw new Error(`no handler for skill "${ctx.opts.skill}"`)
       return (await handler(makeCli(ctx))) ?? defaultTurnResult(`${ctx.opts.skill} finished`)
     },
@@ -289,6 +289,65 @@ describe('abDispatch --once', () => {
 
       // The operator saw the build park.
       expect(out.some((line) => line.includes(`build ${slug} parked`))).toBe(true)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('a new invocation retries a current build parked by an infrastructure policy failure', async () => {
+    const handlers = happyHandlers()
+    const happyPlan = handlers.plan!
+    let planAttempts = 0
+    handlers.plan = async (cli) => {
+      planAttempts += 1
+      if (planAttempts <= 2) return defaultTurnResult('ended without a terminal')
+      return happyPlan(cli)
+    }
+    const fx = await makeFixture(readyTicket('T-retry'), handlers)
+    const firstOut: string[] = []
+    const secondOut: string[] = []
+    try {
+      // The first invocation exhausts the runner's two-attempt infra budget
+      // and parks on a policy escalation.
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => firstOut.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+      const [record] = await fx.store.listBuilds()
+      expect(record).toBeDefined()
+      const slug = record!.slug
+      expect((await fx.store.getEvents(slug)).at(-1)?.type).toBe('escalation.raised')
+
+      // Simulate the prior dispatch process being gone long enough for its
+      // lease to lapse. MemoryBuildStore has no manual clock in this e2e seam,
+      // so release by the recorded holder is the equivalent lease state.
+      expect(record!.lease).toBeDefined()
+      await fx.store.releaseLease(slug, record!.lease!.holder)
+
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => secondOut.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+
+      const events = await fx.store.getEvents(slug)
+      const retry = events.find(
+        (event) =>
+          event.type === 'escalation.answered' && event.payload.resolution === 'retry',
+      )
+      expect(retry?.actor).toEqual({ kind: 'dispatcher' })
+      expect(events.map((event) => event.type)).toContain('finalize.completed')
+      expect(secondOut).toContain('tick: resumed=1')
+      expect(planAttempts).toBe(3)
     } finally {
       await fx.cleanup()
     }

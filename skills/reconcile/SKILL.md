@@ -3,7 +3,7 @@ name: reconcile
 description: Resolve a conflicted PR by merging base into the build branch. Invoked by the build-runner as the reconcile phase; takes only the build slug.
 ---
 
-# /reconcile <build>
+# /ab-reconcile <build>
 
 The build's PR no longer merges cleanly: main moved. Your job is one merge
 commit — base merged *into* the build branch — that preserves both what this

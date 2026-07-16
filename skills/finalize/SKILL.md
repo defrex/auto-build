@@ -3,7 +3,7 @@ name: finalize
 description: Prepare a green build's pull request description. Invoked by the build-runner as the finalize phase; takes only the build slug.
 ---
 
-# /finalize <build>
+# /ab-finalize <build>
 
 The build is green: plan approved, code approved, every verify step passed.
 You write the PR description; the kernel opens the PR when you finish (you

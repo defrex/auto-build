@@ -40,6 +40,8 @@ interface RecordedCall {
     env: Record<string, string>
     model?: string
     resume?: string
+    permissionMode: 'bypassPermissions'
+    allowDangerouslySkipPermissions: true
   }
 }
 
@@ -62,7 +64,7 @@ function fakeQuery(streams: SdkMessage[][]): {
 
 function startOpts(overrides: Partial<AgentStartOpts> = {}): AgentStartOpts {
   return {
-    skill: 'plan',
+    skill: 'ab-plan',
     buildSlug: 'auth-rate-limit',
     workspacePath: '/ws/auth-rate-limit',
     env: { AB_BUILD: 'auth-rate-limit', AB_SESSION: 's_9f2' },
@@ -80,7 +82,7 @@ describe('ClaudeAgentRunner.start', () => {
     const { calls, queryFn } = fakeQuery([[sdkResult('sdk-1', 1, 1)]])
     const runner = new ClaudeAgentRunner({ queryFn })
     await runner.start(startOpts())
-    expect(calls[0]?.prompt).toBe('/plan auth-rate-limit')
+    expect(calls[0]?.prompt).toBe('/ab-plan auth-rate-limit')
   })
 
   test('passes workspacePath as cwd and model through', async () => {
@@ -93,6 +95,15 @@ describe('ClaudeAgentRunner.start', () => {
     expect(calls[0]?.options.model).toBe('claude-opus-4')
     expect(calls[0]?.options.resume).toBeUndefined()
     expect(session.model).toBe('claude-opus-4')
+  })
+
+  test('bypasses interactive SDK permissions for unattended sessions', async () => {
+    const { calls, queryFn } = fakeQuery([[sdkResult('sdk-1', 1, 1)]])
+    const runner = new ClaudeAgentRunner({ queryFn })
+    await runner.start(startOpts())
+
+    expect(calls[0]?.options.permissionMode).toBe('bypassPermissions')
+    expect(calls[0]?.options.allowDangerouslySkipPermissions).toBe(true)
   })
 
   test('merges ambient-auth env over process.env (D8)', async () => {
@@ -160,6 +171,8 @@ describe('ClaudeAgentRunner.continue', () => {
     expect(calls[1]?.options.resume).toBe('sdk-1')
     expect(calls[1]?.options.cwd).toBe('/ws/auth-rate-limit')
     expect(calls[1]?.options.model).toBe('claude-opus-4')
+    expect(calls[1]?.options.permissionMode).toBe('bypassPermissions')
+    expect(calls[1]?.options.allowDangerouslySkipPermissions).toBe(true)
     expect(calls[1]?.options.env['AB_BUILD']).toBe('auth-rate-limit')
     expect(result).toEqual({
       text: 'revised',
@@ -223,7 +236,7 @@ describe('ClaudeAgentRunner.end', () => {
     expect(content.turns).toHaveLength(2)
     expect(content.turns[0]).toMatchObject({
       turn: 1,
-      prompt: '/plan auth-rate-limit',
+      prompt: '/ab-plan auth-rate-limit',
       text: 'the plan',
       usage: { inputTokens: 10, outputTokens: 5 },
     })

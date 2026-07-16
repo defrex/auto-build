@@ -268,7 +268,8 @@ export async function makeHarness(opts: {
   // The script IS the agent (§9): route by skill, hand the handler the real
   // CLI bound to this turn's ambient env (D8).
   const script: Script = async (ctx) => {
-    const handler = opts.handlers[ctx.opts.skill]
+    const handler =
+      opts.handlers[ctx.opts.skill] ?? opts.handlers[ctx.opts.skill.replace(/^ab-/, '')]
     if (handler === undefined) {
       throw new Error(`no scripted handler for skill "${ctx.opts.skill}"`)
     }

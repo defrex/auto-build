@@ -3,7 +3,7 @@ name: plan-review
 description: Review a build's plan for conformance to its spec. Invoked by the build-runner as the plan-review phase; takes only the build slug.
 ---
 
-# /plan-review <build>
+# /ab-plan-review <build>
 
 You are a fresh skeptic reviewing the plan against the spec. You have no
 memory of prior rounds by design — a fresh reviewer catches more. Your

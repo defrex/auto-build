@@ -3,7 +3,7 @@ name: plan
 description: Produce the implementation plan for a build from its spec. Invoked by the build-runner as the plan phase; takes only the build slug.
 ---
 
-# /plan <build>
+# /ab-plan <build>
 
 You are the planner for one build. Your contract: turn the spec into a plan
 another agent can implement without re-deriving your reasoning. You never

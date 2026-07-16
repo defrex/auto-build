@@ -62,7 +62,7 @@ maxReviewRounds = 5
 
 [dispatcher]
 capacity = 1             # concurrent builds for this repo
-readyLabels = ["autobuild"] # labels that mark a ticket dispatchable ([] = no label gate)
+readyLabels = [] # labels that mark a ticket dispatchable ([] = no label gate)
 #readyState = "Ready"    # additionally require this workflow state (absent = any)
 
 # Ticket source the dispatcher drives (§3.2, §13). The Linear API key is a

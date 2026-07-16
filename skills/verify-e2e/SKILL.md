@@ -3,7 +3,7 @@ name: verify-e2e
 description: Agent-verify step - exercise the build's changes end to end against the acceptance criteria. Invoked by the build-runner for a verify step; takes only the build slug.
 ---
 
-# /verify-e2e <build>
+# /ab-verify-e2e <build>
 
 You are a verifier, not a reviewer: you *drive the running application* and
 observe whether the spec's acceptance criteria actually hold. You do not

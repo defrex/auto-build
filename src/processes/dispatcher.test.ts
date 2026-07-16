@@ -621,6 +621,85 @@ describe('Dispatcher janitor', () => {
   })
 })
 
+// ── Dispatch-command startup resume (§2.2, §15.6-C) ─────────────────────────
+
+describe('Dispatcher startup resume', () => {
+  test('attempts every actionable current build even while its old lease is healthy', async () => {
+    const h = harness()
+    const slug = await seedBuild(h)
+    await h.store.claimLease(slug, 'old-runner', 60_000)
+
+    const report = await h.dispatcher.tick({ resumeCurrent: true })
+
+    expect(report).toEqual({ ...emptyTickReport(), resumed: 1 })
+    expect(h.launches).toEqual([slug])
+  })
+
+  test('re-arms a policy-exhausted phase and records an auditable retry answer', async () => {
+    const h = harness()
+    const slug = await seedBuild(h)
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'phase.failed',
+      payload: { phase: 'plan', round: 1, attempt: 2, error: 'no-terminal', willRetry: false },
+    })
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'escalation.raised',
+      payload: {
+        id: 'esc_policy',
+        phase: 'plan',
+        round: 1,
+        source: 'policy',
+        question: 'plan failed twice',
+      },
+    })
+
+    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(h.launches).toEqual([])
+
+    expect(await h.dispatcher.tick({ resumeCurrent: true })).toEqual({
+      ...emptyTickReport(),
+      resumed: 1,
+    })
+    expect(h.launches).toEqual([slug])
+    const answer = (await h.store.getEvents(slug)).at(-1)
+    expect(answer?.type).toBe('escalation.answered')
+    expect(answer?.actor).toEqual({ kind: 'dispatcher' })
+    expect(answer?.payload).toEqual({
+      id: 'esc_policy',
+      answer: 'ab dispatch restarted this build from durable state',
+      resolution: 'retry',
+    })
+  })
+
+  test('does not override human pauses or agent judgment escalations', async () => {
+    const paused = harness()
+    await seedBuild(paused, { slug: 'paused' })
+    await paused.store.append('paused', { actor: KERNEL, type: 'build.paused', payload: {} })
+    expect(await paused.dispatcher.tick({ resumeCurrent: true })).toEqual(emptyTickReport())
+    expect(paused.launches).toEqual([])
+
+    const blocked = harness()
+    await seedBuild(blocked, { slug: 'blocked' })
+    await blocked.store.append('blocked', {
+      actor: KERNEL,
+      type: 'escalation.raised',
+      payload: {
+        id: 'esc_agent',
+        phase: 'plan',
+        source: 'agent',
+        question: 'Which compatibility policy should we use?',
+      },
+    })
+    expect(await blocked.dispatcher.tick({ resumeCurrent: true })).toEqual(emptyTickReport())
+    expect(blocked.launches).toEqual([])
+    expect((await blocked.store.getEvents('blocked')).at(-1)?.type).toBe(
+      'escalation.raised',
+    )
+  })
+})
+
 // ── Lease sweep (§15.6-C) ────────────────────────────────────────────────────
 
 describe('Dispatcher lease sweep', () => {

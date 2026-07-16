@@ -1,23 +1,48 @@
 /**
  * `ab init` — vendor the canonical default skills into a repo (SPEC §16.3,
  * D11). Copies, not references: per-repo customization is the point, so each
- * skill lands in the target's own `.claude/skills/ab-<name>/SKILL.md` where
- * the repo may edit it freely. Alongside the live copy, init records the
- * PRISTINE installed bytes under `.claude/skills/.ab-pristine/` — repo-
- * versioned, the base of `ab upgrade`'s three-way merges (src/cli/upgrade.ts).
+ * skill lands in the Agent Skills standard `.agents/skills/ab-<name>/SKILL.md`
+ * where the repo may edit it freely. Pi discovers that project directory
+ * directly; Claude discovers the same skill through a
+ * `.claude/skills/ab-<name>` symlink, so there is only one editable copy.
+ * Alongside the live copy, init records the PRISTINE installed bytes under
+ * `.agents/skills/.ab-pristine/` — repo-versioned, the base of `ab upgrade`'s
+ * three-way merges (src/cli/upgrade.ts).
  *
  * Init runs OUTSIDE build sessions: it takes a repo path, not a build, and
  * needs no AB_* environment. It is safe to re-run — an existing
  * autobuild.toml is never overwritten, and an installed skill with local
  * edits is never clobbered (`force: true` is the explicit human override).
  */
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import {
+  cp,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  rename,
+  rm,
+  rmdir,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
+import { dirname, join, relative, resolve } from 'node:path'
+import { installedSkillName, SKILL_NAMESPACE } from '../skills'
 
-/** Installed skills are namespaced `ab-*` (§16.3): `.claude/skills/ab-plan/`. */
-export const SKILL_NAMESPACE = 'ab-'
+export { SKILL_NAMESPACE }
 
-/** Where init records pristine installs, under `.claude/skills/`. */
+/** Agent Skills standard project directory for vendored skills. */
+export const AGENTS_SKILLS_DIR = join('.agents', 'skills')
+
+/** The unsupported project path used by earlier auto-build releases. */
+export const LEGACY_AGENT_SKILLS_DIR = join('.agent', 'skills')
+
+/** Claude-compatible discovery links point at the canonical skills. */
+export const CLAUDE_SKILLS_DIR = join('.claude', 'skills')
+
+/** Where init records pristine installs, under `.agents/skills/`. */
 export const PRISTINE_DIR = '.ab-pristine'
 
 /**
@@ -29,14 +54,27 @@ export function defaultDistRoot(): string {
   return resolve(import.meta.dir, '..', '..')
 }
 
-/** Live install path: `<target>/.claude/skills/ab-<name>/SKILL.md`. */
+/** Live install path: `<target>/.agents/skills/ab-<name>/SKILL.md`. */
 export function installedSkillPath(targetRepo: string, installName: string): string {
-  return join(targetRepo, '.claude', 'skills', installName, 'SKILL.md')
+  return join(targetRepo, AGENTS_SKILLS_DIR, installName, 'SKILL.md')
 }
 
-/** Pristine record: `<target>/.claude/skills/.ab-pristine/ab-<name>/SKILL.md`. */
+/** Claude discovery path: a directory symlink to the live `.agents` skill. */
+export function claudeSkillPath(targetRepo: string, installName: string): string {
+  return join(targetRepo, CLAUDE_SKILLS_DIR, installName)
+}
+
+/** Pristine record: `<target>/.agents/skills/.ab-pristine/ab-<name>/SKILL.md`. */
 export function pristineSkillPath(targetRepo: string, installName: string): string {
-  return join(targetRepo, '.claude', 'skills', PRISTINE_DIR, installName, 'SKILL.md')
+  return join(targetRepo, AGENTS_SKILLS_DIR, PRISTINE_DIR, installName, 'SKILL.md')
+}
+
+function legacyInstalledSkillPath(targetRepo: string, installName: string): string {
+  return join(targetRepo, CLAUDE_SKILLS_DIR, installName, 'SKILL.md')
+}
+
+function legacyPristineSkillPath(targetRepo: string, installName: string): string {
+  return join(targetRepo, CLAUDE_SKILLS_DIR, PRISTINE_DIR, installName, 'SKILL.md')
 }
 
 /** Read a file's text, or undefined when it does not exist. */
@@ -83,7 +121,7 @@ export function rewriteSkillSource(source: string, skillName: string): string {
     .slice(1, close)
     .filter((line) => !line.startsWith('disable-model-invocation:'))
     .map((line) =>
-      line.startsWith('name:') ? `name: ${SKILL_NAMESPACE}${skillName}` : line,
+      line.startsWith('name:') ? `name: ${installedSkillName(skillName)}` : line,
     )
   if (!MODEL_INVOCABLE_SKILLS.has(skillName)) {
     front.push('disable-model-invocation: true')
@@ -111,14 +149,166 @@ export async function readDistSkills(distRoot: string): Promise<DistSkill[]> {
     if (source === undefined) continue
     skills.push({
       name: entry.name,
-      installName: `${SKILL_NAMESPACE}${entry.name}`,
+      installName: installedSkillName(entry.name),
       content: rewriteSkillSource(source, entry.name),
     })
   }
   return skills
 }
 
-/** Write a skill's live copy AND its pristine record (the exact same bytes). */
+/** Ensure Claude discovers the canonical `.agents` skill through a symlink. */
+export async function ensureClaudeSkillLink(
+  targetRepo: string,
+  installName: string,
+): Promise<void> {
+  const link = claudeSkillPath(targetRepo, installName)
+  const target = dirname(installedSkillPath(targetRepo, installName))
+  await mkdir(dirname(link), { recursive: true })
+
+  try {
+    const stat = await lstat(link)
+    if (stat.isSymbolicLink()) {
+      const current = resolve(dirname(link), await readlink(link))
+      if (current === resolve(target)) return
+      await unlink(link)
+    } else {
+      throw new Error(
+        `cannot create Claude link for "${installName}": ${CLAUDE_SKILLS_DIR}/${installName} ` +
+          `is a real directory while ${AGENTS_SKILLS_DIR}/${installName} already exists`,
+      )
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+
+  await symlink(relative(dirname(link), target), link, 'dir')
+}
+
+/**
+ * Recursively move non-conflicting entries from an obsolete directory into
+ * its replacement. Existing destination entries always win, so migration
+ * cannot clobber data; conflicting source entries remain for manual recovery.
+ */
+async function moveMissingEntries(source: string, destination: string): Promise<void> {
+  let entries
+  try {
+    entries = await readdir(source, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+
+  await mkdir(destination, { recursive: true })
+  for (const entry of entries) {
+    const from = join(source, entry.name)
+    const to = join(destination, entry.name)
+    let destinationStat
+    try {
+      destinationStat = await lstat(to)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      await rename(from, to)
+      continue
+    }
+
+    const sourceStat = await lstat(from)
+    if (
+      sourceStat.isDirectory() &&
+      !sourceStat.isSymbolicLink() &&
+      destinationStat.isDirectory() &&
+      !destinationStat.isSymbolicLink()
+    ) {
+      await moveMissingEntries(from, to)
+    }
+  }
+
+  try {
+    await rmdir(source)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw error
+  }
+}
+
+/**
+ * Migrate the unsupported `.agent/skills` project layout used by older
+ * releases into the Agent Skills standard `.agents/skills` directory. The
+ * whole tree is considered so local `ab-*` additions, supporting files, and
+ * pristine merge bases move together. Safe and idempotent.
+ */
+export async function migrateLegacyAgentSkills(targetRepo: string): Promise<void> {
+  await moveMissingEntries(
+    join(targetRepo, LEGACY_AGENT_SKILLS_DIR),
+    join(targetRepo, AGENTS_SKILLS_DIR),
+  )
+  try {
+    await rmdir(join(targetRepo, '.agent'))
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw error
+  }
+}
+
+/**
+ * Move a pre-canonical-layout `.claude` install into `.agents` without losing
+ * local edits or the pristine merge base. Returns the migrated live bytes.
+ */
+export async function migrateLegacySkill(
+  targetRepo: string,
+  installName: string,
+): Promise<string | undefined> {
+  let migrated: string | undefined
+  if ((await readIfExists(installedSkillPath(targetRepo, installName))) === undefined) {
+    const legacy = await readIfExists(legacyInstalledSkillPath(targetRepo, installName))
+    if (legacy !== undefined) {
+      const legacyDir = dirname(legacyInstalledSkillPath(targetRepo, installName))
+      const live = installedSkillPath(targetRepo, installName)
+      await mkdir(dirname(dirname(live)), { recursive: true })
+      await cp(legacyDir, dirname(live), { recursive: true })
+      // The complete directory now lives under `.agents`; clear the old
+      // discovery location so ensureClaudeSkillLink can replace it.
+      await rm(legacyDir, { recursive: true, force: true })
+      migrated = legacy
+    }
+  }
+
+  const legacyPristinePath = legacyPristineSkillPath(targetRepo, installName)
+  const legacyPristine = await readIfExists(legacyPristinePath)
+  if (legacyPristine !== undefined) {
+    if ((await readIfExists(pristineSkillPath(targetRepo, installName))) === undefined) {
+      await writePristine(targetRepo, installName, legacyPristine)
+    }
+    await rm(dirname(legacyPristinePath), { recursive: true, force: true })
+    try {
+      await rmdir(join(targetRepo, CLAUDE_SKILLS_DIR, PRISTINE_DIR))
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw error
+    }
+  }
+  return migrated
+}
+
+/** Installed `ab-*` skill directories under `.agents/skills`, sorted. */
+export async function listInstalledSkills(targetRepo: string): Promise<string[]> {
+  const dir = join(targetRepo, AGENTS_SKILLS_DIR)
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+  const names: string[] = []
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(SKILL_NAMESPACE)) continue
+    if ((await readIfExists(join(dir, entry.name, 'SKILL.md'))) === undefined) continue
+    names.push(entry.name)
+  }
+  return names.sort()
+}
+
+/** Write a skill's live copy, pristine record, and Claude discovery link. */
 export async function installSkillFiles(
   targetRepo: string,
   installName: string,
@@ -128,6 +318,7 @@ export async function installSkillFiles(
   await mkdir(dirname(live), { recursive: true })
   await writeFile(live, content)
   await writePristine(targetRepo, installName, content)
+  await ensureClaudeSkillLink(targetRepo, installName)
 }
 
 /** Update only the pristine record for a skill. */
@@ -161,6 +352,10 @@ export async function abInit(opts: {
   const stdout = opts.stdout ?? (() => {})
   const force = opts.force ?? false
 
+  // Older releases used `.agent/skills`, which Pi does not discover. Move the
+  // complete tree before inspecting or writing any skills.
+  await migrateLegacyAgentSkills(opts.targetRepo)
+
   // autobuild.toml from the template — never overwrite an existing one
   // (§16.3): the repo's config is the repo's, from the very first re-run.
   const configPath = join(opts.targetRepo, 'autobuild.toml')
@@ -177,7 +372,9 @@ export async function abInit(opts: {
 
   const skills: InitReport['skills'] = []
   for (const skill of await readDistSkills(distRoot)) {
-    const local = await readIfExists(installedSkillPath(opts.targetRepo, skill.installName))
+    const migrated = await migrateLegacySkill(opts.targetRepo, skill.installName)
+    const local =
+      migrated ?? (await readIfExists(installedSkillPath(opts.targetRepo, skill.installName)))
     let action: InitSkillAction
     if (local === undefined) {
       await installSkillFiles(opts.targetRepo, skill.installName, skill.content)
@@ -197,8 +394,15 @@ export async function abInit(opts: {
       // edited skill is `ab upgrade`'s three-way-merge job, not init's.
       action = 'kept'
     }
+    await ensureClaudeSkillLink(opts.targetRepo, skill.installName)
     stdout(`${skill.installName}: ${action}`)
     skills.push({ skill: skill.installName, action })
+  }
+
+  // Migration considers the complete old tree, including local additions
+  // unknown to this distribution. Keep their Claude discovery links valid too.
+  for (const name of await listInstalledSkills(opts.targetRepo)) {
+    await ensureClaudeSkillLink(opts.targetRepo, name)
   }
   return { config, skills }
 }
