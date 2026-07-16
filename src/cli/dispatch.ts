@@ -257,11 +257,17 @@ class DispatchLoop {
     }
   }
 
+  /** The tick's counters, plus one line per dependency-blocked ticket — the
+   * only place an operator can see WHY a ready ticket is not moving without
+   * inspecting the provider, the filesystem, or the store (§13). */
   private printReport(report: Awaited<ReturnType<Dispatcher['tick']>>): void {
     const parts = Object.entries(report)
-      .filter(([, count]) => count > 0)
+      .filter(([, value]) => typeof value === 'number' && value > 0)
       .map(([name, count]) => `${name}=${count}`)
     this.opts.stdout(parts.length > 0 ? `tick: ${parts.join(' ')}` : 'tick: idle')
+    for (const block of report.dependencyBlocks) {
+      this.opts.stdout(`dependency-blocked: ${block.detail}`)
+    }
   }
 
   async run(): Promise<void> {

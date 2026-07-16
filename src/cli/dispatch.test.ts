@@ -24,7 +24,7 @@ import {
   ScriptedAgentRunner,
   type ScriptContext,
 } from '../ports/runner/fake'
-import { FakeTicketSource } from '../ports/tickets/fake'
+import { FakeTicketSource, type TicketSeed } from '../ports/tickets/fake'
 import type { Ticket } from '../ports/types'
 import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { MemoryBuildStore } from '../store/memory'
@@ -90,7 +90,10 @@ interface Fixture {
 
 /** A wire that supplies fakes over a REAL git worktree provider and a scripted
  * agent driving the real `ab` CLI (the harness happy-path handlers). */
-async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fixture> {
+async function makeFixture(
+  ticket: TicketSeed | TicketSeed[],
+  handlers: SkillHandlers,
+): Promise<Fixture> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-dispatch-'))
   const origin = join(tmp, 'origin')
   await initOrigin(origin)
@@ -98,7 +101,7 @@ async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fix
   const ids = sequentialIds()
   const store = new MemoryBuildStore({ clock: systemClock })
   const forge = new FakeForge()
-  const tickets = new FakeTicketSource([ticket])
+  const tickets = new FakeTicketSource(Array.isArray(ticket) ? ticket : [ticket])
   const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })
   const cliErrors: string[] = []
 
@@ -167,13 +170,14 @@ async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fix
   }
 }
 
-function readyTicket(id: string): Ticket {
+function readyTicket(id: string, over: Partial<Omit<TicketSeed, 'ref'>> = {}): TicketSeed {
   return {
     ref: { source: 'fake', id, title: 'Add rate limiting' },
     title: 'Add rate limiting',
     body: CONFORMING_BODY,
     state: 'Ready',
     labels: ['autobuild'],
+    ...over,
   }
 }
 
@@ -315,4 +319,43 @@ describe('abDispatch --once', () => {
       await fx.cleanup()
     }
   }, 30_000)
+})
+
+describe('abDispatch report output', () => {
+  test('a dependency-blocked ticket is discoverable from stdout alone', async () => {
+    // The blocker carries no readyLabel, so it is resolvable but not itself a
+    // dispatch candidate — the tick's only subject is the blocked ticket.
+    const fx = await makeFixture(
+      [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-1'] }),
+        readyTicket('T-1', { title: 'Blocker work', labels: [] }),
+      ],
+      happyHandlers(),
+    )
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+
+      // Without provider, filesystem, or store inspection (§13): the operator
+      // sees the counter, the blocked ticket, and the blocker id.
+      const printed = out.join('\n')
+      expect(printed).toContain('dependencyBlocked=1')
+      expect(printed).toContain('dependency-blocked: T-2')
+      expect(printed).toContain('T-1')
+      // The mixed TickReport must not leak an array into the counter line.
+      expect(printed).not.toContain('[object Object]')
+      expect(printed).not.toContain('dependencyBlocks=')
+      expect(await fx.store.listBuilds()).toEqual([])
+    } finally {
+      await fx.cleanup()
+    }
+  })
 })

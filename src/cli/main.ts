@@ -104,15 +104,16 @@ const HELP = [
   '',
   '  ab init [target] [--force]             vendor the default skills into a repo as ab-* + autobuild.toml (§16.3; runs outside sessions)',
   '  ab upgrade [target]                    three-way merge vendored ab-* skills with the new defaults (§16.3; runs outside sessions)',
-  '  ab ticket create <title> --body <file> [--labels a,b]',
+  '  ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
   '                                         file a ticket to the configured [tickets] source (§8.8; runs outside sessions)',
+  '                                         --blocked-by takes comma-separated ids from that source; the ticket stays queued until all are done',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>]',
   '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
   '',
   'Every phase ends with exactly one terminal command (D5).',
 ].join('\n')
 
-const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report', 'body', 'labels'])
+const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report', 'body', 'labels', 'blocked-by'])
 const BOOLEAN_FLAGS = new Set(['json'])
 
 interface ParsedArgs {
@@ -256,7 +257,10 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
     // configured TicketSource, before any build exists.
     case 'ticket': {
       const [sub, ...more] = rest
-      const usage = 'usage: ab ticket create <title> --body <file> [--labels a,b] (§8.8)'
+      const usage =
+        'usage: ab ticket create <title> --body <file> [--labels a,b] ' +
+        '[--blocked-by id,id] (§8.8; --blocked-by ids are comma-separated and ' +
+        'belong to the configured ticket source)'
       if (sub !== 'create') {
         throw new Error(usage)
       }
@@ -267,11 +271,13 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         throw new Error(usage)
       }
       const labels = listFlag(parsed, 'labels')
+      const blockedBy = listFlag(parsed, 'blocked-by')
       await abTicketCreate({
         targetRepo: deps.workspacePath,
         title,
         bodyFile,
         ...(labels !== undefined ? { labels } : {}),
+        ...(blockedBy !== undefined ? { blockedBy } : {}),
         env: deps.processEnv ?? {},
         stdout,
       })
