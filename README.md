@@ -180,7 +180,7 @@ is an error, so a typo cannot silently disable a verifier.
 | `[finalize]` | `steps = [...]` — optional post-PR steps, failure-tolerant | `[]` |
 | `[roles]` | Role → `{ runner, model? }`. Only `claude` is registered as a runner. | — |
 | `[policy]` | `stallRounds`, `maxVerifyAttempts`, `maxReconcileAttempts`, `maxReviewRounds` | `3`, `3`, `3`, `5` |
-| `[dispatcher]` | `capacity`, `readyLabels`, optional `readyState` | `1`, template sets `["autobuild"]` |
+| `[dispatcher]` | `capacity`, `readyLabels`, optional `readyState` | `1`, `["autobuild"]` |
 | `[server]` | Optional. `start` + `url` required; `readyTimeout` in seconds | `readyTimeout = 60` |
 | `[tickets]` | Which ticket source to drive — see below | — |
 | `[outer]` | Map of outer-loop process name → `{ cron = "…" }` | — |
@@ -327,11 +327,18 @@ Dispatch gates a ticket in this order: **capacity** (blocked and paused builds
 still hold a slot) → **`readyLabels`** (all must be present) and **`readyState`**
 if set → **claim-before-launch** → the **spec gate**.
 
-> **The label is the gate, not the state.** With the template's defaults
-> (`readyLabels = ["autobuild"]`, `readyState` commented out), *any* ticket
-> carrying the `autobuild` label is dispatchable no matter what state it sits
-> in — including Triage. If you want a state gate too, set `readyState`. Treat
+> **The label is the gate, not the state.** With the defaults
+> (`readyLabels = ["autobuild"]`, no `readyState`), *any* ticket carrying the
+> `autobuild` label is dispatchable no matter what state it sits in —
+> including Triage. If you want a state gate too, set `readyState`. Treat
 > applying the label as the act of saying "build this."
+>
+> `readyLabels` defaults to `["autobuild"]` in the **schema**, not just in the
+> generated template — deleting the key, or the whole `[dispatcher]` table,
+> leaves the label gate in force. To dispatch on state alone, set it
+> explicitly empty: `readyLabels = []`. Getting this wrong is quiet rather than
+> loud: the config stays valid, nothing matches, and every tick just reports
+> `tick: idle`.
 
 Each tick prints a report of its nonzero counters:
 
@@ -426,7 +433,7 @@ Under `~/.autobuild` by default:
 |---|---|
 | `~/.autobuild/autobuild.sqlite` | Events and build records |
 | `~/.autobuild/blobs/` | Content-addressed artifact blobs |
-| `~/.autobuild/worktrees/<branch>/` | One git worktree per build; branches are `ab/<slug>` |
+| `~/.autobuild/worktrees/ab-<slug>/` | One git worktree per build. The branch is `ab/<slug>`; the directory name flattens it — every run of characters outside `[A-Za-z0-9._-]` becomes a `-`, so branch `ab/add-rate-limiting` lives at `worktrees/ab-add-rate-limiting/`. |
 
 `ab dispatch --store <ref>` moves the store — a local path, or an
 `http(s)://` remote store. It does **not** move the worktree root.
@@ -506,6 +513,22 @@ The template ships `[tickets]` commented out. Uncomment and fill it in.
 
 You are not at the repo root. `ab dispatch` and `ab ticket create` read
 `./autobuild.toml`.
+
+### `tick: idle`, but I have tickets waiting
+
+`tick: idle` means no ticket passed the dispatch gates. There is no error,
+because nothing failed — the gates just didn't match. Work down the gates:
+
+- **`readyLabels`** — every label must be present on the ticket. This defaults
+  to `["autobuild"]` **in the schema**, so removing the key (or the whole
+  `[dispatcher]` table) does *not* remove the gate. `readyLabels = []` is the
+  only way to turn it off.
+- **`readyState`** — if you set it, the ticket's state must match exactly.
+- **`capacity`** — blocked and paused builds still hold their slots. At
+  `capacity = 1`, one escalated build stalls all new dispatch.
+- **The spec gate** — a ticket missing `## Acceptance criteria` (with a list
+  item) or `## Out of scope` is bounced to Triage and commented; that shows up
+  as `tick: bounced=1`, not `idle`.
 
 ### Authentication failures
 
