@@ -37,7 +37,7 @@ points, declared per-repo in `autobuild.toml`.
 | `src/cli/` | The `ab` CLI — the only agent↔store channel | §8 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty) | §3.3, §15.7 |
 | `src/config/` | `autobuild.toml` parsing and validation | §16.1 |
-| `skills/` | Canonical default skills, vendored into repos by `ab init` | §16.3 |
+| `skills/` | Canonical defaults; `ab init` vendors them to `.agent/skills/ab-*` and links `.claude/skills/ab-*` | §16.3 |
 | `docs/spec-standard.md` | The definition of "buildable" every ticket surface cites | §6.1 |
 | `templates/` | What `ab init` installs | §16.3 |
 

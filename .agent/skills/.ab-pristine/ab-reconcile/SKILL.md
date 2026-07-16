@@ -1,6 +1,7 @@
 ---
-name: reconcile
+name: ab-reconcile
 description: Resolve a conflicted PR by merging base into the build branch. Invoked by the build-runner as the reconcile phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-reconcile <build>

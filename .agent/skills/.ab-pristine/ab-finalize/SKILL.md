@@ -1,6 +1,7 @@
 ---
-name: finalize
+name: ab-finalize
 description: Prepare a green build's pull request description. Invoked by the build-runner as the finalize phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-finalize <build>

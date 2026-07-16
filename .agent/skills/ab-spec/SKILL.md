@@ -3,7 +3,7 @@ name: ab-spec
 description: Design a feature spec-first through conversation, or flesh out an existing ticket to the spec standard. The human-interactive surface of the spec standard; creates or updates the ticket when done.
 ---
 
-# /spec [ticket]
+# /ab-spec [ticket]
 
 The conversational surface over the spec standard (`docs/spec-standard.md`
 in the autobuild distribution — read it first; it defines "buildable": what

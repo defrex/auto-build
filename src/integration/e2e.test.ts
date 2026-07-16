@@ -355,7 +355,7 @@ test('b. verify failure routes back to implement with the report, then re-verifi
   expect(implSessions).toEqual(['s_3', 's_5'])
   expect(ofType(events, 'implement.completed').map(agentSession)).toEqual(implSessions)
   const implJournals = [...h.agents.sessions.values()].filter(
-    (j) => j.opts.skill === 'implement',
+    (j) => j.opts.skill === 'ab-implement',
   )
   expect(implJournals).toHaveLength(1) // ONE continued runner session…
   expect(implJournals[0]!.turns).toHaveLength(2) // …with a turn per round
@@ -547,7 +547,7 @@ test('c. persists chain stalls, human guidance unblocks, loop converges (§15.6-
   // are turns of ONE continued session; the relaunched sandbox's r4 is a
   // fresh start (a new sandbox has no producer memory).
   const implJournals = [...h.agents.sessions.values()].filter(
-    (j) => j.opts.skill === 'implement',
+    (j) => j.opts.skill === 'ab-implement',
   )
   expect(implJournals.map((j) => j.turns.length)).toEqual([3, 1])
   const finalVerdict = ofType(events, 'code-review.verdict')[3]!

@@ -4,7 +4,7 @@ description: Prepare a green build's pull request description. Invoked by the bu
 disable-model-invocation: true
 ---
 
-# /finalize <build>
+# /ab-finalize <build>
 
 The build is green: plan approved, code approved, every verify step passed.
 You write the PR description; the kernel opens the PR when you finish (you

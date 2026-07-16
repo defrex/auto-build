@@ -866,10 +866,12 @@ This project ships the **canonical default skills** (`plan`, `plan-review`,
 `spec`, and the outer-loop skills). `ab init` installs into a repo:
 
 - Writes an `autobuild.toml` template.
-- **Copies** the default skills into the repo's skill directory, namespaced
-  `ab-*` (e.g. `.claude/skills/ab-code-review/`). Copies, not references —
-  per-repo customization is the point: this repo's code-review standards,
-  this repo's e2e driving instructions, live in the vendored skill.
+- **Copies** the default skills into the harness-neutral repo skill directory,
+  namespaced `ab-*` (e.g. `.agent/skills/ab-code-review/`). Copies, not
+  references — per-repo customization is the point: this repo's code-review
+  standards and e2e driving instructions live in the vendored skill. Harness-
+  specific discovery paths are symlinks to this canonical copy; initially,
+  `.claude/skills/ab-*` symlinks to `.agent/skills/ab-*`.
 - Marks skills **non-agent-invocable** (`disable-model-invocation`) except
   `ab-spec` — phase skills are invoked explicitly by the runner or a human,
   never auto-triggered by a model pattern-matching a description.

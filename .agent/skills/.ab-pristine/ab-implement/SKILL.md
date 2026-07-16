@@ -1,6 +1,7 @@
 ---
-name: implement
+name: ab-implement
 description: Implement a build's approved plan. Invoked by the build-runner as the implement phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-implement <build>

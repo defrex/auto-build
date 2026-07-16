@@ -1,6 +1,7 @@
 ---
-name: plan
+name: ab-plan
 description: Produce the implementation plan for a build from its spec. Invoked by the build-runner as the plan phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-plan <build>

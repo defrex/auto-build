@@ -33,10 +33,13 @@ import { join } from 'node:path'
 import type { Exec } from '../ports/workspace/git-worktree'
 import { spawnExec } from '../ports/workspace/git-worktree'
 import {
+  AGENT_SKILLS_DIR,
   SKILL_NAMESPACE,
   defaultDistRoot,
+  ensureClaudeSkillLink,
   installSkillFiles,
   installedSkillPath,
+  migrateLegacySkill,
   pristineSkillPath,
   readDistSkills,
   readIfExists,
@@ -108,9 +111,9 @@ async function mergeFile(
   }
 }
 
-/** Installed `ab-*` skill dirs under `<target>/.claude/skills/`, sorted. */
+/** Installed `ab-*` skill dirs under `<target>/.agent/skills/`, sorted. */
 async function listInstalledSkills(targetRepo: string): Promise<string[]> {
-  const dir = join(targetRepo, '.claude', 'skills')
+  const dir = join(targetRepo, AGENT_SKILLS_DIR)
   let entries
   try {
     entries = await readdir(dir, { withFileTypes: true })
@@ -148,7 +151,9 @@ export async function abUpgrade(opts: {
   for (const skill of dist) {
     const name = skill.installName
     const incoming = skill.content
-    const local = await readIfExists(installedSkillPath(targetRepo, name))
+    const migrated = await migrateLegacySkill(targetRepo, name)
+    const local = migrated ?? (await readIfExists(installedSkillPath(targetRepo, name)))
+    if (local !== undefined) await ensureClaudeSkillLink(targetRepo, name)
 
     if (local === undefined) {
       // In the distribution but not installed — install fresh, like init.
@@ -218,7 +223,7 @@ export async function abUpgrade(opts: {
       report(name, 'conflicted', merge.text)
       stdout(
         `${name}: conflicted — local edits collide with the new default; ` +
-          `kept your local file (merge by hand against .claude/skills/.ab-pristine/${name}/SKILL.md)`,
+          `kept your local file (merge by hand against .agent/skills/.ab-pristine/${name}/SKILL.md)`,
       )
     }
   }
@@ -228,6 +233,7 @@ export async function abUpgrade(opts: {
   const distNames = new Set(dist.map((skill) => skill.installName))
   for (const name of await listInstalledSkills(targetRepo)) {
     if (distNames.has(name)) continue
+    await ensureClaudeSkillLink(targetRepo, name)
     report(name, 'unknown', 'not in the distribution — left alone (local addition)')
     stdout(`${name}: unknown (not in the distribution — left alone)`)
   }

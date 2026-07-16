@@ -1,6 +1,7 @@
 ---
-name: code-review
+name: ab-code-review
 description: Review a build's implementation commits against its spec and plan. Invoked by the build-runner as the code-review phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-code-review <build>

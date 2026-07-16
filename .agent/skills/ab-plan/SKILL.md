@@ -4,7 +4,7 @@ description: Produce the implementation plan for a build from its spec. Invoked 
 disable-model-invocation: true
 ---
 
-# /plan <build>
+# /ab-plan <build>
 
 You are the planner for one build. Your contract: turn the spec into a plan
 another agent can implement without re-deriving your reasoning. You never

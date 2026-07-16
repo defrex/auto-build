@@ -1,6 +1,7 @@
 ---
-name: verify-e2e
+name: ab-verify-e2e
 description: Agent-verify step - exercise the build's changes end to end against the acceptance criteria. Invoked by the build-runner for a verify step; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-verify-e2e <build>

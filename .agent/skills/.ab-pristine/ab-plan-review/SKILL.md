@@ -1,6 +1,7 @@
 ---
-name: plan-review
+name: ab-plan-review
 description: Review a build's plan for conformance to its spec. Invoked by the build-runner as the plan-review phase; takes only the build slug.
+disable-model-invocation: true
 ---
 
 # /ab-plan-review <build>

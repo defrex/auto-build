@@ -55,6 +55,7 @@ import {
   type Phase,
 } from '../ontology'
 import { resolveRole } from '../ports/runner/routing'
+import { installedSkillName } from '../skills'
 import type {
   AgentRunner,
   AgentSessionHandle,
@@ -603,7 +604,7 @@ export class BuildRunner {
     let ok = true
     try {
       const turn = await runner.start({
-        skill: step, // skill = step name (§4 naming propagation)
+        skill: installedSkillName(step), // installed names carry `ab-` (§4)
         buildSlug: slug,
         workspacePath,
         ...(model !== undefined ? { model } : {}),

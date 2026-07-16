@@ -4,7 +4,7 @@ description: Review a build's implementation commits against its spec and plan. 
 disable-model-invocation: true
 ---
 
-# /code-review <build>
+# /ab-code-review <build>
 
 You are a fresh skeptic reviewing the diff. You have no memory of prior
 rounds by design. Your verdict travels the typed channel; prose you print

@@ -58,7 +58,7 @@ command = "test"
 
 [verify.e2e]
 kind = "agent"
-skill = "verify-e2e"
+skill = "ab-verify-e2e"
 needsServer = true
 
 [finalize]
@@ -297,7 +297,7 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
   const table = (options.handlers ?? happyHandlers)(store)
   const script: Script = async (ctx) => {
     ops.push(`session:${ctx.opts.skill}`)
-    const handler = table[ctx.opts.skill]
+    const handler = table[ctx.opts.skill] ?? table[ctx.opts.skill.replace(/^ab-/, '')]
     if (!handler) throw new Error(`no handler for skill "${ctx.opts.skill}"`)
     return handler(ctx)
   }
@@ -620,7 +620,7 @@ describe('step', () => {
     expect(started.payload).toEqual({ attempt: 1, baseSha: 'sha-main-9' })
 
     // AB_PHASE uses the attempt as the round for reconcile (D8).
-    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'reconcile')
+    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'ab-reconcile')
     expect(journal?.opts.env['AB_PHASE']).toBe('reconcile@1')
 
     // Reconciliation changed code, so verify:* re-runs in full — cheap
@@ -714,7 +714,7 @@ describe('happy path (§15.6)', () => {
       ['plan-review', 1, 'plan-review'],
       ['implement', 1, 'implement'],
       ['code-review', 1, 'code-review'],
-      ['verify:e2e', 1, 'verify-e2e'],
+      ['verify:e2e', 1, 'ab-verify-e2e'],
       ['finalize', 1, 'finalize'],
       ['finalize', 1, 'release-notes'],
     ])
@@ -729,6 +729,20 @@ describe('happy path (§15.6)', () => {
     expect(record?.lease?.holder).toBe('runner-1')
   })
 
+  test('invokes every installed skill through the ab-* namespace', async () => {
+    const h = await makeHarness()
+    await h.br.run()
+    expect([...h.runner.sessions.values()].map((journal) => journal.opts.skill)).toEqual([
+      'ab-plan',
+      'ab-plan-review',
+      'ab-implement',
+      'ab-code-review',
+      'ab-verify-e2e',
+      'ab-finalize',
+      'ab-release-notes',
+    ])
+  })
+
   test('role routing (§9): the plan session carries the configured model everywhere', async () => {
     const h = await makeHarness()
     await h.br.run()
@@ -737,7 +751,7 @@ describe('happy path (§15.6)', () => {
     expect(planSession.payload.model).toBe('m-plan')
     expect(planSession.payload.runner).toBe('scripted')
 
-    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'plan')
+    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'ab-plan')
     expect(journal?.opts.model).toBe('m-plan')
 
     const ended = ofType(events, 'session.ended').find(
@@ -752,9 +766,9 @@ describe('happy path (§15.6)', () => {
     await h.br.run()
     const events = await h.store.getEvents(SLUG)
     const e2eSession = ofType(events, 'session.started').find(
-      (e) => e.payload.role === 'verify-e2e',
+      (e) => e.payload.role === 'ab-verify-e2e',
     )!
-    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'verify-e2e')!
+    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'ab-verify-e2e')!
     expect(journal.opts.env['AB_STORE']).toBe('local')
     expect(journal.opts.env['AB_BUILD']).toBe(SLUG)
     expect(journal.opts.env['AB_PHASE']).toBe('verify:e2e@1')
@@ -827,7 +841,7 @@ describe('session memory (§10)', () => {
     expect(state.status).toBe('running') // ran through to awaiting-pr
 
     const implementJournals = [...h.runner.sessions.values()].filter(
-      (j) => j.opts.skill === 'implement',
+      (j) => j.opts.skill === 'ab-implement',
     )
     expect(implementJournals.length).toBe(1) // ONE runner session, two rounds
     const journal = implementJournals[0]!
@@ -841,7 +855,7 @@ describe('session memory (§10)', () => {
     const h = await makeHarness({ handlers: reviseThenApproveHandlers })
     await h.br.run()
     const reviewJournals = [...h.runner.sessions.values()].filter(
-      (j) => j.opts.skill === 'code-review',
+      (j) => j.opts.skill === 'ab-code-review',
     )
     expect(reviewJournals.length).toBe(2)
     expect(reviewJournals.every((j) => j.turns.length === 1)).toBe(true)
@@ -922,7 +936,7 @@ describe('session memory (§10)', () => {
 
     // Fresh session (no live handle survives a park): started, never continued.
     const planJournals = [...h.runner.sessions.values()].filter(
-      (j) => j.opts.skill === 'plan',
+      (j) => j.opts.skill === 'ab-plan',
     )
     expect(planJournals).toHaveLength(1)
     expect(planJournals[0]!.messages).toEqual([])
@@ -1057,7 +1071,7 @@ describe('session memory (§10)', () => {
     expect(state.status).toBe('running') // recovered and finished the pipeline
 
     const implementJournals = [...h.runner.sessions.values()].filter(
-      (j) => j.opts.skill === 'implement',
+      (j) => j.opts.skill === 'ab-implement',
     )
     expect(implementJournals.length).toBe(2)
     expect(implementJournals[0]!.turns.length).toBe(2) // r1 + failed continue
@@ -1337,7 +1351,7 @@ describe('needsServer (D10)', () => {
     await h.br.run()
     const i = h.ops.indexOf('server:ensureStarted')
     expect(i).toBeGreaterThan(-1)
-    expect(h.ops[i + 1]).toBe('session:verify-e2e')
+    expect(h.ops[i + 1]).toBe('session:ab-verify-e2e')
     expect(h.ops[i + 2]).toBe('server:stop')
   })
 
@@ -1357,7 +1371,7 @@ describe('needsServer (D10)', () => {
     const decision = await h.br.step()
     expect(decision.kind).toBe('run-agent-verify')
 
-    expect(h.ops).toEqual(['server:ensureStarted', 'session:verify-e2e', 'server:stop'])
+    expect(h.ops).toEqual(['server:ensureStarted', 'session:ab-verify-e2e', 'server:stop'])
     const events = await h.store.getEvents(SLUG)
     // The thrown start never returned a handle, so no session.ended arrives —
     // the dead session stays open (§15.6-C) and the failure is recorded.
@@ -1524,7 +1538,7 @@ describe('resume after sandbox death (§15.6-C)', () => {
       'implement.completed',
       'session.ended',
     ])
-    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'implement')!
+    const journal = [...h.runner.sessions.values()].find((j) => j.opts.skill === 'ab-implement')!
     expect(journal.turns.length).toBe(1)
     expect(journal.messages.length).toBe(0) // start, not continue
     expect(journal.opts.env['AB_PHASE']).toBe('implement@2')

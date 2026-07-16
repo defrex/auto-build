@@ -11,6 +11,7 @@ import {
   type Phase,
 } from '../ontology'
 import type { EventType } from '../events/payloads'
+import { installedSkillName } from '../skills'
 
 export type PhaseKind = 'producer' | 'review' | 'agent-verify'
 export type TerminalCommand = 'done' | 'verdict' | 'escalate'
@@ -57,8 +58,8 @@ export interface ContextInputs {
 export interface PhaseSpec {
   name: CorePhase | 'verify'
   kind: PhaseKind
-  /** Bare skill name; the `ab-` namespace prefix is applied at install (§16.3).
-   * For verify steps the actual skill comes from step config (§16.1). */
+  /** Installed, namespaced skill name. For verify steps the actual skill
+   * comes from step config (§16.1). */
   skill: string
   startedEvent: EventType
   terminal: 'done' | 'verdict'
@@ -83,7 +84,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   plan: {
     name: 'plan',
     kind: 'producer',
-    skill: 'plan',
+    skill: installedSkillName('plan'),
     startedEvent: 'plan.started',
     terminal: 'done',
     terminalEvent: 'plan.completed',
@@ -99,7 +100,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   'plan-review': {
     name: 'plan-review',
     kind: 'review',
-    skill: 'plan-review',
+    skill: installedSkillName('plan-review'),
     startedEvent: 'plan-review.started',
     terminal: 'verdict',
     terminalEvent: 'plan-review.verdict',
@@ -111,7 +112,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   implement: {
     name: 'implement',
     kind: 'producer',
-    skill: 'implement',
+    skill: installedSkillName('implement'),
     startedEvent: 'implement.started',
     terminal: 'done',
     terminalEvent: 'implement.completed',
@@ -130,7 +131,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   'code-review': {
     name: 'code-review',
     kind: 'review',
-    skill: 'code-review',
+    skill: installedSkillName('code-review'),
     startedEvent: 'code-review.started',
     terminal: 'verdict',
     terminalEvent: 'code-review.verdict',
@@ -148,7 +149,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   verify: {
     name: 'verify',
     kind: 'agent-verify',
-    skill: 'verify',
+    skill: installedSkillName('verify'),
     startedEvent: 'verify.started',
     terminal: 'verdict',
     terminalEvent: 'verify.completed',
@@ -159,7 +160,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   finalize: {
     name: 'finalize',
     kind: 'producer',
-    skill: 'finalize',
+    skill: installedSkillName('finalize'),
     startedEvent: 'finalize.started',
     terminal: 'done',
     terminalEvent: 'finalize.completed',
@@ -177,7 +178,7 @@ export const PHASE_SPECS: Record<CorePhase | 'verify', PhaseSpec> = {
   reconcile: {
     name: 'reconcile',
     kind: 'producer',
-    skill: 'reconcile',
+    skill: installedSkillName('reconcile'),
     startedEvent: 'reconcile.started',
     terminal: 'done',
     terminalEvent: 'reconcile.completed',

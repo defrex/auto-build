@@ -4,7 +4,7 @@ description: Resolve a conflicted PR by merging base into the build branch. Invo
 disable-model-invocation: true
 ---
 
-# /reconcile <build>
+# /ab-reconcile <build>
 
 The build's PR no longer merges cleanly: main moved. Your job is one merge
 commit — base merged *into* the build branch — that preserves both what this

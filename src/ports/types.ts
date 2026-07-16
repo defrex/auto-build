@@ -122,7 +122,7 @@ export interface Transcript {
 }
 
 export interface AgentStartOpts {
-  /** Skill to invoke, e.g. `plan` — the runner formats `/{skill} {buildSlug}`. */
+  /** Installed skill to invoke, e.g. `ab-plan`; the runner formats `/{skill} {buildSlug}`. */
   skill: string
   buildSlug: string
   workspacePath: string

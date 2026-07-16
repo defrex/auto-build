@@ -133,7 +133,7 @@ async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fix
   }
   const agents = new ScriptedAgentRunner({
     script: async (ctx) => {
-      const handler = handlers[ctx.opts.skill]
+      const handler = handlers[ctx.opts.skill] ?? handlers[ctx.opts.skill.replace(/^ab-/, '')]
       if (handler === undefined) throw new Error(`no handler for skill "${ctx.opts.skill}"`)
       return (await handler(makeCli(ctx))) ?? defaultTurnResult(`${ctx.opts.skill} finished`)
     },
