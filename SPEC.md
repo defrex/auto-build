@@ -433,7 +433,8 @@ implementer:  ab context   (findings.json now materialized) → …
 ### 8.8 Outer-loop namespace (deferred)
 
 Pre-build surfaces need a small separate namespace: `ab ticket create`
-(the `/spec` skill filing a groomed ticket) and `ab ticket propose`
+(the `/spec` skill filing a groomed ticket, including its creation-time
+blockers via `--blocked-by <id,id>` — §13) and `ab ticket propose`
 (ingesters filing to Triage), plus ledger operations for ingesters. Same
 binary, same ambient-auth model, different scope — detailed design belongs
 to the outer-loop/ingester thread, not here.
@@ -534,6 +535,28 @@ build never reads the tracker again. Human-legibility projections (spec
 posted as a comment, final summary, status transitions) flow outward only.
 This keeps the abstraction honest: a file-based TicketSource with nowhere to
 put blobs must be fully workable.
+
+**Ticket dependencies are the source's, gating is the dispatcher's.** A
+ticket may declare blockers at creation (`ab ticket create --blocked-by`),
+and every adapter must materialize them natively — Linear blocking relations,
+file frontmatter `blockedBy` — or fail loudly; silently discarding a
+requested blocker would dispatch dependent work early. The port carries
+exactly the two answers only the provider can give: `Ticket.blockedBy` (what
+this ticket declares) and `Ticket.complete` (is a ticket resolved *by that
+source's own lifecycle* — Linear's state type, the file source's done-state).
+Auto-build never models resolution itself and never redefines what completed
+or canceled means.
+
+Everything downstream of those two answers is deterministic and
+provider-independent (`processes/dependencies.ts`): traversal, classification
+(`self` | `missing` | `cycle` | `unresolved`), and the operator diagnostic.
+The dispatcher consults it *before* claiming, so a dependency-blocked ticket
+stays a plain queued ticket in the source — it creates no build, provisions
+no workspace, and consumes no capacity. There is deliberately no pre-build
+`blocked` build record: that would duplicate the provider's state model. An
+unresolved or invalid graph never starves unrelated eligible tickets, and
+because gating runs on `listReady`'s output, `readyLabels`/`readyState` can
+only narrow candidates — they can never override a dependency.
 
 ## 14. Operator UI
 

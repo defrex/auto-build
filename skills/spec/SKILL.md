@@ -34,6 +34,22 @@ this install; otherwise create it via the repo's ticket tracker and say
 where). The ticket lands in Triage — a human grooms it to Ready; creation is
 not dispatch.
 
+If grooming surfaced work this ticket depends on — "this can't start until
+the auth refactor lands" — declare it at creation:
+
+```
+ab ticket create "…title…" --body spec.md --blocked-by AUT-8,AUT-12
+```
+
+The ids are comma-separated and belong to the configured ticket source (the
+ids that source itself shows, e.g. `AUT-8` for Linear, `file-3` for the file
+tracker) — not build slugs or titles. `ab` records them as real dependencies
+in that source, and the dispatcher leaves the ticket queued until every
+blocker is complete by that source's own lifecycle. Do NOT reach for a custom
+provider script or MCP call to wire the relationship up yourself: a
+dependency created outside this flag is invisible to the flag's validation,
+and one created by hand in the wrong direction dispatches the work early.
+
 ## With a ticket argument: flesh out
 
 Fetch the ticket. Diff it against the standard: which of the four parts are
