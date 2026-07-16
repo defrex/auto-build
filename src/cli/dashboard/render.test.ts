@@ -6,6 +6,11 @@ import { describe, expect, test } from 'bun:test'
 import { renderDashboard, stripAnsi } from './render'
 import type { DashboardBuild, DashboardModel } from './model'
 
+/**
+ * The default fixture carries a `pr` on purpose. Without one, no test ever
+ * truncated a line containing a hyperlink — which is exactly how an unclosed
+ * OSC 8 (`f_f72ad952`) survived a green suite.
+ */
 function build(overrides: Partial<DashboardBuild> = {}): DashboardBuild {
   return {
     slug: 'auth-rate-limit',
@@ -19,8 +24,20 @@ function build(overrides: Partial<DashboardBuild> = {}): DashboardBuild {
       { label: 'verify:test', state: 'pending' },
     ],
     blockers: [],
+    pr: { url: 'https://github.com/defrex/app/pull/7', state: 'open' },
     ...overrides,
   }
+}
+
+/**
+ * How many OSC 8 hyperlinks a line leaves OPEN. `\x1b]8;;<url>\x07` opens one,
+ * `\x1b]8;;\x07` closes it; a hyperlink is a stateful terminal mode, so a line
+ * that ends with one open leaks it into everything painted afterwards.
+ */
+function unclosedLinks(line: string): number {
+  const all = line.match(/\x1b\]8;;[^\x07]*\x07/g) ?? []
+  const closes = all.filter((s) => s === '\x1b]8;;\x07').length
+  return all.length - closes - closes
 }
 
 function model(builds: DashboardBuild[]): DashboardModel {
@@ -185,6 +202,47 @@ describe('renderDashboard: truncation (one rendered line = one physical row)', (
     }
   })
 
+  test('truncation never leaves a hyperlink OPEN — RESET does not close one', () => {
+    // f_f72ad952: `renderBuild` puts the PR link last, so it is the first thing
+    // truncation eats. `\x1b[0m` is an SGR reset and does not end an OSC 8; an
+    // unclosed link makes every line painted afterwards — the progress row, the
+    // blockers, every later build — clickable to that one PR, and `finish()`
+    // deliberately leaves the frame up, so it lands on the operator's shell
+    // prompt after exit.
+    //
+    // 80 is the default width and this module's own fallback, and a 43-char
+    // slug is what this repo's own builds are named: the ordinary case.
+    const real = build({
+      slug: 'interactive-build-dashboard-for-ab-dispatch',
+      ticketId: 'AB-123',
+      phase: 'verify:test',
+    })
+    // Sweep the widths so the cut lands in every part of the link — before it,
+    // inside its text, and past it.
+    for (let width = 10; width <= 120; width += 1) {
+      const lines = renderDashboard(model([real, build({ slug: 'b' })]), { color: true, width })
+      for (const line of lines) expect(unclosedLinks(line)).toBe(0)
+    }
+  })
+
+  test('a link cut exactly inside its TEXT still closes — the regression window', () => {
+    // Width 80 with the real slug lands the cut inside "PR open".
+    const line = renderDashboard(
+      model([
+        build({
+          slug: 'interactive-build-dashboard-for-ab-dispatch',
+          ticketId: 'AB-123',
+          phase: 'verify:test',
+        }),
+      ]),
+      { color: true, width: 80 },
+    ).find((l) => l.includes('\x1b]8;;'))
+    expect(line).toBeDefined()
+    expect(line).toContain('~') // it really was cut mid-link…
+    expect(line).toContain('\x1b]8;;https://github.com/defrex/app/pull/7\x07') // …after opening it
+    expect(unclosedLinks(line!)).toBe(0)
+  })
+
   test('a line that fits is left exactly alone', () => {
     const lines = renderDashboard(model([build()]), WIDE)
     expect(lines.some((l) => l.includes('~'))).toBe(false)
@@ -212,11 +270,13 @@ describe('renderDashboard: the progress row WRAPS rather than truncating', () =>
   })
 
   test('every step survives at a width the row cannot fit on one line', () => {
-    const out = renderDashboard(model([full]), { color: false, width: 60 }).join('\n')
+    const progress = renderDashboard(model([full]), { color: false, width: 60 })
+      .filter((l) => l.startsWith('  ['))
+      .join('\n')
     for (const label of ['plan', 'implement(r2)', 'verify:test(a2)', 'finalize', 'merge(waiting)']) {
-      expect(out).toContain(label)
+      expect(progress).toContain(label)
     }
-    expect(out).not.toContain('~') // nothing was truncated away
+    expect(progress).not.toContain('~') // no step was truncated away
   })
 
   test('…and the width guarantee still holds on every wrapped line', () => {

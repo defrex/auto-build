@@ -33,6 +33,9 @@ export interface RenderOpts {
 
 const ESC = '\x1b['
 const RESET = `${ESC}0m`
+/** Closes an OSC 8 hyperlink. `RESET` does NOT: it is an SGR reset, and the
+ * two families are independent — only this ends the link. */
+const LINK_OFF = '\x1b]8;;\x07'
 const CODES = {
   dim: 2,
   red: 31,
@@ -52,7 +55,7 @@ function paint(text: string, color: ColorName, on: boolean): string {
  * mode we emit the bare URL, which those same terminals linkify on sight —
  * so "PR URLs are recognized as a link" holds on both paths. */
 function link(url: string, text: string, on: boolean): string {
-  return on ? `\x1b]8;;${url}\x07${text}\x1b]8;;\x07` : url
+  return on ? `\x1b]8;;${url}\x07${text}${LINK_OFF}` : url
 }
 
 /** Visible length: what the operator's eye counts, not what `.length` does. */
@@ -66,28 +69,42 @@ export function stripAnsi(text: string): string {
 }
 
 /**
- * Truncate to `width` VISIBLE columns without ever splitting an escape.
+ * Truncate to `width` VISIBLE columns without ever splitting an escape, and
+ * without leaving any mode it cut through switched ON.
  *
  * Walking the string escape-aware (rather than slicing and hoping) is the
  * whole point: a cut mid-sequence leaks raw escape bytes onto the screen, and
- * a cut that drops a trailing reset bleeds color into every line below it.
- * Escapes are copied through and cost zero columns; the reset is re-appended
- * whenever we cut a line that had any.
+ * a cut that drops a closer leaves the mode running down the rest of the
+ * frame. Escapes are copied through and cost zero columns.
+ *
+ * BOTH families this file emits are stateful, and both must be closed — the
+ * SGR colors with `RESET`, and an OSC 8 hyperlink with `LINK_OFF`. `RESET` does
+ * not close a hyperlink. Getting this wrong is not cosmetic: `renderBuild` puts
+ * the PR link LAST, so it is the first thing truncation eats, and an unclosed
+ * OSC 8 makes every line painted afterwards — the progress row, the blockers,
+ * every later build — clickable to that one PR. `finish()` deliberately leaves
+ * the final frame up, so the state would outlive the process and land on the
+ * operator's shell prompt.
  */
 function truncate(text: string, width: number): string {
   if (visibleLength(text) <= width) return text
   let out = ''
   let visible = 0
-  let sawEscape = false
+  let sawSgr = false
+  let linkOpen = false
   for (let i = 0; i < text.length; i += 1) {
     const char = text[i]!
     if (char === '\x1b') {
       // Copy the whole sequence: CSI ends at a letter, OSC 8 at BEL.
-      const end = text[i + 1] === ']' ? text.indexOf('\x07', i) : text.slice(i).search(/[A-Za-z]/) + i
+      const osc = text[i + 1] === ']'
+      const end = osc ? text.indexOf('\x07', i) : text.slice(i).search(/[A-Za-z]/) + i
       const stop = end === -1 || end < i ? text.length - 1 : end
-      out += text.slice(i, stop + 1)
+      const seq = text.slice(i, stop + 1)
+      out += seq
       i = stop
-      sawEscape = true
+      // An OSC 8 with a URL opens the link; the empty-param form closes it.
+      if (osc) linkOpen = seq !== LINK_OFF
+      else sawSgr = true
       continue
     }
     if (visible >= width - 1) {
@@ -97,7 +114,9 @@ function truncate(text: string, width: number): string {
     out += char
     visible += 1
   }
-  return sawEscape ? `${out}${RESET}` : out
+  // Close what we cut through — the link first, so the `~` stays inside it.
+  if (linkOpen) out += LINK_OFF
+  return sawSgr ? `${out}${RESET}` : out
 }
 
 /**

@@ -283,6 +283,21 @@ function guardA(log: AbEvent[], build: DashboardBuild): void {
  * `implement [x] code-review [x] verify [ ]` — every done precedes every
  * pending, so no ordering guard can see it).
  *
+ * It has **two halves**, because `done` was never the only predicate that can
+ * disagree with the engine — `f_7edf2816` was a `current` that did:
+ *
+ *   B1. the step the engine names is not `done`.
+ *   B2. if a row is `current`, the engine names THAT phase.
+ *
+ * B2 is the sound direction only. The converse — "the named phase IS current"
+ * — is **not** an invariant and must not be asserted: `run-phase plan` is also
+ * the answer when plan is merely DUE, and the plan documents intentional
+ * zero-current windows (see the test below). B2 rests on §15.6-C instead: a
+ * started-without-terminal phase is exactly what the engine re-runs FROM ITS
+ * START, so if something is genuinely running, `decideNext` names it. A
+ * non-run decision (wait / acknowledge / raise-escalation) names no phase and
+ * is exempt.
+ *
  * **Known blind spot:** a `wait` decision names no phase — and that covers the
  * two durable, human-paced states an operator stares hardest at (blocked on an
  * escalation; awaiting a spec revision). Those get explicit hand-written cases
@@ -295,6 +310,8 @@ function guardB(log: AbEvent[], build: DashboardBuild, config: Config): void {
     expect(step).toBeDefined()
     expect(step?.state).not.toBe('done')
   }
+
+  // B1 — the engine's next step is not already ticked.
   switch (decision.kind) {
     case 'run-phase':
       notDone(decision.phase)
@@ -309,6 +326,20 @@ function guardB(log: AbEvent[], build: DashboardBuild, config: Config): void {
     default:
       break
   }
+
+  // B2 — nothing else claims to be running. `merge` is exempt: it is not a
+  // phase, and when it is current the engine is parked on `wait{awaiting-pr}`,
+  // which this switch already skips.
+  const named =
+    decision.kind === 'run-phase'
+      ? decision.phase
+      : decision.kind === 'run-check' || decision.kind === 'run-agent-verify'
+        ? verifyPhase(decision.step)
+        : undefined
+  if (named === undefined) return
+  const current = build.steps.find((s) => s.state === 'current')
+  if (current === undefined) return
+  expect(current.label).toBe(named)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -747,6 +778,95 @@ describe('an unlanded revise-spec answer parks the WHOLE pipeline (instance #8)'
     expect(decideNext(log, CONFIG)).toMatchObject({ kind: 'run-phase', phase: 'plan', round: 2 })
     expect(reduceBuild(log).restartSince).toBeGreaterThan(0)
     project(log) // guards only — the pending-restart branch must be off here
+  })
+})
+
+describe('f_7edf2816: `current` is scoped to the current spec too', () => {
+  // The plan's rule only ever quantified over `done`, so `at()` read the
+  // full-log `currentPhase` — which `spec.revised` does not touch, because
+  // `start()` sets it and only that phase's OWN terminal clears it, and
+  // `escalation.raised` deliberately does not (the phase still needs
+  // re-running). A phase in flight when a restart lands therefore kept
+  // rendering as running.
+  //
+  // The canonical revise-spec path, no mutation, default config: an
+  // implementer escalates because the spec is self-contradictory (an accepted
+  // phase terminal, §8.4), so `implement.completed` never lands.
+  const escalatedMidImplement = [
+    ...prelude(),
+    ...planRound(1, 'approve'),
+    ev('implement.started', { round: 1 }),
+    ev('escalation.raised', {
+      id: 'e_respec',
+      phase: 'implement',
+      round: 1,
+      source: 'agent',
+      question: 'the spec contradicts itself',
+    }),
+    ev('escalation.answered', {
+      id: 'e_respec',
+      answer: 'rewriting it',
+      resolution: 'revise-spec',
+    }),
+  ]
+  const restartLanded = [
+    ...escalatedMidImplement,
+    ev('spec.revised', { artifact: { kind: 'spec', rev: 1 }, escalation: 10 }),
+  ]
+
+  test('window A — pending restart: nothing is running, so nothing is current', () => {
+    const log = toLog(escalatedMidImplement)
+    // The build is parked on the human. It is NOT blocked (the escalation is
+    // answered), so it is listed and reads `running` — the operator sees the
+    // row and must not be told `implement` is in flight.
+    expect(decideNext(log, CONFIG)).toEqual({ kind: 'wait', reason: 'awaiting-spec' })
+    expect(reduceBuild(log).currentPhase).toMatchObject({ phase: 'implement', round: 1 })
+
+    const build = project(log)
+    expect(build.status).toBe('running')
+    expect(build.blockers).toEqual([])
+    expect(build.steps.filter((s) => s.state === 'current')).toEqual([])
+    expect(build.phase).toBeUndefined()
+  })
+
+  test('window B — restart landed: the engine runs plan r2, so implement is not current', () => {
+    const log = toLog(restartLanded)
+    expect(decideNext(log, CONFIG)).toMatchObject({ kind: 'run-phase', phase: 'plan', round: 2 })
+    // The reducer still carries the pre-restart context — that is the fact the
+    // row may not be built from, exactly as with `plan.approved` and `prState`.
+    expect(reduceBuild(log).currentPhase).toMatchObject({ phase: 'implement', round: 1 })
+
+    const build = project(log)
+    expect(stateOf(build, 'implement')).toBe('pending')
+    expect(build.steps.filter((s) => s.state === 'current')).toEqual([])
+    expect(build.phase).toBeUndefined()
+  })
+
+  test('…and plan goes current once the post-restart plan.started lands', () => {
+    const build = project(toLog([...restartLanded, ev('plan.started', { round: 2 })]))
+    expect(stateOf(build, 'plan')).toBe('current')
+    expect(stateOf(build, 'implement')).toBe('pending')
+    expect(build.phase).toBe('plan')
+  })
+
+  test('the header phase is scoped too — lastCompletedPhase is full-log as well', () => {
+    // `state.phase` is `currentPhase ?? lastCompletedPhase`; both survive a
+    // restart. Here the pre-restart phase COMPLETED, so only the
+    // lastCompletedPhase path is left to lie.
+    const log = toLog([
+      ...prelude(),
+      ...planRound(1, 'approve'),
+      ...codeRound(1, 'approve'),
+      ...reviseSpec(13, 'code-review'),
+    ])
+    expect(reduceBuild(log).phase).toBe('code-review')
+    expect(project(log).phase).toBeUndefined()
+  })
+
+  test('no restart ⇒ current and phase behave exactly as before', () => {
+    const build = project(toLog([...prelude(), ...planRound(1, 'approve'), ev('implement.started', { round: 1 })]))
+    expect(stateOf(build, 'implement')).toBe('current')
+    expect(build.phase).toBe('implement')
   })
 })
 

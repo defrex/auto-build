@@ -31,7 +31,7 @@
  * reducer nor the engine is touched.
  */
 import type { Config } from '../../config/schema'
-import type { BuildState, PrLifecycle } from '../../kernel/reducer'
+import type { BuildState, PhaseContext, PrLifecycle } from '../../kernel/reducer'
 import { verifyPhase } from '../../ontology'
 import type { BuildRecord } from '../../store/types'
 
@@ -140,6 +140,36 @@ export function projectBuild(
   // already drops them at `spec.revised`, so only the pending case is left.
   const finalizeSteps = pendingRestart ? [] : state.finalizeSteps
 
+  /**
+   * The phase contexts, scoped to the current spec.
+   *
+   * `currentPhase` and `lastCompletedPhase` are latest-wins over the FULL log
+   * — the same shape as `plan.approved` and `prState`, and stale for the same
+   * reason. `start()` sets `currentPhase` and only that phase's OWN terminal
+   * event clears it (`reducer.ts`); `escalation.raised` deliberately does not
+   * (the phase still needs re-running), and `spec.revised` resets
+   * `restartSince`, `cycleSince` and `finalizeSteps` but not these. So a phase
+   * that was in flight when a restart landed still reads as running.
+   *
+   * That is the plan's own defect class in the one predicate its rule never
+   * quantified over — `current`, not `done` — so it gets the same treatment:
+   * across a restart (landed OR pending) nothing is current until a new
+   * `*.started` lands. That is exactly what the engine does; it re-runs the
+   * loops from plan (engine.ts:466) rather than resuming the interrupted
+   * phase, and during a pending restart it runs nothing at all
+   * (engine.ts:221-227).
+   *
+   * `reconcile` is included deliberately. The epilogue is restart-orthogonal
+   * in the facts it routes on (engine.ts:161-162) — but rule 3 preempts it
+   * while a restart is pending, and once one lands the engine goes to plan and
+   * only re-reaches the epilogue after a full rebuild re-opens the PR. A
+   * pre-restart `reconcile.started` is not "reconcile is running now".
+   */
+  const scoped = (ctx: PhaseContext | undefined): PhaseContext | undefined =>
+    ctx !== undefined && ctx.seq > restartSince ? ctx : undefined
+  const activePhase = scoped(state.currentPhase)
+  const lastPhase = scoped(state.lastCompletedPhase)
+
   // ── Shared derivations ────────────────────────────────────────────────────
   // ORDER MATTERS: `cycleFailed` must be defined before `codeDone` reads it.
   const cycle = state.verify.results.filter((r) => r.seq > cycleSince)
@@ -169,7 +199,7 @@ export function projectBuild(
     finalizeSteps.some((f) => f.step === s),
   )
 
-  const at = (phase: string): boolean => state.currentPhase?.phase === phase
+  const at = (phase: string): boolean => activePhase?.phase === phase
   const planNote = state.plan.round > 1 ? `r${state.plan.round}` : undefined
   const codeNote = state.implement.round > 1 ? `r${state.implement.round}` : undefined
 
@@ -188,7 +218,7 @@ export function projectBuild(
     // `verify.attempt`, which is the max attempt SEEN and names the previous
     // cycle in the window after a boundary move. Rendered only on the running
     // step, so it can never be stale.
-    const attempt = state.currentPhase?.attempt
+    const attempt = activePhase?.attempt
     const note = cycle.some((r) => r.step === s && !r.pass)
       ? 'failed'
       : current && attempt !== undefined && attempt > 1
@@ -238,12 +268,15 @@ export function projectBuild(
         state.prState === 'open' &&
         verifyDrained &&
         postStepsDrained &&
-        state.currentPhase === undefined,
+        activePhase === undefined,
       'waiting',
     ),
   )
 
-  const phase = state.currentPhase?.phase ?? state.phase
+  // `state.phase` is `currentPhase ?? lastCompletedPhase` — both full-log, so
+  // it is scoped here rather than read directly: after a restart the header
+  // must not name a phase that belongs to a spec that no longer exists.
+  const phase = activePhase?.phase ?? lastPhase?.phase
 
   return {
     slug: record.slug,
