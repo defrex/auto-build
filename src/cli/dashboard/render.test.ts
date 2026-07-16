@@ -190,3 +190,63 @@ describe('renderDashboard: truncation (one rendered line = one physical row)', (
     expect(lines.some((l) => l.includes('~'))).toBe(false)
   })
 })
+
+describe('renderDashboard: the progress row WRAPS rather than truncating', () => {
+  // Regression, found by rendering a realistic frame at 100 columns: a full
+  // pipeline (plan → plan-review → implement → code-review → verify:* →
+  // finalize → merge) does not fit, and truncating drops the tail — which is
+  // `finalize` and `merge(waiting)`, i.e. exactly the steps the ACs require
+  // and the ones the operator is actually waiting on. We do the wrapping, so
+  // the row count stays honest AND nothing is lost.
+  const full = build({
+    steps: [
+      { label: 'plan', state: 'done' },
+      { label: 'plan-review', state: 'done' },
+      { label: 'implement', state: 'done', note: 'r2' },
+      { label: 'code-review', state: 'done', note: 'r2' },
+      { label: 'verify:lint', state: 'done' },
+      { label: 'verify:test', state: 'current', note: 'a2' },
+      { label: 'finalize', state: 'pending' },
+      { label: 'merge', state: 'pending', note: 'waiting' },
+    ],
+  })
+
+  test('every step survives at a width the row cannot fit on one line', () => {
+    const out = renderDashboard(model([full]), { color: false, width: 60 }).join('\n')
+    for (const label of ['plan', 'implement(r2)', 'verify:test(a2)', 'finalize', 'merge(waiting)']) {
+      expect(out).toContain(label)
+    }
+    expect(out).not.toContain('~') // nothing was truncated away
+  })
+
+  test('…and the width guarantee still holds on every wrapped line', () => {
+    for (const width of [30, 44, 60, 100]) {
+      for (const color of [false, true]) {
+        const lines = renderDashboard(model([full]), { color, width })
+        for (const line of lines) expect(stripAnsi(line).length).toBeLessThanOrEqual(width)
+      }
+    }
+  })
+
+  test('a long blocker message wraps instead of losing its tail', () => {
+    // "Every unresolved blocker message is displayed" is not satisfied by its
+    // first 80 characters, and a policy escalation's question routinely runs
+    // longer than that.
+    const blocker =
+      'maxVerifyAttempts (3) exhausted: verify:test is still failing after three ' +
+      'attempts and the implementer keeps reintroducing the same regression'
+    const lines = renderDashboard(
+      model([build({ status: 'blocked', blockers: [blocker] })]),
+      { color: false, width: 50 },
+    )
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(50)
+    // Reassembled, the whole message is there.
+    const text = lines
+      .filter((l) => l.trimStart().startsWith('!') || /^\s{4}\S/.test(l))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .replace('! ', '')
+      .trim()
+    expect(text).toBe(blocker)
+  })
+})

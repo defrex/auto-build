@@ -100,6 +100,37 @@ function truncate(text: string, width: number): string {
   return sawEscape ? `${out}${RESET}` : out
 }
 
+/**
+ * Greedily pack pre-rendered tokens into `indent`-prefixed lines of at most
+ * `width` VISIBLE columns.
+ *
+ * Why wrap rather than truncate: truncation is mandatory for redraw
+ * correctness (one rendered line must be one physical row, or the painted-line
+ * count under-counts and the redraw leaves fragments) — but a truncated
+ * progress row loses `finalize` and `merge waiting` off the right edge, i.e.
+ * exactly the steps the ACs require and the ones the operator is waiting on.
+ * Both hold at once because WE do the wrapping: every line we emit is within
+ * the width, so the row count stays honest AND nothing is dropped.
+ *
+ * A single token wider than the line is truncated — it cannot be helped, and
+ * it keeps the width guarantee absolute.
+ */
+function packLines(tokens: string[], width: number, indent: string): string[] {
+  const lines: string[] = []
+  let line = ''
+  for (const token of tokens) {
+    const candidate = line === '' ? `${indent}${token}` : `${line} ${token}`
+    if (line !== '' && visibleLength(candidate) > width) {
+      lines.push(line)
+      line = `${indent}${token}`
+    } else {
+      line = candidate
+    }
+  }
+  if (line !== '') lines.push(line)
+  return lines.map((l) => truncate(l, width))
+}
+
 // ── Steps ────────────────────────────────────────────────────────────────────
 
 const GLYPH: Record<PipelineStep['state'], string> = {
@@ -146,9 +177,18 @@ function renderBuild(build: DashboardBuild, opts: RenderOpts, widths: Widths): s
   }
 
   const lines = [truncate(bits.join('  '), width)]
-  lines.push(truncate(`  ${build.steps.map((s) => renderStep(s, color)).join(' ')}`, width))
+  // The progress row wraps rather than truncating: the tail is `finalize` and
+  // `merge waiting`, which the ACs require and the operator is waiting on.
+  lines.push(...packLines(build.steps.map((s) => renderStep(s, color)), width, '  '))
+  // Blockers wrap too — "every unresolved blocker message is displayed" is not
+  // satisfied by its first 80 characters, and a policy escalation's question
+  // is routinely longer than that. Wrap the words, then paint each line, so no
+  // escape is ever split across a wrap.
   for (const blocker of build.blockers) {
-    lines.push(truncate(paint(`  ! ${blocker}`, 'red', color), width))
+    const [first, ...rest] = packLines(blocker.split(/\s+/), width - 4, '')
+    if (first === undefined) continue
+    lines.push(truncate(paint(`  ! ${first}`, 'red', color), width))
+    for (const line of rest) lines.push(truncate(paint(`    ${line}`, 'red', color), width))
   }
   return lines
 }

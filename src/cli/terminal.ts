@@ -22,9 +22,21 @@ export interface TerminalOut {
   interactive: boolean
 }
 
-/** Width to assume when the stream reports none (not a TTY, or a TTY that
- * declines to say) — the conventional terminal default. */
+/** Width to assume when the stream reports none — the conventional default. */
 const FALLBACK_COLUMNS = 80
+
+/**
+ * `stream.columns` for a real terminal, else the fallback.
+ *
+ * The guard is `> 0`, not `?? `: a TTY may report **0** columns — `script(1)`,
+ * many pty wrappers, and some CI runners all do — and `0 ?? 80` is `0`, which
+ * truncates every line to nothing and collapses the dashboard to a column of
+ * ellipses. Zero is not a width; it means "this terminal will not say".
+ */
+function resolveColumns(stream: NodeJS.WriteStream): number {
+  const columns = stream.columns
+  return typeof columns === 'number' && columns > 0 ? columns : FALLBACK_COLUMNS
+}
 
 /**
  * The real terminal over a Node/Bun write stream.
@@ -43,7 +55,7 @@ export function processTerminal(stream: NodeJS.WriteStream = process.stdout): Te
       stream.write(chunk)
     },
     get columns(): number {
-      return stream.columns ?? FALLBACK_COLUMNS
+      return resolveColumns(stream)
     },
     interactive: stream.isTTY === true,
   }
