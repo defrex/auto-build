@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import { resolveCliEnv } from './env'
 import { runCli } from './main'
 import { abDispatch, type DispatchWiring } from './dispatch'
+import type { TerminalOut } from './terminal'
 import { sequentialIds } from '../ids'
 import { FakeForge } from '../ports/forge/fake'
 import {
@@ -66,10 +67,10 @@ source = "file"
 dir = "tickets"
 `
 
-async function initOrigin(dir: string): Promise<void> {
+async function initOrigin(dir: string, toml = DISPATCH_CONFIG_TOML): Promise<void> {
   await mkdir(dir, { recursive: true })
   await git(['init', '-q', '-b', 'main'], dir)
-  await writeFile(join(dir, 'autobuild.toml'), DISPATCH_CONFIG_TOML)
+  await writeFile(join(dir, 'autobuild.toml'), toml)
   await writeFile(join(dir, 'README.md'), 'dispatch e2e origin\n')
   await git(['add', '-A'], dir)
   await git([...GIT_ID, 'commit', '-q', '-m', 'initial'], dir)
@@ -90,10 +91,14 @@ interface Fixture {
 
 /** A wire that supplies fakes over a REAL git worktree provider and a scripted
  * agent driving the real `ab` CLI (the harness happy-path handlers). */
-async function makeFixture(ticket: Ticket, handlers: SkillHandlers): Promise<Fixture> {
+async function makeFixture(
+  ticket: Ticket,
+  handlers: SkillHandlers,
+  toml = DISPATCH_CONFIG_TOML,
+): Promise<Fixture> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-dispatch-'))
   const origin = join(tmp, 'origin')
-  await initOrigin(origin)
+  await initOrigin(origin, toml)
 
   const ids = sequentialIds()
   const store = new MemoryBuildStore({ clock: systemClock })
@@ -311,6 +316,188 @@ describe('abDispatch --once', () => {
       expect(events.map((event) => event.type)).toContain('finalize.completed')
       expect(secondOut).toContain('tick: resumed=1')
       expect(planAttempts).toBe(3)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+})
+
+/** A TerminalOut that claims to be a TTY and records every raw write. */
+function fakeTerminal(interactive = true): TerminalOut & { frames: string[]; all: () => string } {
+  const frames: string[] = []
+  return {
+    frames,
+    all: () => frames.join(''),
+    write: (chunk) => {
+      frames.push(chunk)
+    },
+    columns: 120,
+    interactive,
+  }
+}
+
+describe('abDispatch --once with an interactive terminal', () => {
+  // The existing tests above pass an opts object with NO terminal, and they
+  // pass unchanged — that is the regression proof for "absent terminal ⇒
+  // non-interactive ⇒ plain ⇒ today's exact behavior". These add the
+  // interactive path on top.
+
+  test('paints a dashboard frame naming the build and its progress', async () => {
+    const fx = await makeFixture(readyTicket('T-tty'), happyHandlers())
+    const term = fakeTerminal()
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+      })
+
+      const builds = await fx.store.listBuilds()
+      const slug = builds[0]!.slug
+      const painted = term.all()
+      expect(painted).toContain(slug)
+      // A progress row, with the pipeline in it.
+      expect(painted).toContain('plan')
+      expect(painted).toMatch(/\[[x> ]\]/)
+      // The cursor is always restored, however the pass ends.
+      expect(painted).toContain('\x1b[?25h')
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('prints a SUPERSET of plain mode — the dashboard adds, never removes', async () => {
+    // Plan@4 suppressed the tick report and the parked line on the rationale
+    // that "the dashboard conveys both". It does not: a parked-`done` build is
+    // filtered OUT of the dashboard by construction, and TickReport carries
+    // counts no row ever shows. Suppressing them would be an unrequested
+    // information regression, worst in the interactive --once an operator runs
+    // by hand.
+    const fx = await makeFixture(readyTicket('T-super'), happyHandlers())
+    const term = fakeTerminal()
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+      })
+
+      const slug = (await fx.store.listBuilds())[0]!.slug
+      expect(out.some((line) => line.includes(`build ${slug} parked`))).toBe(true)
+      expect(out.some((line) => line.startsWith('tick: dispatched=1'))).toBe(true)
+      expect(out.some((line) => line.includes('one pass over'))).toBe(true)
+      // …and the final frame is still on screen at exit.
+      expect(term.all()).toContain(slug)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('plain: true with an interactive terminal emits no escapes at all', async () => {
+    const fx = await makeFixture(readyTicket('T-plain'), happyHandlers())
+    const term = fakeTerminal()
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        plain: true,
+        wire: fx.wire,
+        terminal: term,
+      })
+      expect(term.all()).toBe('')
+      expect(out.join('\n')).not.toContain('\x1b')
+      // Plain still reports everything it reports today.
+      const slug = (await fx.store.listBuilds())[0]!.slug
+      expect(out.some((line) => line.includes(`build ${slug} parked`))).toBe(true)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('a non-interactive terminal (a pipe or redirect) auto-selects plain', async () => {
+    const fx = await makeFixture(readyTicket('T-pipe'), happyHandlers())
+    const term = fakeTerminal(false)
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+      })
+      expect(term.all()).toBe('')
+      expect(out.join('\n')).not.toContain('\x1b')
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('--once ticks exactly ONCE — a ticket that turns Ready mid-drain is not claimed', async () => {
+    // The AC says --once selects eligible tickets only during its initial pass.
+    // Today's --once already calls tick() once and then drains; the render loop
+    // only READS, so this is a constraint to preserve, not to implement.
+    const late = readyTicket('T-late')
+    const handlers = happyHandlers()
+    const happyPlan = handlers.plan!
+    // Capacity 2: with capacity 1 the dispatcher's own active-count gate
+    // blocks the second claim, and the test would pass even if --once ticked
+    // twice — a false green.
+    const fx = await makeFixture(
+      readyTicket('T-first'),
+      handlers,
+      DISPATCH_CONFIG_TOML.replace('capacity = 1', 'capacity = 2'),
+    )
+    // Make the late ticket Ready while the first build is still in flight.
+    let seeded = false
+    handlers.plan = async (cli) => {
+      fx.tickets.add(late)
+      seeded = true
+      return happyPlan(cli)
+    }
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: fakeTerminal(),
+      })
+      // The oracle only means anything if the late ticket really did become
+      // Ready mid-drain and the pass really did finish.
+      expect(seeded).toBe(true)
+      expect(fx.cliErrors).toEqual([])
+      // T-late really was on offer by the time the pass drained…
+      const ready = await fx.tickets.listReady({ labels: ['autobuild'], state: 'Ready' })
+      expect(ready.map((t) => t.ref.id).sort()).toEqual(['T-first', 'T-late'])
+
+      // …and the pass still built only the ticket its ONE tick selected.
+      const builds = await fx.store.listBuilds()
+      expect(builds.map((b) => b.ticket?.id)).toEqual(['T-first'])
     } finally {
       await fx.cleanup()
     }
