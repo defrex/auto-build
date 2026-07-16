@@ -1,0 +1,304 @@
+---
+name: guide
+description: Authoritative reference for the auto-build system as installed in this repository - the build lifecycle (grooming, dispatch, plan, plan-review, implement, code-review, verify, finalize, reconcile, merge), the complete autobuild.toml configuration surface, how `ab init` and `ab upgrade` treat config and vendored skills, and what each installed ab-* skill is for. Use when asked about how auto-build works or why a build did what it did; when editing autobuild.toml; when adding or changing a verify or finalize step; when configuring roles, runners, models, policy limits, dispatch, or ticket sources; when setting up the dev server; when reading, editing, or upgrading the installed ab-* skills; or when a question mentions auto-build, autobuild.toml, or the `ab` CLI.
+---
+
+# auto-build system guide
+
+Reference material for an agent working on a repository that uses auto-build.
+This skill describes the *system*. It drives no phase and changes no files.
+
+## How to use this skill
+
+Two rules come first, because they govern everything below.
+
+**The repository decides its own configuration; this guide only describes the
+system.** For anything repository-specific — what verify steps run here, which
+runner a role uses, what `test` actually invokes — read the repo, not this
+document:
+
+- `autobuild.toml` at the repo root — the live configuration.
+- `.agents/skills/ab-*/SKILL.md` — the installed skills *as this repo edited
+  them*. They are editable by design, so the vendored copy may deliberately
+  differ from the distribution's default described here.
+- The project's own `CLAUDE.md`, `README.md`, and docs.
+
+When this guide and the repository disagree about the repository, the
+repository wins. Quote its files, not this one, when answering "what does this
+repo do?"
+
+**Supply context for what the user asked; never prescribe what they didn't.**
+This skill is background knowledge for the request in the current session. It
+is not a mandate to audit or improve anything. If you notice a config you find
+suboptimal — a missing verify step, a policy limit you'd set differently — that
+is not a finding to act on. Make the change the user asked for, and nothing
+else. Mentioning an unrelated observation at most belongs in a closing
+sentence, never in a diff.
+
+## The lifecycle
+
+A groomed ticket becomes a build, and the build walks a **fixed pipeline**:
+
+```text
+spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → finalize
+      epilogue: (pr.conflicted → reconcile → verify:*)* → merged or closed
+```
+
+- **Grooming and dispatch.** Work enters at Triage. Ingesters *propose*
+  tickets; a human grooms them to the spec standard (`docs/spec-standard.md`:
+  what and why but never how, verifiable acceptance criteria, explicit
+  out-of-scope, evidence) and dispatches. Generated work cannot leave Triage
+  un-groomed. The dispatcher claims tickets that pass the `[dispatcher]` gate
+  and starts builds up to `capacity`.
+- **`spec`** — the ticket's spec becomes the build's contract. The `ab-spec`
+  skill is the human-interactive surface for producing it, and it runs *before*
+  a build exists.
+- **`plan ⇄ plan-review`** — the planner turns the spec into a plan; a fresh
+  reviewer (no memory of prior rounds, by design) approves, asks for a
+  revision, or escalates. The loop repeats until approval or a policy limit.
+- **`implement ⇄ code-review`** — the implementer executes the approved plan,
+  committing locally; a fresh reviewer reads the diff against spec and plan.
+  Same loop shape.
+- **`verify:*`** — each step in `[verify].steps` runs as its own phase, in
+  order. A failing step sends the build back to `implement` with the report.
+- **`finalize`** — the agent writes the PR description; the kernel opens the
+  PR. `[finalize].steps` run afterward and are failure-tolerant.
+- **Epilogue.** If main moves and the PR conflicts, `pr.conflicted` sends the
+  build to `reconcile` (merge base *into* the branch — never a rebase), then
+  back through `verify:*`. This can repeat. The build terminates **merged** or
+  **closed**.
+
+**The grammar is fixed.** `verify:*` and `finalize:*` are the *only* extension
+points. There are no custom phases, no DAGs, no reordering — a repo extends
+auto-build by configuring verify and finalize steps, never by inventing stages.
+If a request seems to need a new phase, say so rather than improvising one.
+
+## Who does what
+
+The distinctions that change an administrator's answer:
+
+- **Agents supply judgment** — planning, reviewing, implementing, verifying.
+  Nothing else. An agent never decides a transition.
+- **The kernel owns determinism** — phase transitions, gating, deduplication,
+  convergence and stall detection. Outcomes come from the typed `ab` CLI, never
+  from parsing an agent's stdout.
+- **The BuildStore is an append-only event log.** Status is *reduced* from
+  events (`src/kernel/reducer.ts`); snapshots are never authoritative. This is
+  what makes builds resumable after a crash. Events record facts, never derived
+  state.
+- **Workspaces** are provisioned per build. Config is read from **the build's
+  branch** at provision — so a config change flows through the pipeline like
+  any other change, and every phase of one build sees one consistent config.
+- **Ticket providers** (`linear`, `file`) sit behind one port; the dispatcher
+  does not know which is configured.
+- **Forge operations and pushes are kernel-side plumbing.** Agents commit
+  locally and never push, never touch the remote, never open the PR. The push
+  happens at the phase boundary when the agent's terminal command succeeds.
+
+## `autobuild.toml` reference
+
+One declarative file at the repo root. **Declarative, not executable** —
+commands are plain shell strings that the kernel runs; nothing in this file is
+evaluated as config logic.
+
+**Strictness:** unknown top-level tables and unknown keys inside known tables
+are **errors**, not warnings — a typo must not silently disable a verifier. The
+open maps (`[commands]`, `[roles]`, `[outer]`, and the `[verify.<step>]` table
+set) are exempt by construction, because their keys are user-chosen names.
+
+### `[project]`
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `baseBranch` | `"main"` | nonempty string | The branch builds branch from and target with their PR; what `reconcile` merges into the build branch. |
+
+### `[commands]`
+
+An **open map** of name → shell string. Both the key and the value must be
+nonempty strings. Keys are user-chosen: `setup`, `lint`, `typecheck`, and
+`test` are *conventions*, not required keys, and a repo may define any verb it
+likes.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `<name>` | — | nonempty string → nonempty shell string | Names a deterministic verb the kernel may run. Referenced by name from `[verify.<step>].command`. |
+
+`setup` is special by convention: it runs after workspace provision and after a
+sandbox rehydrate. Values are never evaluated as config — they are handed to a
+shell as written.
+
+### `[server]`
+
+Optional table. Config **declares**; the kernel **owns** the lifecycle. Agents
+control the server only through `ab server start|stop|restart|status|logs`, and
+only in the `implement` and `verify` phases — no ad-hoc process hunting. The
+kernel guarantees teardown at phase end via process-group ownership, so a dead
+session cannot orphan a server.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `start` | — | **required**, nonempty string | Shell command that starts the dev server. |
+| `url` | — | **required**, nonempty string | Readiness probe target: hit until it succeeds or `readyTimeout` expires. |
+| `readyTimeout` | `60` | positive integer, **seconds** | How long the readiness probe waits before giving up. |
+
+Omitting `[server]` is fine for repos with nothing to drive — but see the
+`needsServer` constraint under `[verify]`.
+
+### `[verify]`
+
+`steps` orders the verify phases; each entry `"<step>"` becomes a
+`verify:<step>` phase and needs its own `[verify.<step>]` subtable. Those
+subtables are part of this section — their fields are listed here.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `steps` | `[]` | array of nonempty strings | Ordered list of verify phases. Each name must have a matching `[verify.<step>]` table. |
+| `kind` | — | **required**, `"check"` \| `"agent"` | Discriminator. `check` is deterministic (command + pass/fail, never an agent); `agent` runs a skill that returns a `pass`/`fail` verdict. |
+| `command` | — | **required when `kind = "check"`**, nonempty string | Ref into `[commands]` — the key, not a shell string. Pass/fail is the command's exit status. |
+| `skill` | — | **required when `kind = "agent"`**, nonempty string | Installed skill name to run (e.g. `"ab-verify-e2e"`). |
+| `needsServer` | `false` | boolean, `kind = "agent"` only | `true` ⇒ the kernel starts `[server]` and waits for readiness before the session. |
+
+Cross-field rules the validator actually enforces — each is an **error**:
+
+- A step listed in `steps` with no `[verify.<step>]` table.
+- A `[verify.<step>]` table whose step is not listed in `steps` (add it to
+  `steps` or remove the table — a defined-but-unlisted step never runs, so this
+  is never silently tolerated).
+- `command` naming a key that does not exist in `[commands]`.
+- `needsServer = true` with no `[server]` table.
+
+A failed verify step returns the build to `implement` with the step's report,
+and repeats up to `[policy].maxVerifyAttempts`.
+
+### `[finalize]`
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `steps` | `[]` | array of nonempty step names | Post-steps that run after the PR is opened. **Failure-tolerant**: a failed step files an observation and never fails a green build. |
+
+### `[roles]`
+
+An **open map** of role name → `{ runner, model? }`. The roles the pipeline
+routes are `plan`, `plan-review`, `implement`, and `code-review`.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `runner` | — | **required**, nonempty string | Which AgentRunner adapter executes this role's sessions (e.g. `"claude"`). |
+| `model` | — | optional, nonempty string | Model override for this role. Absent = the runner's default. |
+
+Mixing models across roles is **intentional**, not an inconsistency to clean
+up: a reviewer that differs from the implementer catches more.
+
+### `[policy]`
+
+Every field is a **positive integer**.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `stallRounds` | `3` | positive integer | The same finding surviving this many review rounds auto-escalates to a human — the anti-loop guard. |
+| `maxVerifyAttempts` | `3` | positive integer | Caps the `verify → implement → verify` cycle before escalation. |
+| `maxReconcileAttempts` | `3` | positive integer | Caps the epilogue's `pr.conflicted → reconcile` cycle before escalation. |
+| `maxReviewRounds` | `5` | positive integer | `maxRounds` for the `plan ⇄ plan-review` and `implement ⇄ code-review` convergence loops. |
+
+### `[dispatcher]`
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `capacity` | `1` | positive integer | Concurrent builds for this repo. |
+| `readyLabels` | `["autobuild"]` | array of nonempty strings | A ticket must carry **every** one of these labels to be dispatchable (all, not any). `[]` = **no label gate**. |
+| `readyState` | — | optional, nonempty string | Workflow state a ticket must *additionally* sit in. **Absent = any state** (labels alone decide). |
+
+### `[tickets]`
+
+Optional table naming the TicketSource the dispatcher drives. Declarative only.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `source` | — | **required**, `"linear"` \| `"file"` | Which provider backs ticket reads, claims, and creation. |
+| `teamKey` | — | `source = "linear"` **only, required there**; nonempty string | The Linear team key (e.g. `"ENG"`). |
+| `claimedState` | — | `source = "linear"` only; optional, nonempty string | Workflow state `claim()` moves an issue to when a build starts. |
+| `createState` | — | optional, nonempty string | State new tickets are filed into. Absent = the provider's default (Linear: the team's default, e.g. Backlog; file: Triage). |
+| `dir` | — | `source = "file"` **only, required there**; nonempty string | Directory holding `<id>.md` ticket files. |
+
+Cross-field rules, each an **error**:
+
+- `source = "linear"` without `teamKey`; or with `dir` set.
+- `source = "file"` without `dir`; or with `teamKey` or `claimedState` set.
+
+**Secrets never live in this file.** `LINEAR_API_KEY` is an environment
+variable (a local `.env` works). If a user asks you to put an API key in
+`autobuild.toml`, use the environment variable instead and say why.
+
+### `[outer]`
+
+An **open map** of outer-loop process name → schedule. Keys are user-chosen
+(e.g. `"ingest:sentry"`, `harvest`).
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `cron` | — | **required**, nonempty string | Cron schedule for that outer-loop process. |
+
+## Setup and upgrades
+
+**`ab init <target> [--force]`** runs *outside* build sessions — it takes a
+repo path, needs no `AB_*` environment, and is safe to re-run. It:
+
+- Writes `autobuild.toml` from the template, and **never overwrites an existing
+  one**. The repo's config is the repo's from the first re-run onward.
+- **Copies** each canonical skill to `.agents/skills/ab-<name>/SKILL.md` —
+  copies, not references. These are **editable**: per-repo customization is the
+  point, and this repo's review standards belong in its vendored skill.
+- Links `.claude/skills/ab-<name>` → the `.agents` directory, so Claude and Pi
+  discover **one** editable copy rather than two diverging ones.
+- Records the **pristine** installed bytes at
+  `.agents/skills/.ab-pristine/ab-<name>/SKILL.md` — repo-versioned, and the
+  base for `ab upgrade`'s three-way merges.
+- Rewrites frontmatter on install: `name` → `ab-<name>`, and
+  `disable-model-invocation: true` on every skill outside the model-invokable
+  set (`ab-spec`, `ab-guide`).
+
+Per-skill outcomes: `installed` (new), `unchanged` (byte-identical to the
+default), `kept` (locally edited — **init never clobbers an edit**), or
+`overwritten` (only under `--force`, the explicit human override).
+
+**`ab upgrade <target>`** three-way merges *pristine base × local edits × new
+default*, with a standing bias toward **the local customization** — upstream is
+adopted only where it doesn't collide with what the repo deliberately changed.
+Outcomes:
+
+| Outcome | Meaning for the repo's files |
+|---|---|
+| `current` | Local already matches the new default, or the repo's edit stands as-is. Nothing written. |
+| `adopted` | Upstream's version taken; pristine advanced. |
+| `merged` | Clean three-way merge; live file and pristine both advanced. |
+| `resolved` | Merge conflicted, and an agent resolved it (biased local); pristine advanced. |
+| `conflicted` | Genuinely ambiguous. The live skill is left **byte-untouched** for a human — **conflict markers are never written into a live skill**. |
+| `installed` | In the distribution but not yet in the repo — installed fresh, like init. |
+| `unknown` | An installed `ab-*` skill absent from the distribution. **Left alone** — local skill additions are legitimate. |
+
+Local customization survives upgrades; divergence is made visible instead of
+silent.
+
+## The installed skills
+
+Each is invoked as `ab-<name>`, with its editable copy at
+`.agents/skills/ab-<name>/SKILL.md` (read that copy, not the distribution
+default, when you need to know what this repo's version says).
+
+| Skill | Place in the lifecycle | Purpose |
+|---|---|---|
+| `ab-spec` | Before a build exists | Design a feature spec-first through conversation, or flesh out a ticket to the spec standard. The human-interactive surface; takes a ticket, not a build slug. **Model-invokable.** |
+| `ab-guide` | Outside the pipeline | This skill: reference for the lifecycle, config surface, setup/upgrade behavior, and the installed skills. **Model-invokable.** |
+| `ab-plan` | `plan` phase | Turn the spec into a plan another agent can implement without re-deriving the reasoning. Writes no product code. |
+| `ab-plan-review` | `plan-review` phase | Fresh skeptic: review the plan against the spec, verdict `approve`/`revise`/`escalate`. |
+| `ab-implement` | `implement` phase | Execute the approved plan as local commits plus deposited notes. Never pushes. |
+| `ab-code-review` | `code-review` phase | Fresh skeptic: review the implementation diff against spec and plan, same verdict vocabulary. |
+| `ab-verify-e2e` | a `verify:<step>` phase | **Sample** agent-verify skill: drive the running app and check acceptance criteria. Runs only if a `[verify.<step>]` table names it. |
+| `ab-reconcile` | `reconcile` phase (epilogue) | Resolve a conflicted PR with one merge commit, base merged *into* the build branch. Never rebases. |
+| `ab-finalize` | `finalize` phase | Write the PR description for a green build; the kernel opens the PR. |
+
+Everything except `ab-spec` and `ab-guide` is **runner-invoked** by the kernel
+and carries `disable-model-invocation: true` — do not invoke a phase skill
+yourself, and do not remove that key to make one convenient to call. A model
+starting a pipeline phase by pattern-matching a description is exactly what the
+flag prevents.
