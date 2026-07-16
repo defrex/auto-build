@@ -127,16 +127,31 @@ function leaseInfo(record: BuildRecord, now: Date): LeaseInfo {
  * once and builds both projections from it, rather than reducing twice.
  */
 function summarizeFrom(record: BuildRecord, state: BuildState, now: Date): BuildSummary {
-  const round = state.currentPhase?.round ?? state.round
-  const attempt = state.currentPhase?.attempt
+  // `phase`, `round`, and `attempt` describe ONE phase occurrence, so they come
+  // from ONE source: the in-flight phase, else the last completed one — the
+  // same `currentPhase ?? lastCompletedPhase` the reducer uses to derive
+  // `state.phase`. Reading `phase` from that pair while reading round/attempt
+  // from `currentPhase` alone made the three disagree the moment a phase
+  // completed: `verify.completed` clears `currentPhase`, so between two verify
+  // steps a build on attempt 3 reported `verify:unit r1` — the attempt gone and
+  // the loop round stamped onto a phase that carries none. That reads as "first
+  // pass through verify" while verify is actually thrashing on its third.
+  //
+  // PhaseContext is authoritative about which axis a phase HAS (§15.3): loop
+  // phases carry `round`, verify and reconcile carry `attempt`, finalize
+  // carries neither. Taking both straight from it is what makes "current round
+  // or attempt WHEN APPLICABLE" fall out, instead of being re-decided here.
+  const active = state.currentPhase ?? state.lastCompletedPhase
+  const round = active?.round
+  const attempt = active?.attempt
   return {
     slug: record.slug,
     // record.ticket is a TicketRef already carrying id/title/url — no artifact
     // read and no ticket-provider call (live ticket state is out of scope).
     ...(record.ticket !== undefined ? { ticket: record.ticket } : {}),
     status: state.status,
-    ...(state.phase !== undefined ? { phase: state.phase } : {}),
-    ...(round > 0 ? { round } : {}),
+    ...(active?.phase !== undefined ? { phase: active.phase } : {}),
+    ...(round !== undefined ? { round } : {}),
     ...(attempt !== undefined ? { attempt } : {}),
     ...(state.pr !== undefined
       ? {

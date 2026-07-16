@@ -164,6 +164,76 @@ describe('summarize', () => {
     const verify = summarize(r, await store.getEvents('b1'), NOW)
     expect(verify.phase).toBe('verify:e2e')
     expect(verify.attempt).toBe(3)
+    // A verify phase carries an attempt, not a loop round (§15.3) — stamping
+    // the round on it would claim an axis this phase does not have.
+    expect(verify.round).toBeUndefined()
+  })
+
+  /**
+   * The regression this suite previously missed: every case above has a phase
+   * started-but-not-completed, so `currentPhase` is always set. `*.completed`
+   * CLEARS it (reducer's `complete()`), and a build sits in that gap between
+   * every pair of verify steps — a normal, common state, not an edge case.
+   */
+  test('the verify attempt survives the gap between two steps', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await seedBuild(store, { slug: 'b1' })
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'implement.started',
+      payload: { round: 1 },
+    })
+    // Verify has already failed twice; this is attempt 3.
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'verify.started',
+      payload: { step: 'unit', attempt: 3 },
+    })
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'verify.completed',
+      payload: { step: 'unit', attempt: 3, pass: true },
+    })
+    const r = (await store.getBuild('b1'))!
+    const summary = summarize(r, await store.getEvents('b1'), NOW)
+
+    expect(summary.phase).toBe('verify:unit')
+    expect(summary.attempt).toBe(3)
+    // The loop round must NOT be stamped on in the attempt's place: `r1` reads
+    // as "first pass through verify" while verify is thrashing on its third —
+    // wrong in the reassuring direction, and it hides the thrash signal.
+    expect(summary.round).toBeUndefined()
+    expect(renderSummaries([summary], NOW, 'none').join('\n')).toContain('verify:unit a3')
+  })
+
+  test('a completed loop phase keeps reporting its own round', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await seedBuild(store, { slug: 'b1' })
+    await store.append('b1', { actor: KERNEL, type: 'plan.started', payload: { round: 2 } })
+    // plan.completed is the agent's deposit, not the kernel's.
+    await store.append('b1', {
+      actor: agentActor('plan', 's_1'),
+      type: 'plan.completed',
+      payload: { round: 2, artifact: { kind: 'plan', rev: 0 } },
+    })
+    const summary = summarize((await store.getBuild('b1'))!, await store.getEvents('b1'), NOW)
+    expect(summary.phase).toBe('plan')
+    expect(summary.round).toBe(2)
+    expect(summary.attempt).toBeUndefined()
+  })
+
+  // The reducer documents finalize as carrying neither round nor attempt.
+  test('finalize reports neither a round nor an attempt', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await seedBuild(store, { slug: 'b1' })
+    await store.append('b1', { actor: KERNEL, type: 'implement.started', payload: { round: 4 } })
+    await store.append('b1', { actor: KERNEL, type: 'finalize.started', payload: {} })
+    const started = summarize((await store.getBuild('b1'))!, await store.getEvents('b1'), NOW)
+    expect(started.phase).toBe('finalize')
+    expect(started.round).toBeUndefined()
+    expect(started.attempt).toBeUndefined()
+    expect(renderSummaries([started], NOW, 'none').join('\n')).toContain('finalize')
+    expect(renderSummaries([started], NOW, 'none').join('\n')).not.toContain('finalize r4')
   })
 
   test('ticket fields present when the record carries them, absent when not', async () => {
