@@ -8,9 +8,59 @@
  * called mid-build; comments and transitions flow outward, and the build
  * never reads Linear again after dispatch imports the spec.
  */
-import type { Ticket, TicketDraft, TicketSource } from '../types'
+import type {
+  DependencyState,
+  Ticket,
+  TicketDraft,
+  TicketSource,
+} from '../types'
 
 export const LINEAR_API_URL = 'https://api.linear.app/graphql'
+
+/** One entry of a GraphQL `errors` array — the fields this adapter reads. */
+interface GqlError {
+  message: string
+  path?: string[]
+  extensions?: { code?: string; type?: string }
+}
+
+/**
+ * A GraphQL-level failure, carrying the structured errors rather than only a
+ * joined message: callers must be able to tell "no such issue" from "rate
+ * limited", and a substring match on prose cannot be trusted with that.
+ */
+export class LinearGqlError extends Error {
+  constructor(
+    message: string,
+    readonly errors: GqlError[],
+  ) {
+    super(message)
+    this.name = 'LinearGqlError'
+  }
+}
+
+/**
+ * Linear reports an unknown issue identifier as a GraphQL ERROR
+ * (`Entity not found: Issue`, extensions.code `INPUT_ERROR`) — NOT as
+ * `{issue: null}`, which is what the shape of the query suggests. Verified
+ * against the live API; a canned fixture would happily agree with either
+ * guess, so this predicate exists because the real thing was asked.
+ *
+ * Every error in the set must be a not-found for this to be "missing": a
+ * response mixing not-found with a rate-limit error is a real failure and
+ * must not be quietly read as an absent ticket.
+ */
+function isEntityNotFound(error: unknown): boolean {
+  return (
+    error instanceof LinearGqlError &&
+    error.errors.length > 0 &&
+    error.errors.every(
+      (e) =>
+        e.extensions?.code === 'INPUT_ERROR' &&
+        /entity not found/i.test(e.message),
+    )
+  )
+}
 
 /** The narrow slice of fetch this adapter needs — injectable for tests. */
 export type LinearFetch = (
@@ -21,12 +71,40 @@ export type LinearFetch = (
 // ── Wire shapes (small structural types per operation) ───────────────────────
 
 interface GqlIssue {
+  id?: string
   identifier: string
   title: string
   description: string | null
   url: string
-  state: { name: string } | null
+  state: { name: string; type: string } | null
   labels: { nodes: Array<{ name: string }> }
+  /** Relations where THIS issue is the `relatedIssue` side. A relation
+   * `{issue: A, relatedIssue: B, type: "blocks"}` reads "A blocks B", so an
+   * issue's blockers are its inverse `blocks` relations, and the blocker is
+   * each relation's `issue`. */
+  inverseRelations?: {
+    nodes: Array<{ type: string; issue: { identifier: string } | null }>
+  }
+}
+
+/**
+ * Linear's workflow state types (the `state.type` taxonomy):
+ * `backlog | unstarted | started | completed | canceled`. Resolution is
+ * provider-owned (§13) — a blocker is done when Linear says the work is
+ * finished, either by completion or by cancelation. Any unrecognized type
+ * fails CLOSED (unresolved): a dependency we cannot interpret must hold the
+ * ticket and show up in the dispatcher's diagnostics, never wave it through.
+ */
+const RESOLVED_STATE_TYPES = new Set(['completed', 'canceled'])
+
+/** The identifiers blocking `issue`: inverse relations of type `blocks`,
+ * taking each relation's `issue` side. Relations of any other type
+ * (`related`, `duplicate`, …) are not dependencies and are ignored. */
+function blockersOf(issue: GqlIssue): string[] {
+  const blockers = (issue.inverseRelations?.nodes ?? [])
+    .filter((relation) => relation.type === 'blocks' && relation.issue !== null)
+    .map((relation) => relation.issue!.identifier)
+  return [...new Set(blockers)]
 }
 
 interface GqlTeamInfo {
@@ -40,7 +118,8 @@ interface GqlTeamInfo {
 }
 
 const ISSUE_FIELDS =
-  'identifier title description url state { name } labels { nodes { name } }'
+  'identifier title description url state { name type } labels { nodes { name } } ' +
+  'inverseRelations { nodes { type issue { identifier } } }'
 
 const LIST_READY_QUERY = `query ListReady($filter: IssueFilter!) { issues(filter: $filter) { nodes { ${ISSUE_FIELDS} } } }`
 const GET_ISSUE_QUERY = `query GetIssue($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`
@@ -49,7 +128,8 @@ const ISSUE_STATE_QUERY = `query IssueState($id: String!) { issue(id: $id) { id 
 const TEAM_INFO_QUERY = `query TeamInfo($teamKey: String!) { teams(filter: { key: { eq: $teamKey } }) { nodes { id states { nodes { id name } } labels { nodes { id name } } } } }`
 const UPDATE_STATE_MUTATION = `mutation UpdateState($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }`
 const CREATE_COMMENT_MUTATION = `mutation CreateComment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }`
-const CREATE_ISSUE_MUTATION = `mutation CreateIssue($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { ${ISSUE_FIELDS} } } }`
+const CREATE_ISSUE_MUTATION = `mutation CreateIssue($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id ${ISSUE_FIELDS} } } }`
+const CREATE_RELATION_MUTATION = `mutation CreateRelation($issueId: String!, $relatedIssueId: String!) { issueRelationCreate(input: { issueId: $issueId, relatedIssueId: $relatedIssueId, type: "blocks" }) { success } }`
 
 export class LinearTicketSource implements TicketSource {
   readonly name = 'linear'
@@ -188,7 +268,80 @@ export class LinearTicketSource implements TicketSource {
     if (!data.issueCreate.success || !data.issueCreate.issue) {
       throw new Error(`linear create: issueCreate failed for "${draft.title}"`)
     }
-    return this.toTicket(data.issueCreate.issue)
+    const issue = data.issueCreate.issue
+    const blockedBy = [...new Set(draft.blockedBy ?? [])]
+    if (blockedBy.length > 0) {
+      const createdId = issue.id
+      if (createdId === undefined) {
+        throw new Error(
+          'linear create: issueCreate returned no id — cannot record blockers',
+        )
+      }
+      this.issueIds.set(issue.identifier, createdId)
+      for (const blockerId of blockedBy) {
+        // Direction matters and is the inverse of how it reads aloud: the
+        // BLOCKER is `issueId` and the new issue is `relatedIssueId`, because
+        // Linear's `blocks` relation reads "issueId blocks relatedIssueId".
+        // Transposing these silently records the exact opposite relationship.
+        const blockerUuid = await this.resolveIssueId('create', blockerId)
+        const relation = await this.gql<{
+          issueRelationCreate: { success: boolean }
+        }>('create', CREATE_RELATION_MUTATION, {
+          issueId: blockerUuid,
+          relatedIssueId: createdId,
+        })
+        if (!relation.issueRelationCreate.success) {
+          throw new Error(
+            `linear create: issueRelationCreate failed — "${blockerId}" was ` +
+              `not recorded as blocking "${issue.identifier}"`,
+          )
+        }
+      }
+      // The create response predates the relations; report what we recorded.
+      return { ...this.toTicket(issue), blockedBy }
+    }
+    return this.toTicket(issue)
+  }
+
+  /**
+   * Dependency nodes (§13). One query per id — Linear's `IssueFilter` has no
+   * identifier-`in` filter, and the id sets here are small (the ready set's
+   * blockers). Deliberately uncached: a blocker completing between ticks must
+   * be visible on the very next pass, so only the identifier→UUID map (which
+   * never changes) is cached.
+   */
+  async dependencyStates(ids: string[]): Promise<DependencyState[]> {
+    const states: DependencyState[] = []
+    for (const id of ids) {
+      let data: { issue: GqlIssue | null }
+      try {
+        data = await this.gql<{ issue: GqlIssue | null }>(
+          'dependencyStates',
+          GET_ISSUE_QUERY,
+          { id },
+        )
+      } catch (error) {
+        // An unknown identifier is a MISSING dependency, not a failed check:
+        // the dispatcher must be able to say "AUT-99 does not exist" rather
+        // than bailing out of the ticket's whole dependency evaluation.
+        if (isEntityNotFound(error)) {
+          states.push({ id, exists: false, resolved: false, blockedBy: [] })
+          continue
+        }
+        throw error
+      }
+      if (!data.issue) {
+        states.push({ id, exists: false, resolved: false, blockedBy: [] })
+        continue
+      }
+      states.push({
+        id,
+        exists: true,
+        resolved: RESOLVED_STATE_TYPES.has(data.issue.state?.type ?? ''),
+        blockedBy: blockersOf(data.issue),
+      })
+    }
+    return states
   }
 
   // ── Plumbing ───────────────────────────────────────────────────────────────
@@ -211,11 +364,14 @@ export class LinearTicketSource implements TicketSource {
     }
     const payload = (await response.json()) as {
       data?: T | null
-      errors?: Array<{ message: string }>
+      errors?: GqlError[]
     }
     if (payload.errors && payload.errors.length > 0) {
       const messages = payload.errors.map((e) => e.message).join('; ')
-      throw new Error(`linear ${operation}: GraphQL errors — ${messages}`)
+      throw new LinearGqlError(
+        `linear ${operation}: GraphQL errors — ${messages}`,
+        payload.errors,
+      )
     }
     if (payload.data === undefined || payload.data === null) {
       throw new Error(`linear ${operation}: response has no data`)
@@ -226,11 +382,22 @@ export class LinearTicketSource implements TicketSource {
   private async resolveIssueId(operation: string, id: string): Promise<string> {
     const cached = this.issueIds.get(id)
     if (cached) return cached
-    const data = await this.gql<{ issue: { id: string } | null }>(
-      operation,
-      RESOLVE_ISSUE_QUERY,
-      { id },
-    )
+    let data: { issue: { id: string } | null }
+    try {
+      data = await this.gql<{ issue: { id: string } | null }>(
+        operation,
+        RESOLVE_ISSUE_QUERY,
+        { id },
+      )
+    } catch (error) {
+      // Live Linear raises a GraphQL error for an unknown identifier rather
+      // than returning null — surface this adapter's own actionable message
+      // either way, instead of leaking `Entity not found: Issue`.
+      if (isEntityNotFound(error)) {
+        throw new Error(`linear ${operation}: unknown ticket "${id}"`)
+      }
+      throw error
+    }
     if (!data.issue) {
       throw new Error(`linear ${operation}: unknown ticket "${id}"`)
     }
@@ -284,6 +451,7 @@ export class LinearTicketSource implements TicketSource {
   }
 
   private toTicket(issue: GqlIssue): Ticket {
+    const blockedBy = blockersOf(issue)
     return {
       ref: {
         source: this.name,
@@ -295,6 +463,7 @@ export class LinearTicketSource implements TicketSource {
       body: issue.description ?? '',
       state: issue.state?.name,
       labels: issue.labels.nodes.map((label) => label.name),
+      ...(blockedBy.length > 0 ? { blockedBy } : {}),
     }
   }
 }

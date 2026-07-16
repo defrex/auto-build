@@ -61,7 +61,7 @@ maxReconcileAttempts = 3
 maxReviewRounds = 5
 
 [dispatcher]
-capacity = 1             # concurrent builds for this repo
+capacity = 3             # concurrent builds for this repo
 readyLabels = [] # labels that mark a ticket dispatchable ([] = no label gate)
 #readyState = "Ready"    # additionally require this workflow state (absent = any)
 

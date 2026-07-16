@@ -18,12 +18,34 @@ export interface Ticket {
   body: string
   state?: string
   labels: string[]
+  /** Source-local ids of tickets declared as blockers. Absent ≡ none. */
+  blockedBy?: string[]
 }
 
 export interface TicketDraft {
   title: string
   body: string
   labels?: string[]
+  /** Source-local blocker ids, recorded natively at creation (§13). An
+   * adapter must record every one or throw — never discard silently. */
+  blockedBy?: string[]
+}
+
+/** One node of the dependency graph, as this source sees it. */
+export interface DependencyState {
+  /** The requested source-local id, echoed back. */
+  id: string
+  /** False = no such ticket in this source. */
+  exists: boolean
+  /**
+   * Complete per this source's NATIVE lifecycle semantics — the adapter owns
+   * this meaning and callers must not re-derive it from `state` (§13: the
+   * provider's taxonomy never leaks above the port). Linear: `state.type` in
+   * `completed | canceled`. File: state equals the source's done state.
+   */
+  resolved: boolean
+  /** This node's own declared blockers, so callers can close the graph. */
+  blockedBy: string[]
 }
 
 export interface TicketSource {
@@ -36,6 +58,13 @@ export interface TicketSource {
   comment(id: string, body: string): Promise<void>
   transition(id: string, state: string): Promise<void>
   create(draft: TicketDraft): Promise<Ticket>
+  /**
+   * Dependency-graph nodes for `ids`. The result covers EVERY requested id, in
+   * request order; a missing id comes back `{exists: false, resolved: false,
+   * blockedBy: []}`. Read at ticket creation and at dispatch time only — both
+   * are initiation, so §13's "never consulted mid-build" is untouched.
+   */
+  dependencyStates(ids: string[]): Promise<DependencyState[]>
 }
 
 // ── Workspace (SPEC §3.2, §7) ────────────────────────────────────────────────

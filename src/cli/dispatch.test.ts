@@ -1,8 +1,8 @@
 /**
  * `ab dispatch` (src/cli/dispatch.ts): the operator entry into the outer loop.
  *
- * The orchestration-unique surface is tested here — config loading, the
- * [tickets] guard, and the in-process fire-and-forget `launchRunner` that a
+ * The orchestration-unique surface is tested here — config loading, ticket
+ * source selection, and the in-process fire-and-forget `launchRunner` that a
  * `--once` pass must drain before exiting. The Dispatcher + BuildRunner +
  * real-CLI pipeline itself is proven exhaustively by the integration harness
  * (src/integration/*.test.ts); this drives abDispatch over that same machinery
@@ -18,6 +18,7 @@ import { resolveCliEnv } from './env'
 import { runCli } from './main'
 import { abDispatch, type DispatchWiring } from './dispatch'
 import type { TerminalOut } from './terminal'
+import type { Config } from '../config/schema'
 import { sequentialIds } from '../ids'
 import { FakeForge } from '../ports/forge/fake'
 import {
@@ -39,8 +40,10 @@ import {
   type SkillHandlers,
 } from '../integration/harness'
 
-// A [tickets] table so abDispatch's guard passes; the injected wire ignores it
-// (it supplies a FakeTicketSource), so a file source with a dummy dir is fine.
+// The injected wire supplies a FakeTicketSource and ignores this table, so its
+// contents don't matter — it is here only to pin that an explicit [tickets]
+// table still parses and flows through. Omitting it would be equally valid now
+// (absent = the local file tracker); the zero-config path is covered below.
 const DISPATCH_CONFIG_TOML = `
 [project]
 baseBranch = "main"
@@ -92,7 +95,7 @@ interface Fixture {
 /** A wire that supplies fakes over a REAL git worktree provider and a scripted
  * agent driving the real `ab` CLI (the harness happy-path handlers). */
 async function makeFixture(
-  ticket: Ticket,
+  ticket: Ticket | Ticket[],
   handlers: SkillHandlers,
   toml = DISPATCH_CONFIG_TOML,
 ): Promise<Fixture> {
@@ -103,7 +106,7 @@ async function makeFixture(
   const ids = sequentialIds()
   const store = new MemoryBuildStore({ clock: systemClock })
   const forge = new FakeForge()
-  const tickets = new FakeTicketSource([ticket])
+  const tickets = new FakeTicketSource(Array.isArray(ticket) ? ticket : [ticket])
   const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })
   const cliErrors: string[] = []
 
@@ -172,13 +175,15 @@ async function makeFixture(
   }
 }
 
-function readyTicket(id: string): Ticket {
+function readyTicket(id: string, over: Partial<Omit<Ticket, 'ref'>> = {}): Ticket {
+  const title = over.title ?? 'Add rate limiting'
   return {
-    ref: { source: 'fake', id, title: 'Add rate limiting' },
-    title: 'Add rate limiting',
-    body: CONFORMING_BODY,
-    state: 'Ready',
-    labels: ['autobuild'],
+    ref: { source: 'fake', id, title },
+    title,
+    body: over.body ?? CONFORMING_BODY,
+    state: over.state ?? 'Ready',
+    labels: over.labels ?? ['autobuild'],
+    ...(over.blockedBy !== undefined ? { blockedBy: over.blockedBy } : {}),
   }
 }
 
@@ -201,23 +206,57 @@ describe('abDispatch guards', () => {
     }
   })
 
-  test('a config with no [tickets] table is rejected', async () => {
+  test('a config with no [tickets] table is accepted and selects the file source (AC 1)', async () => {
+    // The inverse of the rejection this used to assert: no [tickets] table is
+    // the zero-config default now, not an error.
+    //
+    // It stops at the `wire` seam deliberately. Unlike ticket.test.ts — whose
+    // real factory only writes under tmp — abDispatch's defaultWire would open
+    // a real SQLite store and a real worktree provider under DEFAULT_LOCAL_ROOT
+    // (~/.autobuild), i.e. side effects in the user's actual autobuild home.
+    // The old test never reached defaultWire because the deleted guard threw
+    // first, so letting it through now would be a new hazard, not a fuller test.
+    // What abDispatch itself owns is: don't reject, and hand the resolved
+    // config to the wire. That the config then yields a FileTicketSource under
+    // the repo is proven against the real factory in
+    // ports/tickets/create.test.ts, and end-to-end through a real dispatcher
+    // tick in processes/dispatcher-file-tickets.test.ts.
     const tmp = await mkdtemp(join(tmpdir(), 'ab-dispatch-'))
     try {
       await writeFile(
         join(tmp, 'autobuild.toml'),
         '[project]\nbaseBranch = "main"\n[dispatcher]\ncapacity = 1\n',
       )
-      await expect(
-        abDispatch({
-          targetRepo: tmp,
-          env: {},
-          exec: spawnExec,
-          stdout: () => {},
-          stderr: () => {},
-          once: true,
-        }),
-      ).rejects.toThrow(/no \[tickets\] table/)
+      let wired: Config | undefined
+      const store = new MemoryBuildStore({ clock: systemClock })
+
+      await abDispatch({
+        targetRepo: tmp,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: () => {},
+        once: true,
+        wire: (config) => {
+          wired = config
+          return {
+            store,
+            tickets: new FakeTicketSource([]),
+            forge: new FakeForge(),
+            workspaces: new GitWorktreeProvider({ root: join(tmp, 'worktrees') }),
+            runners: {},
+            defaultRunner: 'claude',
+            storeRef: join(tmp, 'store'),
+            ids: sequentialIds(),
+            clock: systemClock,
+          }
+        },
+      })
+
+      // Reaching the wire at all IS the assertion: the guard used to throw
+      // before this point.
+      expect(wired?.tickets).toEqual({ source: 'file' })
+      await store.close()
     } finally {
       await rm(tmp, { recursive: true, force: true })
     }
@@ -257,6 +296,56 @@ describe('abDispatch --once', () => {
 
       // The operator saw the build park.
       expect(out.some((line) => line.includes(`build ${slug} parked`))).toBe(true)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  /**
+   * The observability criterion: a dependency-blocked ticket and its
+   * unresolved blockers must be discoverable from dispatcher output alone —
+   * no provider API, filesystem, or database inspection.
+   *
+   * Also the regression guard for printReport's shape assumption: it filters
+   * `Object.entries(report)` by `count > 0`, which silently drops a non-numeric
+   * field (an array is never `> 0`, and TypeScript does not complain). Without
+   * this test, the diagnostics could vanish from output while the counter
+   * incremented, and every other test would still pass.
+   */
+  test('prints dependency diagnostics as lines AND still prints numeric counts', async () => {
+    const fx = await makeFixture(
+      [
+        readyTicket('T-blocked', { title: 'Blocked work', blockedBy: ['T-9'] }),
+        readyTicket('T-9', { title: 'The blocker', state: 'In Progress' }),
+        readyTicket('T-free', { title: 'Unrelated work' }),
+      ],
+      happyHandlers(),
+    )
+    const out: string[] = []
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+
+      expect(out).toContain('ticket T-blocked blocked by T-9 (not complete)')
+      const tick = out.find((line) => line.startsWith('tick: '))
+      expect(tick).toContain('dependencyBlocked=1')
+      // The counts line survives the array field rather than throwing or
+      // rendering `dependencyDiagnostics=[object Object]`.
+      expect(tick).not.toContain('dependencyDiagnostics')
+      // The blocked ticket built nothing, while the unrelated eligible ticket
+      // in the same ready list dispatched — the gate is per-ticket, not a
+      // per-tick abort. (T-9 never appears: this config's source is `file`,
+      // whose readyState defaults to `Ready`, so an In-Progress ticket is not
+      // a candidate in the first place — see readyCriteria.)
+      const builds = await fx.store.listBuilds()
+      expect(builds.map((b) => b.ticket?.id)).toEqual(['T-free'])
     } finally {
       await fx.cleanup()
     }
@@ -504,6 +593,85 @@ describe('abDispatch --once with an interactive terminal', () => {
       })
       expect(term.all()).toBe('')
       expect(out.join('\n')).not.toContain('\x1b')
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  /**
+   * The reconcile guard where this branch's dashboard met main's dependency
+   * diagnostics: main added them to `printReport` writing straight to
+   * `opts.stdout`, which on a TTY lands inside the frame the region is about
+   * to repaint over — the "routine runner messages must not corrupt or
+   * interleave with the dashboard" criterion. They must route through `say()`.
+   *
+   * This is a WATCH-mode test on purpose, and neither test above can replace
+   * it. In plain mode `say()` IS `opts.stdout` (no region), so both spellings
+   * pass. In `--once` the only tick's diagnostics are printed BEFORE the
+   * render loop has painted anything, so the region is empty and `log()`
+   * degrades to a bare write — again both spellings pass. Only a tick that
+   * runs while a frame is already on screen distinguishes them, and only watch
+   * mode has one.
+   */
+  test('watch: a diagnostic on a later tick is bracketed by the region, not dropped into the frame', async () => {
+    const fx = await makeFixture(
+      [
+        readyTicket('T-blocked-tty', { title: 'Blocked work', blockedBy: ['T-9'] }),
+        readyTicket('T-9', { title: 'The blocker', state: 'In Progress' }),
+      ],
+      happyHandlers(),
+    )
+    // One interleaved transcript across BOTH sinks: asserting on `out` alone
+    // cannot discriminate, because region.log() forwards to this same stdout
+    // sink. The difference is only the erase/repaint the TERMINAL sees hugging
+    // the write, so the two streams have to be ordered against each other.
+    const transcript: string[] = []
+    const term = fakeTerminal()
+    const termWrite = term.write.bind(term)
+    term.write = (chunk: string) => {
+      termWrite(chunk)
+      transcript.push(`term:${chunk}`)
+    }
+    const controller = new AbortController()
+    // Two ticks: the first paints the header frame, the second emits its
+    // diagnostic into a live region. Real (short) sleeps, so the render loop's
+    // async store reads land between them rather than racing the assertion.
+    let sleeps = 0
+    const sleep = async (): Promise<void> => {
+      sleeps += 1
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      if (sleeps >= 2) controller.abort()
+    }
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => transcript.push(`out:${line}`),
+        stderr: (line) => fx.err.push(line),
+        once: false,
+        intervalMs: 1,
+        sleep,
+        signal: controller.signal,
+        wire: fx.wire,
+        terminal: term,
+      })
+
+      const marker = 'out:ticket T-blocked-tty blocked by T-9 (not complete)'
+      // The LAST diagnostic — the one from a tick with a frame already up.
+      const at = transcript.lastIndexOf(marker)
+      expect(at).toBeGreaterThan(0)
+      // The operator still sees WHY the ticket is sitting still (main's
+      // criterion: discoverable from dispatcher output alone) — AND the region
+      // ERASED the frame immediately before the write, then repainted after.
+      //
+      // The erase must be matched precisely (cursor-up + clear-down), not as
+      // "some escape sequence": the painted frame is itself full of colour
+      // escapes, so a loose /\x1b/ here matches the raw-write bug too — the
+      // failure mode being guarded against is exactly `term:<frame>` followed
+      // by `out:<diagnostic>` scribbled on top of it.
+      expect(transcript[at - 1]).toMatch(/^term:\x1b\[\d+A\x1b\[0J$/)
+      expect(transcript[at + 1]).toMatch(/^term:\x1b\[1mab dispatch/)
     } finally {
       await fx.cleanup()
     }

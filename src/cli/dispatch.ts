@@ -22,9 +22,9 @@
  * next tick advances the post-PR epilogue (§15.7).
  */
 import { hostname } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { loadConfig } from '../config/load'
-import type { Config, TicketsConfig } from '../config/schema'
+import type { Config } from '../config/schema'
 import type { AbEvent } from '../events/catalog'
 import { randomIds, type IdSource } from '../ids'
 import { reduceBuild, type BuildState } from '../kernel/reducer'
@@ -152,16 +152,7 @@ async function defaultWire(config: Config, opts: DispatchOpts): Promise<Dispatch
     ...(token !== undefined && token !== '' ? { token } : {}),
   })
 
-  // A relative [tickets].dir is relative to the repo, not this process's cwd
-  // (mirrors `ab ticket create`).
-  if (config.tickets === undefined) {
-    throw new Error('unreachable: abDispatch checks config.tickets before wiring')
-  }
-  const ticketsConfig: TicketsConfig =
-    config.tickets.dir !== undefined
-      ? { ...config.tickets, dir: resolve(opts.targetRepo, config.tickets.dir) }
-      : config.tickets
-  const tickets = createTicketSource(ticketsConfig, opts.env)
+  const tickets = createTicketSource(config.tickets, opts.env, opts.targetRepo)
 
   return {
     store,
@@ -317,9 +308,24 @@ class DispatchLoop {
     else this.opts.stderr(line)
   }
 
+  /**
+   * Dependency diagnostics print as their own lines above the counts — this
+   * is the operator's only view of why a ready ticket is sitting still, and
+   * the acceptance criterion is that it needs no provider, filesystem, or
+   * database inspection. The counts map guards on `typeof count === 'number'`
+   * because a non-numeric TickReport field would otherwise be dropped here
+   * silently (`count > 0` is false for an array, with no type error).
+   *
+   * The diagnostics route through `say()` rather than `opts.stdout` for the
+   * reason given above: on a TTY a raw write would land inside the frame the
+   * region is about to repaint. `say()` is the identity in plain mode, so
+   * their line-oriented behavior is unchanged.
+   */
   private printReport(report: Awaited<ReturnType<Dispatcher['tick']>>): void {
-    const parts = Object.entries(report)
-      .filter(([, count]) => count > 0)
+    const { dependencyDiagnostics, ...counts } = report
+    for (const line of dependencyDiagnostics) this.say(line)
+    const parts = Object.entries(counts)
+      .filter(([, count]) => typeof count === 'number' && count > 0)
       .map(([name, count]) => `${name}=${count}`)
     if (parts.length > 0) {
       this.say(`tick: ${parts.join(' ')}`)
@@ -453,10 +459,11 @@ class DispatchLoop {
 }
 
 /**
- * Entry point (§8.2). Loads the repo's config, requires a [tickets] table
- * (the dispatcher has nothing to watch without one), wires the ports, and
- * runs the loop until a single pass finishes (`--once`) or `opts.signal`
- * aborts (SIGINT).
+ * Entry point (§8.2). Loads the repo's config — whose [tickets] table selects
+ * the TicketSource, defaulting to the local file tracker at
+ * `.autobuild/tickets` when the table is absent (§13), so a repo with no
+ * config still has a backlog to watch — wires the ports, and runs the loop
+ * until a single pass finishes (`--once`) or `opts.signal` aborts (SIGINT).
  */
 export async function abDispatch(opts: DispatchOpts): Promise<void> {
   const configPath = join(opts.targetRepo, 'autobuild.toml')
@@ -472,14 +479,6 @@ export async function abDispatch(opts: DispatchOpts): Promise<void> {
     }
     throw error
   }
-  if (config.tickets === undefined) {
-    throw new Error(
-      "autobuild.toml has no [tickets] table — 'ab dispatch' watches the " +
-        'configured TicketSource for Ready tickets (§3.3); add [tickets] with ' +
-        'source = "linear" (teamKey = "…") or source = "file" (dir = "…")',
-    )
-  }
-
   const wire = opts.wire ?? defaultWire
   const wiring = await wire(config, opts)
   const loop = new DispatchLoop(config, wiring, opts)
