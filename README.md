@@ -410,7 +410,7 @@ It three-way merges each skill with `git merge-file`:
 | `installed` | New skill in the distribution; installed fresh. |
 | `current` | Upstream did not change; your file stands, edited or not. |
 | `adopted` | No local edits; the new default was taken. |
-| `merged` | Both changed, but not in the same place; merged cleanly. |
+| `merged` | Both changed and the three-way merge resolved cleanly; your edits and the new default are both in the result. |
 | `conflicted` | Both changed the same lines. **Your local file is kept byte-for-byte** — no conflict markers are ever written into it. |
 | `unknown` | An installed `ab-*` skill that is not in the distribution. Left alone; local additions are legitimate. |
 
@@ -418,8 +418,11 @@ It three-way merges each skill with `git merge-file`:
 
 **Resolving a conflict:** merge by hand against the pristine record —
 `.agents/skills/.ab-pristine/ab-<name>/SKILL.md` holds the bytes you started
-from. Upgrade keeps reporting `conflicted` on that skill until your live file
-matches either the pristine record or the new default.
+from. You only have to reconcile the **colliding** hunks: once the three-way
+merge comes out clean, the next `ab upgrade` reports `merged` and advances the
+pristine record. **Your unrelated local edits survive that** — you are not
+choosing between your customizations and the upgrade, and you do not have to
+make the file match either side in full.
 
 ---
 
