@@ -12,6 +12,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { DISPATCHER, KERNEL, agentActor, humanActor } from '../events/envelope'
+import { BUILD_STATUSES } from '../ontology'
 import type { Exec } from '../ports/workspace/git-worktree'
 import { MemoryBuildStore } from '../store/memory'
 import type { BuildRecord, BuildStore } from '../store/types'
@@ -363,9 +364,9 @@ describe('statusFilter', () => {
   })
 
   test('--all is every status and subsumes --queued', () => {
-    expect(statusFilter(true, false).sort()).toEqual(
-      ['aborted', 'blocked', 'done', 'paused', 'queued', 'running'].sort(),
-    )
+    // Pinned against the ontology's own list, so a new BuildStatus that --all
+    // forgets to include fails here rather than silently going unreportable.
+    expect([...statusFilter(true, false)].sort()).toEqual([...BUILD_STATUSES].sort())
     expect(statusFilter(true, true)).toEqual(statusFilter(true, false))
   })
 })

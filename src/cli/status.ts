@@ -31,7 +31,13 @@
 import { dirname, resolve } from 'node:path'
 import type { AbEvent } from '../events/catalog'
 import type { Actor } from '../events/envelope'
-import { reduceBuild, type OpenEscalation, type OpenSession, type PrLifecycle } from '../kernel/reducer'
+import {
+  reduceBuild,
+  type BuildState,
+  type OpenEscalation,
+  type OpenSession,
+  type PrLifecycle,
+} from '../kernel/reducer'
 import type { BuildOutcome, BuildStatus, Phase, TicketRef } from '../ontology'
 import type { Exec } from '../ports/workspace/git-worktree'
 import { DEFAULT_LOCAL_ROOT } from '../store/local/store'
@@ -117,12 +123,10 @@ function leaseInfo(record: BuildRecord, now: Date): LeaseInfo {
 }
 
 /**
- * One build's summary. `round`/`attempt` come from the in-flight phase when
- * there is one, so "current round or attempt when applicable" reflects what is
- * happening now rather than the last thing that finished.
+ * The summary over an ALREADY-reduced state — so `detail` reduces the log
+ * once and builds both projections from it, rather than reducing twice.
  */
-export function summarize(record: BuildRecord, events: AbEvent[], now: Date): BuildSummary {
-  const state = reduceBuild(events)
+function summarizeFrom(record: BuildRecord, state: BuildState, now: Date): BuildSummary {
   const round = state.currentPhase?.round ?? state.round
   const attempt = state.currentPhase?.attempt
   return {
@@ -148,6 +152,15 @@ export function summarize(record: BuildRecord, events: AbEvent[], now: Date): Bu
   }
 }
 
+/**
+ * One build's summary. `round`/`attempt` come from the in-flight phase when
+ * there is one, so "current round or attempt when applicable" reflects what is
+ * happening now rather than the last thing that finished.
+ */
+export function summarize(record: BuildRecord, events: AbEvent[], now: Date): BuildSummary {
+  return summarizeFrom(record, reduceBuild(events), now)
+}
+
 /** Summary plus the detail fields; `eventCount` appends the newest n events. */
 export function detail(
   record: BuildRecord,
@@ -156,7 +169,7 @@ export function detail(
   eventCount?: number,
 ): BuildDetail {
   const state = reduceBuild(events)
-  const summary = summarize(record, events, now)
+  const summary = summarizeFrom(record, state, now)
   // §15.6-A: a re-run after a failed verify restarts from the FIRST step at
   // attempt+1, so only this attempt's results describe the current cycle.
   // Without this filter an earlier cycle's passes read as current — wrong, and
