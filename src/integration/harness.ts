@@ -41,7 +41,7 @@ import {
   type ScriptContext,
 } from '../ports/runner/fake'
 import { FakeTicketSource } from '../ports/tickets/fake'
-import type { AgentTurnResult, Ticket } from '../ports/types'
+import type { AgentTurnResult, Ticket, TicketSource } from '../ports/types'
 import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { BuildRunner } from '../processes/build-runner'
 import { Dispatcher } from '../processes/dispatcher'
@@ -249,6 +249,10 @@ export interface E2eHarness {
 export async function makeHarness(opts: {
   handlers: SkillHandlers
   tickets?: Ticket[]
+  /** Drive the dispatcher with a REAL TicketSource instead of the fake — e.g.
+   * FileTicketSource, to prove the source's own dependency representation and
+   * lifecycle end-to-end. `h.tickets` stays the (then unused) fake. */
+  ticketSource?: TicketSource
 }): Promise<E2eHarness> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-e2e-'))
   const origin = join(tmp, 'origin')
@@ -259,6 +263,7 @@ export async function makeHarness(opts: {
   const store = new MemoryBuildStore({ clock })
   const forge = new FakeForge()
   const tickets = new FakeTicketSource(opts.tickets ?? [])
+  const ticketSource: TicketSource = opts.ticketSource ?? tickets
   const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })
   const config = parseConfig(CONFIG_TOML, 'e2e autobuild.toml')
 
@@ -349,7 +354,7 @@ export async function makeHarness(opts: {
 
   const dispatcher = new Dispatcher({
     store,
-    tickets,
+    tickets: ticketSource,
     workspaces,
     forge,
     config,
