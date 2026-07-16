@@ -249,6 +249,107 @@ describe('renderDashboard: truncation (one rendered line = one physical row)', (
   })
 })
 
+describe('renderDashboard: the frame fits the SCREEN (one frame = one screenful)', () => {
+  // f_d2e4b3ee — the width invariant's twin, on the other axis, and never
+  // stated anywhere. `LiveRegion.erase()` cursors UP over the lines it
+  // painted, which only works while they are still on screen; a taller frame
+  // scrolls its own top away, CUU clamps at the top margin, and the header —
+  // the line AC 19 names — is the first thing lost, while each repaint pushes
+  // partial snapshots into scrollback (AC 18, read literally).
+  //
+  // `live.test.ts` cannot catch this: its fake appends to an array, so a frame
+  // is never taller than anything. Height is only decidable here, where the
+  // line count is known before anything is painted.
+  const blocked = (i: number): DashboardBuild =>
+    build({
+      slug: `interactive-build-dashboard-for-ab-${i}`,
+      status: 'blocked',
+      ticketId: `AB-${i}`,
+      phase: 'verify:test',
+      steps: [
+        { label: 'plan', state: 'done' },
+        { label: 'plan-review', state: 'done' },
+        { label: 'implement', state: 'pending' },
+        { label: 'code-review', state: 'pending' },
+        { label: 'verify:lint', state: 'pending' },
+        { label: 'verify:test', state: 'pending', note: 'failed' },
+        { label: 'finalize', state: 'pending' },
+        { label: 'merge', state: 'pending', note: 'waiting' },
+      ],
+      blockers: ['maxVerifyAttempts (3) exhausted: verify:test is still failing'],
+    })
+  const many = (n: number): DashboardBuild[] => Array.from({ length: n }, (_, i) => blocked(i))
+
+  test('an unclamped frame really does overflow a default 80x24 — the bug', () => {
+    // Only the RUNNING half of the listed set is bounded by capacity; blocked
+    // builds accumulate until a human answers, which is the very condition the
+    // dashboard exists to surface. Five is not a large backlog.
+    const unbounded = renderDashboard(model(many(5)), { color: false, width: 80 })
+    expect(unbounded.length).toBeGreaterThan(24)
+  })
+
+  test('…and the same frame clamped to 24 rows fits in 24 rows', () => {
+    const lines = renderDashboard(model(many(5)), { color: false, width: 80, height: 24 })
+    expect(lines.length).toBeLessThanOrEqual(24)
+  })
+
+  test('never exceeds the height, over a sweep of heights and build counts', () => {
+    for (const n of [0, 1, 2, 3, 5, 8, 20]) {
+      for (let height = 1; height <= 40; height += 1) {
+        for (const color of [false, true]) {
+          const lines = renderDashboard(model(many(n)), { color, width: 80, height })
+          expect(lines.length).toBeLessThanOrEqual(height)
+        }
+      }
+    }
+  })
+
+  test('the header survives the clamp — it is the line the ACs name', () => {
+    for (let height = 1; height <= 12; height += 1) {
+      const [header] = renderDashboard(model(many(8)), { color: false, width: 80, height })
+      expect(header).toContain('ab dispatch')
+      expect(header).toContain('capacity 2')
+      // The count is on the header, so it still reports every build even when
+      // most rows are clamped away.
+      expect(header).toContain('8 active')
+    }
+  })
+
+  test('the overflow is VISIBLE, not silent — `... and N more`', () => {
+    // Silent truncation would read as "these are all the builds", which is a
+    // worse answer than the scrolling it replaces.
+    const lines = renderDashboard(model(many(8)), { color: false, width: 80, height: 24 })
+    const notice = lines.at(-1)
+    expect(notice).toContain('more')
+    const shown = lines.filter((l) => l.includes('BLOCKED')).length
+    expect(notice).toContain(`and ${8 - shown} more`)
+    expect(shown).toBeGreaterThan(0)
+  })
+
+  test('builds are dropped WHOLE — never a half-rendered build', () => {
+    const lines = renderDashboard(model(many(8)), { color: false, width: 80, height: 24 })
+    // Every rendered build brings its header, its progress rows and its
+    // blocker; a build's blocker line never appears without its header.
+    const headers = lines.filter((l) => l.includes('BLOCKED')).length
+    const blockerLines = lines.filter((l) => l.trimStart().startsWith('!')).length
+    expect(blockerLines).toBe(headers)
+  })
+
+  test('a frame that fits is not clamped and gets no notice', () => {
+    const lines = renderDashboard(model(many(2)), { color: false, width: 80, height: 24 })
+    expect(lines.some((l) => l.includes('more'))).toBe(false)
+    expect(lines.filter((l) => l.includes('BLOCKED'))).toHaveLength(2)
+  })
+
+  test('height is optional — absent ⇒ unbounded, for callers not painting a screen', () => {
+    expect(renderDashboard(model(many(5)), { color: false, width: 80 }).length).toBeGreaterThan(24)
+  })
+
+  test('an empty dashboard still fits a 1-row screen', () => {
+    expect(renderDashboard(model([]), { color: false, width: 80, height: 1 })).toHaveLength(1)
+  })
+})
+
 describe('renderDashboard: the progress row WRAPS rather than truncating', () => {
   // Regression, found by rendering a realistic frame at 100 columns: a full
   // pipeline (plan → plan-review → implement → code-review → verify:* →

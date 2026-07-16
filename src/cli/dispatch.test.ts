@@ -323,7 +323,10 @@ describe('abDispatch --once', () => {
 })
 
 /** A TerminalOut that claims to be a TTY and records every raw write. */
-function fakeTerminal(interactive = true): TerminalOut & { frames: string[]; all: () => string } {
+function fakeTerminal(
+  interactive = true,
+  size: { columns?: number; rows?: number } = {},
+): TerminalOut & { frames: string[]; all: () => string } {
   const frames: string[] = []
   return {
     frames,
@@ -331,9 +334,21 @@ function fakeTerminal(interactive = true): TerminalOut & { frames: string[]; all
     write: (chunk) => {
       frames.push(chunk)
     },
-    columns: 120,
+    columns: size.columns ?? 120,
+    rows: size.rows ?? 40,
     interactive,
   }
+}
+
+/** The longest run of consecutive painted lines the region wrote — i.e. the
+ * tallest frame it will later have to cursor UP over. */
+function tallestFrame(term: { frames: string[] }): number {
+  return Math.max(
+    0,
+    ...term.frames
+      .filter((chunk) => chunk.includes('\n'))
+      .map((chunk) => chunk.split('\n').length - 1),
+  )
 }
 
 describe('abDispatch --once with an interactive terminal', () => {
@@ -400,6 +415,37 @@ describe('abDispatch --once with an interactive terminal', () => {
       expect(out.some((line) => line.includes('one pass over'))).toBe(true)
       // …and the final frame is still on screen at exit.
       expect(term.all()).toContain(slug)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('the frame never exceeds the terminal HEIGHT — rows are wired through', async () => {
+    // f_d2e4b3ee: the region repaints by cursoring up over the rows it painted,
+    // so a frame taller than the screen is unpaintable, not merely ugly. The
+    // seam is only real if `terminal.rows` actually reaches `renderDashboard`.
+    // rows: 3 is deliberately tighter than this fixture's natural frame
+    // (header + blank + build header + progress = 4). A looser value proves
+    // nothing — the frame would fit anyway and the assertion would pass with
+    // `height` never wired through at all.
+    const fx = await makeFixture(readyTicket('T-rows'), happyHandlers())
+    const term = fakeTerminal(true, { columns: 80, rows: 3 })
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+      })
+      expect(fx.cliErrors).toEqual([])
+      expect(tallestFrame(term)).toBeGreaterThan(0) // it really did paint
+      expect(tallestFrame(term)).toBeLessThanOrEqual(3)
+      // The header survives the clamp.
+      expect(term.all()).toContain('ab dispatch')
     } finally {
       await fx.cleanup()
     }

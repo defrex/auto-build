@@ -18,24 +18,30 @@ export interface TerminalOut {
   write(chunk: string): void
   /** Terminal width in columns; a sane fallback when unknown. */
   columns: number
+  /** Terminal height in rows; a sane fallback when unknown. The live region
+   * repaints by cursoring UP over the rows it painted, which only works while
+   * those rows are still on screen — so a frame taller than this is not a
+   * cosmetic problem, it is an unpaintable one. */
+  rows: number
   /** True only for a real TTY — false for pipes and redirects. */
   interactive: boolean
 }
 
-/** Width to assume when the stream reports none — the conventional default. */
+/** Dimensions to assume when the stream reports none — the conventional 80x24. */
 const FALLBACK_COLUMNS = 80
+const FALLBACK_ROWS = 24
 
 /**
- * `stream.columns` for a real terminal, else the fallback.
+ * A terminal dimension, or the fallback.
  *
- * The guard is `> 0`, not `?? `: a TTY may report **0** columns — `script(1)`,
- * many pty wrappers, and some CI runners all do — and `0 ?? 80` is `0`, which
- * truncates every line to nothing and collapses the dashboard to a column of
- * ellipses. Zero is not a width; it means "this terminal will not say".
+ * The guard is `> 0`, not `?? `: a TTY may report **0** — `script(1)`, many pty
+ * wrappers, and some CI runners all do — and `0 ?? 80` is `0`. Zero is not a
+ * dimension; it means "this terminal will not say". (A zero width truncated
+ * every line to nothing and collapsed the dashboard into a column of
+ * ellipses; a zero height would clamp the whole build list away.)
  */
-function resolveColumns(stream: NodeJS.WriteStream): number {
-  const columns = stream.columns
-  return typeof columns === 'number' && columns > 0 ? columns : FALLBACK_COLUMNS
+function dimension(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && value > 0 ? value : fallback
 }
 
 /**
@@ -46,8 +52,8 @@ function resolveColumns(stream: NodeJS.WriteStream): number {
  * redirected or piped output, automatically uses plain mode" for free — there
  * is no separate detection path to keep in sync.
  *
- * `columns` is a getter, not a snapshot: a resized window is picked up on the
- * next frame without anyone subscribing to SIGWINCH.
+ * `columns` and `rows` are getters, not snapshots: a resized window is picked
+ * up on the next frame without anyone subscribing to SIGWINCH.
  */
 export function processTerminal(stream: NodeJS.WriteStream = process.stdout): TerminalOut {
   return {
@@ -55,7 +61,10 @@ export function processTerminal(stream: NodeJS.WriteStream = process.stdout): Te
       stream.write(chunk)
     },
     get columns(): number {
-      return resolveColumns(stream)
+      return dimension(stream.columns, FALLBACK_COLUMNS)
+    },
+    get rows(): number {
+      return dimension(stream.rows, FALLBACK_ROWS)
     },
     interactive: stream.isTTY === true,
   }

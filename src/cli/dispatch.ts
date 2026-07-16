@@ -352,7 +352,13 @@ class DispatchLoop {
       mode: this.opts.once === true ? 'once' : 'watch',
       capacity: this.config.dispatcher.capacity,
     })
-    this.region.update(renderDashboard(model, { color: true, width: terminal.columns }))
+    this.region.update(
+      renderDashboard(model, {
+        color: true,
+        width: terminal.columns,
+        height: terminal.rows,
+      }),
+    )
   }
 
   private startRendering(): void {

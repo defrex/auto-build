@@ -27,6 +27,18 @@ export interface RenderOpts {
   color: boolean
   /** Hard cap per line; one rendered line must be one physical row. */
   width: number
+  /**
+   * Hard cap on the NUMBER of lines — the screen's rows.
+   *
+   * Same invariant as `width`, on the other axis, and for a sharper reason:
+   * the live region repaints by cursoring up over the rows it painted, which
+   * only works while they are still on screen. A frame taller than the screen
+   * scrolls its own top away, so the cursor-up clamps at the top margin and
+   * the header — the line the ACs name — is the first thing lost.
+   *
+   * Absent ⇒ unbounded, for callers that are not painting a screen.
+   */
+  height?: number
 }
 
 // ── ANSI ─────────────────────────────────────────────────────────────────────
@@ -229,23 +241,53 @@ function frameWidths(builds: DashboardBuild[]): Widths {
 // ── The frame ────────────────────────────────────────────────────────────────
 
 export function renderDashboard(model: DashboardModel, opts: RenderOpts): string[] {
-  const { color, width } = opts
-  const header = [
-    paint('ab dispatch', 'bold', color),
-    basename(model.repo),
-    paint(`${model.mode} · capacity ${model.capacity} · ${model.builds.length} active`, 'dim', color),
-  ].join('  ')
+  const { color, width, height } = opts
+  const header = truncate(
+    [
+      paint('ab dispatch', 'bold', color),
+      basename(model.repo),
+      paint(
+        `${model.mode} · capacity ${model.capacity} · ${model.builds.length} active`,
+        'dim',
+        color,
+      ),
+    ].join('  '),
+    width,
+  )
 
-  const lines = [truncate(header, width)]
+  // A screen with room for nothing but the header gets the header: it is the
+  // line the ACs name, and it carries the active COUNT, so it still tells the
+  // operator the builds exist.
+  if (height !== undefined && height <= 1) return [header]
+
   if (model.builds.length === 0) {
-    lines.push(truncate(paint('  no active builds', 'dim', color), width))
-    return lines
+    return [header, truncate(paint('  no active builds', 'dim', color), width)]
   }
 
+  // Build blocks first — each is its blank separator plus its lines — so the
+  // frame's height is known before anything is painted.
   const widths = frameWidths(model.builds)
-  for (const build of model.builds) {
-    lines.push('')
-    lines.push(...renderBuild(build, opts, widths))
+  const blocks = model.builds.map((build) => ['', ...renderBuild(build, opts, widths)])
+
+  const total = blocks.reduce((n, block) => n + block.length, 1)
+  if (height === undefined || total <= height) return [header, ...blocks.flat()]
+
+  // Overflow: keep whole builds from the top (they are slug-sorted, so the
+  // set stays stable across frames) and spend one line saying what was
+  // dropped. Silent truncation would read as "these are all the builds", which
+  // is worse than the scrolling it replaces.
+  const budget = height - 2 // the header, and the overflow notice
+  let used = 0
+  let shown = 0
+  for (const block of blocks) {
+    if (used + block.length > budget) break
+    used += block.length
+    shown += 1
   }
-  return lines
+  const dropped = blocks.length - shown
+  return [
+    header,
+    ...blocks.slice(0, shown).flat(),
+    truncate(paint(`  ... and ${dropped} more`, 'dim', color), width),
+  ]
 }

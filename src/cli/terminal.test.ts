@@ -2,12 +2,15 @@
  * The terminal seam (src/cli/terminal.ts) over fake write streams.
  *
  * Small surface, but it decides two things nothing downstream can recover
- * from: whether the dashboard runs at all, and how wide it thinks it is.
+ * from: whether the dashboard runs at all, and how big it thinks the screen
+ * is — on BOTH axes. A wrong width truncates lines to nothing; a wrong height
+ * makes the frame unpaintable, because the live region repaints by cursoring
+ * up over rows that have to still be on screen.
  */
 import { describe, expect, test } from 'bun:test'
 import { processTerminal } from './terminal'
 
-function stream(props: { isTTY?: boolean; columns?: number }): NodeJS.WriteStream {
+function stream(props: { isTTY?: boolean; columns?: number; rows?: number }): NodeJS.WriteStream {
   const writes: string[] = []
   return {
     write: (chunk: string) => {
@@ -57,6 +60,30 @@ describe('processTerminal: columns', () => {
     expect(term.columns).toBe(100)
     ;(s as unknown as { columns: number }).columns = 60
     expect(term.columns).toBe(60)
+  })
+})
+
+describe('processTerminal: rows', () => {
+  test('reports the stream height', () => {
+    expect(processTerminal(stream({ isTTY: true, columns: 100, rows: 50 })).rows).toBe(50)
+  })
+
+  test('a stream with no height falls back to 24', () => {
+    expect(processTerminal(stream({})).rows).toBe(24)
+  })
+
+  test('a TTY reporting ZERO rows falls back too', () => {
+    // Same trap as columns, same terminals: `0 ?? 24` is 0, which would clamp
+    // the entire build list away and leave a header over an empty screen.
+    expect(processTerminal(stream({ isTTY: true, rows: 0 })).rows).toBe(24)
+  })
+
+  test('rows is a GETTER too — a resized window is picked up on the next frame', () => {
+    const s = stream({ isTTY: true, columns: 100, rows: 50 })
+    const term = processTerminal(s)
+    expect(term.rows).toBe(50)
+    ;(s as unknown as { rows: number }).rows = 24
+    expect(term.rows).toBe(24)
   })
 })
 

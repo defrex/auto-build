@@ -15,6 +15,7 @@ function fakeTerm(): TerminalOut & { writes: string[]; all: () => string } {
       writes.push(chunk)
     },
     columns: 80,
+    rows: 24,
     interactive: true,
   }
 }
