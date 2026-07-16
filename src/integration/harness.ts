@@ -40,7 +40,7 @@ import {
   type Script,
   type ScriptContext,
 } from '../ports/runner/fake'
-import { FakeTicketSource } from '../ports/tickets/fake'
+import { FakeTicketSource, type TicketSeed } from '../ports/tickets/fake'
 import type { AgentTurnResult, Ticket } from '../ports/types'
 import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { BuildRunner } from '../processes/build-runner'
@@ -93,8 +93,8 @@ export const CONFORMING_BODY = [
 
 export function readyTicket(
   id: string,
-  over: Partial<Omit<Ticket, 'ref'>> = {},
-): Ticket {
+  over: Partial<Omit<TicketSeed, 'ref'>> = {},
+): TicketSeed {
   const title = over.title ?? 'Add rate limiting'
   return {
     ref: { source: 'fake', id, title },
@@ -102,6 +102,7 @@ export function readyTicket(
     body: over.body ?? CONFORMING_BODY,
     state: over.state ?? 'Ready',
     labels: over.labels ?? ['autobuild'],
+    ...over,
   }
 }
 
@@ -248,7 +249,7 @@ export interface E2eHarness {
 
 export async function makeHarness(opts: {
   handlers: SkillHandlers
-  tickets?: Ticket[]
+  tickets?: TicketSeed[]
 }): Promise<E2eHarness> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-e2e-'))
   const origin = join(tmp, 'origin')

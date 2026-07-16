@@ -38,6 +38,11 @@ import type {
 } from '../ports/types'
 import type { Exec } from '../ports/workspace/git-worktree'
 import type { ArtifactMeta, BuildRecord, BuildStore, Clock } from '../store/types'
+import {
+  memoizeLookup,
+  resolveDependencyBlock,
+  type DependencyBlock,
+} from './dependencies'
 
 // ── Spec quality gate (SPEC §6.3, docs/spec-standard.md) ─────────────────────
 
@@ -129,6 +134,11 @@ export interface TickReport {
   bounced: number
   /** Claim-before-launch (§12): claims lost to another dispatcher. */
   claimRaces: number
+  /** Dependency gate (§13): ready tickets held back by unresolved blockers. */
+  dependencyBlocked: number
+  /** The blocks behind `dependencyBlocked` — what makes them discoverable
+   * without provider API, filesystem, or database inspection. */
+  dependencyBlocks: DependencyBlock[]
 }
 
 export function emptyTickReport(): TickReport {
@@ -143,6 +153,8 @@ export function emptyTickReport(): TickReport {
     authored: 0,
     bounced: 0,
     claimRaces: 0,
+    dependencyBlocked: 0,
+    dependencyBlocks: [],
   }
 }
 
@@ -565,8 +577,25 @@ export class Dispatcher {
         ? { state: config.dispatcher.readyState }
         : {}),
     })
+    // One memo per pass: a blocker shared by several ready tickets is fetched
+    // once, and a dependency-free ticket never fetches at all.
+    const lookup = memoizeLookup((id) => tickets.get(id))
     for (const ticket of ready) {
       if (capacity <= 0) break
+
+      // Dependency gate (§13) — BEFORE the claim, so a blocked ticket stays a
+      // plain queued ticket: no claim, no build, no workspace, no capacity.
+      // `continue`, never `break`, and no capacity decrement: an unresolved or
+      // outright invalid graph must never starve unrelated eligible tickets.
+      // This runs on listReady's output, so readyLabels/readyState can only
+      // narrow the candidates — they can never override a dependency.
+      const block = await this.dependencyBlock(ticket, lookup)
+      if (block) {
+        report.dependencyBlocks.push(block)
+        report.dependencyBlocked += 1
+        continue
+      }
+
       // Claim-before-launch (§12): losing the claim means another dispatcher
       // (or an earlier tick) owns this ticket.
       if (!(await tickets.claim(ticket.ref.id))) {
@@ -652,6 +681,33 @@ export class Dispatcher {
       await this.launch(slug, launched)
       report.dispatched += 1
       capacity -= 1
+    }
+  }
+
+  /**
+   * The dependency decision for one candidate, with the ticket source's
+   * failures contained: an unreachable provider or a malformed blocker file
+   * must hold THIS ticket back, not crash the tick and strand every other
+   * build's janitor duty. Erring toward blocked is the safe direction — the
+   * cost is a delayed dispatch, whereas guessing "eligible" starts dependent
+   * work early, which is the whole thing this gate exists to prevent.
+   */
+  private async dependencyBlock(
+    ticket: Ticket,
+    lookup: (id: string) => Promise<Ticket | null>,
+  ): Promise<DependencyBlock | null> {
+    try {
+      return await resolveDependencyBlock(ticket, lookup)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        ticket: ticket.ref.id,
+        reason: 'missing',
+        blockers: [...ticket.blockedBy],
+        detail:
+          `${ticket.ref.id}: could not resolve blockers ` +
+          `(${ticket.blockedBy.join(', ')}) — ${message}`,
+      }
     }
   }
 

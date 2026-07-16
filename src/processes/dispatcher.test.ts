@@ -7,7 +7,7 @@ import { parseConfig } from '../config/load'
 import { DISPATCHER, KERNEL, agentActor, humanActor } from '../events/envelope'
 import { sequentialIds } from '../ids'
 import { FakeForge } from '../ports/forge/fake'
-import { FakeTicketSource } from '../ports/tickets/fake'
+import { FakeTicketSource, type TicketSeed } from '../ports/tickets/fake'
 import type { Ticket } from '../ports/types'
 import { FakeWorkspaceProvider } from '../ports/workspace/fake'
 import type { Exec } from '../ports/workspace/git-worktree'
@@ -39,7 +39,7 @@ const CONFORMING_BODY = [
   '',
 ].join('\n')
 
-function readyTicket(id: string, over: Partial<Omit<Ticket, 'ref'>> = {}): Ticket {
+function readyTicket(id: string, over: Partial<Omit<TicketSeed, 'ref'>> = {}): TicketSeed {
   const title = over.title ?? 'Add rate limiting'
   return {
     ref: { source: 'fake', id, title },
@@ -47,12 +47,13 @@ function readyTicket(id: string, over: Partial<Omit<Ticket, 'ref'>> = {}): Ticke
     body: over.body ?? CONFORMING_BODY,
     state: over.state ?? 'Ready',
     labels: over.labels ?? ['autobuild'],
+    ...over,
   }
 }
 
 function harness(
   opts: {
-    tickets?: Ticket[]
+    tickets?: TicketSeed[]
     toml?: string
     authorSpec?: (ticket: Ticket) => Promise<string | null>
     opts?: DispatcherOpts
@@ -948,5 +949,198 @@ describe('Dispatcher tick idempotency', () => {
     expect(h.workspaces.releases).toEqual([])
     expect(h.tickets.comments).toEqual([])
     expect(h.tickets.transitions).toEqual([])
+  })
+})
+
+// ── Dependency gating (§12, §13) ─────────────────────────────────────────────
+
+describe('Dispatcher dependency gating', () => {
+  test('a blocked ticket is not claimed, builds nothing, and provisions nothing', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-1'] }),
+        readyTicket('T-1', { title: 'Blocker work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 2', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    // It stays a plain queued ticket in the source (§13): no claim, no build,
+    // no workspace — and specifically NOT a blocked BuildStore build.
+    expect(h.tickets.isClaimed('T-2')).toBe(false)
+    expect((await h.store.listBuilds()).map((b) => b.slug)).toEqual(['blocker-work'])
+    expect(h.workspaces.provisions).toEqual([
+      { repo: REPO, baseBranch: 'main', branch: 'ab/blocker-work' },
+    ])
+    expect(h.launches).toEqual(['blocker-work'])
+    expect(report.dependencyBlocked).toBe(1)
+    expect(report.dispatched).toBe(1)
+  })
+
+  test('the report names the blocked ticket and its unresolved blocker ids', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('T-3', { title: 'Dependent', blockedBy: ['T-1', 'T-2'] }),
+        readyTicket('T-1', { title: 'Blocker one', state: 'Done' }),
+        readyTicket('T-2', { title: 'Blocker two', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 3', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    // T-1 is Done, so only T-2 is still outstanding — and a multi-blocker
+    // ticket stays ineligible until the LAST blocker resolves.
+    const block = report.dependencyBlocks.find((b) => b.ticket === 'T-3')
+    expect(block?.reason).toBe('unresolved')
+    expect(block?.blockers).toEqual(['T-2'])
+    expect(block?.detail).toContain('T-3')
+    expect(block?.detail).toContain('T-2')
+  })
+
+  test('a blocked ticket does not consume capacity an eligible sibling needs', async () => {
+    // Capacity 1, blocked ticket FIRST: if the gate consumed a slot or broke
+    // the loop, the eligible sibling behind it would starve.
+    const h = harness({
+      tickets: [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-9'] }),
+        readyTicket('T-1', { title: 'Independent work', state: 'Ready' }),
+        readyTicket('T-9', { title: 'Blocker work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 1', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    expect(report.dispatched).toBe(1)
+    expect((await h.store.listBuilds()).map((b) => b.slug)).toEqual(['independent-work'])
+  })
+
+  test('resolving the blocker makes the ticket dispatch on a subsequent tick', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-1'] }),
+        readyTicket('T-1', { title: 'Blocker work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 4', 'readyState = "Ready"'].join('\n'),
+    })
+
+    expect((await h.dispatcher.tick()).dependencyBlocked).toBe(1)
+    expect(h.tickets.isClaimed('T-2')).toBe(false)
+
+    // Completion is the source's own lifecycle event — no manual sync, no
+    // auto-build-side dependency state to update.
+    await h.tickets.transition('T-1', 'Done')
+    // Back to Ready so it still matches the scan; only `complete` changed.
+    const second = await h.dispatcher.tick()
+
+    expect(second.dependencyBlocked).toBe(0)
+    expect(second.dispatched).toBe(1)
+    expect(h.tickets.isClaimed('T-2')).toBe(true)
+    expect((await h.store.listBuilds()).map((b) => b.slug).sort()).toEqual(
+      ['blocker-work', 'dependent-work'].sort(),
+    )
+  })
+
+  test('a cyclic pair blocks both while an unrelated ticket still dispatches', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('A', { title: 'Cycle a', blockedBy: ['B'] }),
+        readyTicket('B', { title: 'Cycle b', blockedBy: ['A'] }),
+        readyTicket('C', { title: 'Unrelated work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 3', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    // An invalid graph must not starve unrelated eligible work (§13).
+    expect(report.dependencyBlocked).toBe(2)
+    expect(report.dispatched).toBe(1)
+    expect((await h.store.listBuilds()).map((b) => b.slug)).toEqual(['unrelated-work'])
+    expect(report.dependencyBlocks.map((b) => b.reason)).toEqual(['cycle', 'cycle'])
+    expect(report.dependencyBlocks[0]?.detail).toContain('cycle')
+  })
+
+  test('a self-dependency blocks only itself, with a diagnostic naming it', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('A', { title: 'Self blocked', blockedBy: ['A'] }),
+        readyTicket('C', { title: 'Unrelated work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 3', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    expect(report.dependencyBlocks).toHaveLength(1)
+    expect(report.dependencyBlocks[0]?.reason).toBe('self')
+    expect(report.dependencyBlocks[0]?.ticket).toBe('A')
+    expect(report.dispatched).toBe(1)
+  })
+
+  test('a missing blocker blocks the ticket with an actionable diagnostic', async () => {
+    const h = harness({
+      tickets: [readyTicket('A', { title: 'Dangling', blockedBy: ['ghost'] })],
+      toml: ['[dispatcher]', 'capacity = 3', 'readyState = "Ready"'].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    expect(report.dependencyBlocks[0]?.reason).toBe('missing')
+    expect(report.dependencyBlocks[0]?.blockers).toEqual(['ghost'])
+    expect(report.dependencyBlocks[0]?.detail).toContain('ghost')
+    expect(await h.store.listBuilds()).toEqual([])
+  })
+
+  test('a ticket source that throws blocks the ticket rather than crashing the tick', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-1'] }),
+        readyTicket('T-1', { title: 'Blocker work', state: 'Ready' }),
+      ],
+      toml: ['[dispatcher]', 'capacity = 3', 'readyState = "Ready"'].join('\n'),
+    })
+    h.tickets.get = async () => {
+      throw new Error('linear unreachable')
+    }
+
+    // An unreachable provider must not strand every other build's janitor duty.
+    const report = await h.dispatcher.tick()
+
+    expect(report.dependencyBlocks[0]?.ticket).toBe('T-2')
+    expect(report.dependencyBlocks[0]?.detail).toContain('linear unreachable')
+    expect(h.tickets.isClaimed('T-2')).toBe(false)
+    // The eligible ticket is untouched by the other one's lookup failure.
+    expect(report.dispatched).toBe(1)
+  })
+
+  test('dependencies gate independently of readyLabels — labels cannot override', async () => {
+    const h = harness({
+      tickets: [
+        readyTicket('T-2', { title: 'Dependent work', blockedBy: ['T-1'], labels: ['autobuild'] }),
+        readyTicket('T-1', { title: 'Blocker work', state: 'Ready', labels: ['autobuild'] }),
+      ],
+      toml: [
+        '[dispatcher]',
+        'capacity = 3',
+        'readyState = "Ready"',
+        'readyLabels = ["autobuild"]',
+      ].join('\n'),
+    })
+
+    const report = await h.dispatcher.tick()
+
+    // Matching every dispatch criterion makes a ticket a candidate; it never
+    // makes it eligible in spite of an unresolved dependency.
+    expect(report.dependencyBlocked).toBe(1)
+    expect(h.tickets.isClaimed('T-2')).toBe(false)
+  })
+
+  test('dependency-free dispatch is byte-for-byte unchanged', async () => {
+    const h = harness({ tickets: [readyTicket('T-1')] })
+    const report = await h.dispatcher.tick()
+    expect(report).toEqual({ ...emptyTickReport(), dispatched: 1 })
   })
 })
