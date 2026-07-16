@@ -28,6 +28,7 @@ import {
   claudeSkillPath,
   defaultDistRoot,
   installedSkillPath,
+  MODEL_INVOKABLE_SKILLS,
   pristineSkillPath,
   rewriteSkillSource,
 } from './init'
@@ -35,10 +36,11 @@ import { runCli, type SessionlessCliDeps } from './main'
 
 const DIST_ROOT = resolve(import.meta.dir, '..', '..')
 
-/** The 8 canonical skills shipped in the distribution (§16.3). */
+/** The 9 canonical skills shipped in the distribution (§16.3). */
 const SKILL_NAMES = [
   'code-review',
   'finalize',
+  'guide',
   'implement',
   'plan',
   'plan-review',
@@ -67,7 +69,7 @@ function splitFrontmatter(content: string): { front: string[]; body: string } {
 }
 
 describe('abInit — fresh install', () => {
-  test('installs all 8 skills under .agents and links Claude discovery to the same copies', async () => {
+  test('installs all 9 skills under .agents and links Claude discovery to the same copies', async () => {
     const report = await abInit({ targetRepo: target })
 
     expect(report.config).toBe('written')
@@ -85,14 +87,16 @@ describe('abInit — fresh install', () => {
     }
   })
 
-  test('frontmatter: name rewritten; disable-model-invocation everywhere EXCEPT ab-spec', async () => {
+  test('frontmatter: name rewritten; disable-model-invocation everywhere EXCEPT the model-invokable set', async () => {
+    // The set is the policy (§16.3): skills that drive no phase may be
+    // model-invoked; every phase skill must not be.
+    expect([...MODEL_INVOKABLE_SKILLS].sort()).toEqual(['guide', 'spec'])
     await abInit({ targetRepo: target })
     for (const name of SKILL_NAMES) {
       const installed = await readFile(installedSkillPath(target, `ab-${name}`), 'utf8')
       const { front } = splitFrontmatter(installed)
       expect(front).toContain(`name: ab-${name}`)
-      if (name === 'spec') {
-        // The one model-invocable skill: a human conversation surface (§16.3).
+      if (MODEL_INVOKABLE_SKILLS.has(name)) {
         expect(front.some((l) => l.startsWith('disable-model-invocation:'))).toBe(false)
       } else {
         expect(front).toContain('disable-model-invocation: true')
