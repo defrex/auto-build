@@ -214,7 +214,7 @@ test('a. happy path: ready ticket → dispatch → pipeline → PR → janitor m
   h.forge.setPrState(1, { state: 'merged', sha: 'squash-1' })
   const tick2 = await h.dispatcher.tick()
   // claimRaces is 0, where it was 1 before the ready state gated the scan.
-  // The config's required `readyState = "Ready"` (readyCriteria,
+  // The config's required `[tickets].readyState = "Ready"` (readyCriteria,
   // src/processes/dispatcher.ts) means the scan only lists Ready tickets. The
   // just-merged ticket is in Done, so the scan skips it outright. Previously,
   // when a state gate could be absent, a ticket that had long since left Ready

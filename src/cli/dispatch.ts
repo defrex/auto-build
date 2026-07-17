@@ -774,11 +774,10 @@ class DispatchLoop {
 }
 
 /**
- * Entry point (§8.2). Loads the repo's config — whose [tickets] table selects
- * the TicketSource, defaulting to the local file tracker at
- * `.autobuild/tickets` when the table is absent (§13), so a repo with no
- * config still has a backlog to watch — wires the ports, and runs the loop
- * until a single pass finishes (`--once`) or `opts.signal` aborts (SIGINT).
+ * Entry point (§8.2). Loads the repo's config — whose required [tickets]
+ * table selects the TicketSource and names its ready state. A file source with
+ * no `dir` still defaults to `.autobuild/tickets` (§13). Then wires the ports
+ * and runs until one pass finishes (`--once`) or `opts.signal` aborts (SIGINT).
  */
 export async function abDispatch(opts: DispatchOpts): Promise<void> {
   const configPath = join(opts.targetRepo, 'autobuild.toml')

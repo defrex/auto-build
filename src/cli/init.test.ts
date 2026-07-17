@@ -138,7 +138,7 @@ describe('abInit — fresh install', () => {
     // top-level config concept.
     await abInit({ targetRepo: target })
     const config = parseConfig(await readFile(join(target, 'autobuild.toml'), 'utf8'))
-    expect(config.dispatcher.readyState).toBe('ready')
+    expect(config.tickets.readyState).toBe('ready')
     expect(config.roles.default).toEqual({ runtime: 'claude' })
   })
 

@@ -48,9 +48,9 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
   tickets; a human grooms them to the spec standard (`docs/spec-standard.md`:
   what and why but never how, verifiable acceptance criteria, explicit
   out-of-scope, evidence) and dispatches. Generated work cannot leave Triage
-  un-groomed. The dispatcher claims tickets that pass the `[dispatcher]` gate,
-  chooses a short immutable slug from the final conforming spec, and starts
-  builds up to `capacity`.
+  un-groomed. The dispatcher claims tickets that pass the `[tickets]` ready
+  gate, chooses a short immutable slug from the final conforming spec, and
+  starts builds up to `[dispatcher].capacity`.
 - **`spec`** — the ticket's spec becomes the build's contract. The `ab-spec`
   skill is the human-interactive surface for producing it, and it runs *before*
   a build exists.
@@ -239,38 +239,37 @@ Every field is a **positive integer**.
 | Field | Default | Allowed / constraints | Effect |
 |---|---|---|---|
 | `capacity` | `1` | positive integer | Concurrent builds for this repo. |
-| `readyLabels` | — (source-aware) | optional; array of nonempty strings | A ticket must carry **every** one of these labels to be dispatchable (all, not any). `[]` = **no label gate**. Absent falls back to the source's default gate — see below. |
-| `readyState` | — (source-aware) | optional, nonempty string | Workflow state a ticket must *additionally* sit in. See below: absent means *any state* for `linear`, but `Ready` for `file`. |
 
-**Both defaults are source-aware**, resolved by `readyCriteria` in
-`src/processes/dispatcher.ts` — the schema's `undefined` is not the effective
-value, so read that function rather than the field type:
-
-| `[tickets].source` | `readyLabels` absent | `readyState` absent |
-|---|---|---|
-| `"linear"` | `["autobuild"]` — the label gate | any state (labels alone decide) |
-| `"file"` | `[]` — **no label gate** | `"Ready"` — the `ready/` directory *is* the gate |
-
-An explicit value always wins for either source.
+Readiness is expressed in the ticket source's vocabulary, so its fields live
+under `[tickets]`, not `[dispatcher]`.
 
 ### `[tickets]`
 
-Names the TicketSource the dispatcher drives. Declarative only.
-
-**Omitting the table entirely is a supported configuration, not an oversight**:
-it prefaults to `{ source = "file" }`, giving the local file tracker at
-`.autobuild/tickets` — a repo dispatches with no config edit and no secret.
-So `config.tickets` is always present; never write code or advice that treats
-"no `[tickets]` table" as a separate case.
+Names the TicketSource and owns its readiness/lifecycle state vocabulary.
+Declarative only. The table is required: `readyState` has no default, and an
+absent table fails clearly at `tickets.readyState` rather than making every
+state eligible.
 
 | Field | Default | Allowed / constraints | Effect |
 |---|---|---|---|
-| `source` | `"file"` (via the table's prefault) | `"linear"` \| `"file"` | Which provider backs ticket reads, claims, and creation. |
+| `source` | — | **required**, `"linear"` \| `"file"` | Which provider backs ticket reads, claims, and creation. |
+| `readyLabels` | — (source-aware) | optional; array of nonempty strings | A ticket must carry **every** listed label to be dispatchable. `[]` = **no label gate**. Absent uses the source default below. |
+| `readyState` | — | **required**, non-blank string | The one workflow state a ticket must sit in to be dispatchable. Linear matches exactly and case-sensitively; file canonicalizes it to a state directory (`ready` → `ready/`). There is no any-state mode. |
 | `teamKey` | — | `source = "linear"` **only, required there**; nonempty string | The Linear team key (e.g. `"ENG"`). |
 | `claimedState` | — | `source = "linear"` only; optional, nonempty string | Workflow state `claim()` moves an issue to when a build starts. |
 | `createState` | — | optional, nonempty string | State new tickets are filed into. Absent = the provider's default (Linear: the team's default, e.g. Backlog; file: Triage). |
 | `triageState` | — | optional, nonempty string | State the dispatcher hands tickets back to for human triage — spec-gate bounces, aborted builds, closed-unmerged PRs. Absent = the provider's default (Linear: Backlog; file: Triage). Must name a state the tracker actually has — a Linear team only has "Triage" when its triage feature is enabled. |
 | `dir` | `.autobuild/tickets` | `source = "file"` **only**; optional, nonempty string | Root holding the state directories. Resolved relative to the repo. |
+
+`readyLabels` is the only source-aware readiness default, resolved by
+`readyCriteria` in `src/processes/dispatcher.ts`:
+
+| `[tickets].source` | `readyLabels` absent |
+|---|---|
+| `"linear"` | `["autobuild"]` — the historical label narrowing |
+| `"file"` | `[]` — no label narrowing; `readyState` selects the directory |
+
+An explicit `readyLabels` value always wins for either source.
 
 Cross-field rules, each an **error**:
 
