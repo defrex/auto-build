@@ -892,13 +892,13 @@ needsServer = true
 [finalize]
 steps = ["release-notes"]       # optional post-steps, failure-tolerant (§5)
 
-[agent]                         # repo-wide DEFAULT on the two axes (§9)
-runtime = "claude"              # no model ⇒ the runtime's own default
+[agent]                         # repo-wide DEFAULT on the axes (§9)
+runtime = "claude"              # no model ⇒ the runtime's own default; no extensions ⇒ hermetic
 
 [roles]                         # per-step OVERRIDES, most-specific-first (§9)
-slug = { model = "gpt-5.6-sol" }               # optional pre-build naming override
-plan = { model = "gpt-5.6-sol" }               # model only ⇒ routes to pi (serves GPT)
-code-review = { runtime = "pi", model = "kimi-k3" }  # exactly this runtime+model pair
+slug = { model = "openai/gpt-5.6-sol" }  # optional pre-build naming override
+plan = { model = "openai/gpt-5.6-sol", extensions = ["subagents", "web-access"] }  # model + pi extensions
+code-review = { runtime = "pi", model = "moonshotai/kimi-k3", extensions = ["web-access"] }  # pinned pair + web grounding
 
 [policy]
 stallRounds = 3

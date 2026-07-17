@@ -27,10 +27,11 @@ export interface RuntimeRegistration {
    */
   oneShot?: OneShotCompletion
   /**
-   * Model-id PREFIXES this runtime can serve, e.g. `['kimi-', 'gpt-']`. Prefix
-   * families — not an exhaustive id list — because the model landscape moves
-   * faster than the pipeline and the spec forbids hardcoding served ids: a new
-   * `kimi-*`/`gpt-*` model routes here without editing this list. Keep families
+   * Model-id PREFIXES this runtime can serve, e.g. `['openai/',
+   * 'kimi-coding/']`. Prefix families — not an exhaustive id list — because the
+   * model landscape moves faster than the pipeline and the spec forbids
+   * hardcoding served ids: a new model from either provider routes here without
+   * editing this list. Keep families
    * NARROW so two runtimes don't both claim a family (that surfaces as the
    * resolver's "multiple non-default supporters" loud error, never a silent
    * mis-route). `serves()` below is the matcher.
@@ -48,8 +49,9 @@ export interface RuntimeRegistration {
 export type RuntimeRegistry = Record<string, RuntimeRegistration>
 
 /**
- * Does this registration serve `model`? Prefix-family match: `kimi-k3` is
- * served by a registration declaring `kimi-`. Empty `servesModels` serves
+ * Does this registration serve `model`? Prefix-family match:
+ * `openai/gpt-5.6-sol` is served by a registration declaring `openai/`. Empty
+ * `servesModels` serves
  * nothing (a runtime that only runs via an explicit `defaultModel`/built-in
  * default and never via model-only routing).
  */

@@ -180,8 +180,8 @@ is an error, so a typo cannot silently disable a verifier.
 | `[verify]` | `steps = [...]` — the ordered verify phases | `[]` |
 | `[verify.<step>]` | `kind = "check"` needs `command` (a key in `[commands]`); `kind = "agent"` needs `skill`, optionally `needsServer` | `needsServer = false` |
 | `[finalize]` | `steps = [...]` — optional post-PR steps, failure-tolerant | `[]` |
-| `[agent]` | Repo-wide **default** on the two axes: `runtime` (which runtime executes the session) and `model` (which model it runs on). Both optional. | absent ⇒ the built-in fallback runtime + its own default model |
-| `[roles]` | Role → per-step **override** `{ runtime?, model? }`, most-specific-first (see below), including the optional pre-build `slug` naming role. Registered runtimes: `claude` (Claude models), `pi` (Kimi/GPT). | — |
+| `[agent]` | Repo-wide defaults for `runtime`, `model`, and the optional Pi `extensions` allowlist. | absent ⇒ the built-in fallback runtime + its own default model; extensions hermetic |
+| `[roles]` | Role → per-step override `{ runtime?, model?, extensions? }`, most-specific-first (see below), including the optional pre-build `slug` naming role. Registered runtimes: `claude` (Claude models), `pi` (provider-qualified Kimi/GPT models). | — |
 | `[policy]` | `stallRounds`, `maxVerifyAttempts`, `maxReconcileAttempts`, `maxReviewRounds` | `3`, `3`, `3`, `5` |
 | `[dispatcher]` | `capacity`, optional `readyLabels`, **required `readyState`** | `1`; `readyState` names the single dispatchable state and has no default (see below) |
 | `[server]` | Optional. `start` + `url` required; `readyTimeout` in seconds | `readyTimeout = 60` |
@@ -203,19 +203,25 @@ kind = "check"
 command = "test"
 ```
 
-**Runtime and model — two axes, one line each.** Every agent session runs on a
-`runtime` (the adapter that executes it) and a `model`. Set the repo-wide
-default in `[agent]`, override per step in `[roles]`:
+**Runtime, model, and extensions — set once, override per step.** Every agent
+session runs on a `runtime` (the adapter that executes it), a `model`, and — for
+the `pi` runtime — an optional `extensions` allowlist of installed Pi packages
+(e.g. `web-access`, `subagents`). Set the repo-wide default in `[agent]`,
+override per step in `[roles]`. Extensions are **off by default** (hermetic):
 
 ```toml
 [agent]
 runtime = "claude"                                   # no model ⇒ the runtime's own default
 
 [roles]
-slug        = { model = "gpt-5.6-sol" }              # optional pre-build naming override
-code-review = { runtime = "pi", model = "kimi-k3" }  # exactly this runtime + model
-plan        = { model = "gpt-5.6-sol" }              # model only ⇒ routes to pi (it serves GPT)
+slug        = { model = "openai/gpt-5.6-sol" }                                      # optional pre-build naming override
+code-review = { runtime = "pi", model = "moonshotai/kimi-k3", extensions = ["web-access"] }  # pinned pair + web grounding
+plan        = { model = "openai/gpt-5.6-sol", extensions = ["subagents", "web-access"] }     # model only ⇒ pi; plus extensions
 ```
+
+Grant `web-access`/`subagents` to plan and review so they can ground on real
+docs and fan out sub-agents; leave `implement` and `verify` hermetic so nothing
+external flows into committed code. `ab models [query]` looks up provider-qualified model ids.
 
 Overrides resolve **most-specific-first**: `runtime + model` pins the pair
 (a runtime that can't serve the model is a config error); `runtime` alone uses
@@ -226,9 +232,9 @@ the `[agent]` default. Two runtimes ship today: **`claude`** (Claude models)
 and **`pi`** (Kimi/Moonshot and GPT/OpenAI models). The whole config is
 resolved **before any build launches**, so a typo'd runtime fails loudly at
 `ab dispatch`, never mid-build. Slug naming follows the `[agent]` default unless
-`[roles].slug` overrides it. It is a tool-free one-shot completion, not a
-pipeline phase or resumable session; a runtime without that capability simply
-uses the deterministic title fallback.
+`[roles].slug` overrides it. Only its runtime/model selection applies: naming is
+a tool-free one-shot completion, not a pipeline phase or resumable session. A
+runtime without that capability simply uses the deterministic title fallback.
 
 ### 3. Point at a ticket source and set up auth
 
