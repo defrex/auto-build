@@ -27,9 +27,9 @@
  *     clamped.
  *
  * The model identifier is provider-qualified and flows from config
- * (`opts.model`, e.g. `openai/gpt-5.6-sol`), never hardcoded — the whole point
- * of the two-axis config is that the model is a config line, not a code
- * constant. `parsePiModel` splits it into the `(provider, id)` pair Pi's
+ * (`opts.model`, e.g. `openai/gpt-5.6-sol`), never hardcoded — runtime/model
+ * routing keeps the model in config rather than code. `parsePiModel` splits it
+ * into the `(provider, id)` pair Pi's
  * `ModelRuntime.getModel` wants.
  *
  * Sessions are deliberately non-interactive (build workspaces are disposable,
@@ -43,6 +43,11 @@ import type {
   AgentTurnResult,
   Transcript,
 } from '../types'
+import type {
+  OneShotCompletion,
+  OneShotCompletionInput,
+  OneShotCompletionResult,
+} from './one-shot'
 
 /** Built-in tool set enabled for a build session. `bash` is mandatory — the
  * agent invokes the `ab` CLI through it — and is the one we override with an
@@ -94,14 +99,15 @@ export interface PiSession {
    * Run one prompt to completion (Pi's `prompt()` resolves only after the full
    * run finishes, retries included) and return its text + per-turn usage.
    * `env` is the ambient+scoped env for THIS turn; the session overlays it onto
-   * the bash tool's subprocess env.
+   * the bash tool's subprocess env. `signal` aborts an in-flight one-shot turn;
+   * build-session turns omit it and remain resumable through the runner.
    */
-  prompt(text: string, env: Record<string, string>): Promise<PiTurn>
+  prompt(text: string, env: Record<string, string>, signal?: AbortSignal): Promise<PiTurn>
   /** Release the session (SDK `dispose()`). */
   dispose(): Promise<void> | void
 }
 
-/** The injectable boundary: create a live session for one build phase. */
+/** The injectable boundary: create a live session for a build phase or one-shot turn. */
 export type PiCreateSessionFn = (opts: {
   cwd: string
   model?: PiModelRef
@@ -217,11 +223,25 @@ const piSdkCreateSession: PiCreateSessionFn = async (opts) => {
     get sessionId() {
       return session.sessionId
     },
-    async prompt(text, env) {
+    async prompt(text, env, signal) {
       injectedEnv = env
       turnTexts = []
       const before = tokens()
-      await session.prompt(text)
+      let aborting: Promise<void> | undefined
+      const onAbort = (): void => {
+        // Handle abort rejection immediately; the caller still receives the
+        // signal's reason below, after the SDK has settled back to idle.
+        aborting ??= session.abort().catch(() => {})
+      }
+      if (signal !== undefined && signalAborted(signal)) throw abortError(signal)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        await session.prompt(text)
+      } finally {
+        signal?.removeEventListener('abort', onAbort)
+        if (aborting !== undefined) await aborting
+      }
+      if (signal !== undefined && signalAborted(signal)) throw abortError(signal)
       const after = tokens()
       return {
         text: turnTexts.join(''),
@@ -251,7 +271,7 @@ interface SessionState {
   turns: TurnRecord[]
 }
 
-export class PiAgentRunner implements AgentRunner {
+export class PiAgentRunner implements AgentRunner, OneShotCompletion {
   readonly name = 'pi'
 
   private readonly createSessionFn: PiCreateSessionFn
@@ -259,6 +279,30 @@ export class PiAgentRunner implements AgentRunner {
 
   constructor(opts: { createSessionFn?: PiCreateSessionFn } = {}) {
     this.createSessionFn = opts.createSessionFn ?? piSdkCreateSession
+  }
+
+  /** Pre-build judgment: one verbatim prompt, one model turn, and no tools.
+   * It deliberately creates no resumable AgentRunner session state. */
+  async complete(input: OneShotCompletionInput): Promise<OneShotCompletionResult> {
+    const model = input.model !== undefined ? parsePiModel(input.model) : undefined
+    const session = await this.createSessionFn({
+      cwd: input.cwd,
+      ...(model !== undefined ? { model } : {}),
+      // With no tools, Pi cannot enter a tool loop: this is one model turn.
+      tools: [],
+      // One-shot naming is hermetic even if the selected role grants extensions.
+      extensions: [],
+    })
+    try {
+      const turn = await session.prompt(
+        input.prompt,
+        { ...ambientEnv(), ...input.env },
+        input.signal,
+      )
+      return { text: turn.text }
+    } finally {
+      await session.dispose()
+    }
   }
 
   async start(
@@ -358,6 +402,16 @@ export class PiAgentRunner implements AgentRunner {
   private toResult(turn: PiTurn): AgentTurnResult {
     return { text: turn.text, usage: { ...turn.usage, turns: 1 } }
   }
+}
+
+function signalAborted(signal: AbortSignal): boolean {
+  return signal.aborted
+}
+
+function abortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason
+  const detail = signal.reason === undefined ? '' : `: ${String(signal.reason)}`
+  return new Error(`pi runtime: prompt aborted${detail}`)
 }
 
 function ambientEnv(): Record<string, string> {

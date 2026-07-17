@@ -26,6 +26,7 @@ interface RecordedCreate {
 interface RecordedPrompt {
   text: string
   env: Record<string, string>
+  signal?: AbortSignal
 }
 
 /**
@@ -56,8 +57,9 @@ function fakeSessions(
     let turn = 0
     return {
       sessionId: script.sessionId,
-      async prompt(text, env): Promise<PiTurn> {
-        prompts.push({ text, env })
+      async prompt(text, env, signal): Promise<PiTurn> {
+        prompts.push({ text, env, signal })
+        if (signal?.aborted === true) throw signal.reason
         const scripted = script.turns[turn++]
         if (scripted === undefined) {
           throw new Error(`fake session "${script.sessionId}": no scripted turn ${turn}`)
@@ -182,6 +184,66 @@ describe('PiAgentRunner.start', () => {
       delete process.env['AB_TEST_AMBIENT']
       delete process.env['AB_TEST_OVERRIDE']
     }
+  })
+})
+
+describe('PiAgentRunner.complete', () => {
+  test('runs one verbatim, tool-free, cancellable turn without opening a resumable session', async () => {
+    const { creates, prompts, disposed, createSessionFn } = fakeSessions([
+      {
+        sessionId: 'one-shot-id',
+        turns: [{ text: 'login-rate-limit', inputTokens: 4, outputTokens: 2 }],
+      },
+    ])
+    const runner = new PiAgentRunner({ createSessionFn })
+    const controller = new AbortController()
+
+    const result = await runner.complete({
+      prompt: 'name this spec verbatim',
+      cwd: '/repos/app',
+      env: { NAMING_TOKEN: 'secret' },
+      model: 'openai/gpt-5.6-sol',
+      signal: controller.signal,
+    })
+
+    expect(result).toEqual({ text: 'login-rate-limit' })
+    expect(creates[0]).toEqual({
+      cwd: '/repos/app',
+      model: { provider: 'openai', id: 'gpt-5.6-sol' },
+      tools: [],
+      extensions: [],
+    })
+    expect(prompts[0]?.text).toBe('name this spec verbatim')
+    expect(prompts[0]?.env['NAMING_TOKEN']).toBe('secret')
+    expect(prompts[0]?.signal).toBe(controller.signal)
+    expect(disposed).toEqual(['one-shot-id'])
+    await expect(runner.end({ id: 'one-shot-id', runner: 'pi' })).rejects.toThrow(
+      'unknown session "one-shot-id"',
+    )
+  })
+
+  test('forwards an already-aborted deadline and still disposes the one-shot session', async () => {
+    const { prompts, disposed, createSessionFn } = fakeSessions([
+      {
+        sessionId: 'cancelled-one-shot',
+        turns: [{ text: 'unused', inputTokens: 0, outputTokens: 0 }],
+      },
+    ])
+    const runner = new PiAgentRunner({ createSessionFn })
+    const controller = new AbortController()
+    controller.abort(new Error('naming deadline'))
+
+    await expect(
+      runner.complete({
+        prompt: 'name this spec',
+        cwd: '/repos/app',
+        env: {},
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow('naming deadline')
+
+    expect(prompts[0]?.signal).toBe(controller.signal)
+    expect(disposed).toEqual(['cancelled-one-shot'])
   })
 })
 
