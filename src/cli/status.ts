@@ -185,12 +185,19 @@ export function detail(
 ): BuildDetail {
   const state = reduceBuild(events)
   const summary = summarizeFrom(record, state, now)
-  // §15.6-A: a re-run after a failed verify restarts from the FIRST step at
-  // attempt+1, so only this attempt's results describe the current cycle.
+  // §15.6-A: only the CURRENT cycle's results describe the current code.
   // Without this filter an earlier cycle's passes read as current — wrong, and
   // wrong in the reassuring direction.
+  //
+  // The cycle test is `seq > verify.cycleSince`, NOT `attempt ===
+  // verify.attempt`: the latter is stale for the whole window between a verify
+  // failure and the next `verify.started`, where `verify.attempt` still names
+  // the failed cycle. `cycleSince` is the authoritative boundary the reducer
+  // and engine.ts already agree on (max of restart, code-review approve, and
+  // reconcile) — reading it here is what keeps this command's report equal to
+  // the projection used elsewhere rather than a second, drifting opinion.
   const steps = state.verify.results
-    .filter((result) => result.attempt === state.verify.attempt)
+    .filter((result) => result.seq > state.verify.cycleSince)
     .map((result) => ({ step: result.step, pass: result.pass }))
   return {
     ...summary,

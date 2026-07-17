@@ -332,9 +332,15 @@ filter matched nothing, not that the command failed. Widen it with `--queued`
 or `--all` before concluding a build doesn't exist.
 
 **`ab build status <slug>`** details one build: unresolved escalations, open
-sessions, verify progress for the current attempt, PR lifecycle, latest event,
+sessions, verify progress for the current cycle, PR lifecycle, latest event,
 heartbeat, and lease. `--events <n>` appends the newest `n` event envelopes in
 chronological order — the fastest way to see what a build actually just did.
+
+Verify progress covers the **current cycle** — the results since the latest
+code-review approve or reconcile. Implement and reconcile change the code, so a
+new cycle re-runs from the first step and earlier results describe code that no
+longer exists. An empty step list next to `attempt 1` therefore means the cycle
+restarted, not that verify never ran.
 `--json` and `--store <ref>` work the same here.
 
 Use `ab builds` to find the build; use `ab build status` to understand it.

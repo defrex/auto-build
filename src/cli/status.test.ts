@@ -286,7 +286,12 @@ describe('summarize', () => {
 describe('detail', () => {
   // §15.6-A: a re-run after a failed verify restarts from the first step at
   // attempt+1, so attempt 1's pass must NOT read as current progress.
-  test('verify progress covers the current attempt only', async () => {
+  //
+  // The cycle boundary is the code-review approve, not the attempt number: a
+  // verify failure routes back through implement ⇄ code-review (engine.ts:275),
+  // so attempt 2 is only ever reached across an approve. Seeding that approve
+  // is what makes this sequence a state the pipeline can actually be in.
+  test('verify progress covers the current cycle only', async () => {
     const store = new MemoryBuildStore({ clock: steppingClock() })
     await seedBuild(store, { slug: 'b1' })
     await store.append('b1', {
@@ -298,6 +303,16 @@ describe('detail', () => {
       actor: KERNEL,
       type: 'verify.completed',
       payload: { step: 'e2e', attempt: 1, pass: false },
+    })
+    await store.append('b1', {
+      actor: agentActor('code-review', 's_cr'),
+      type: 'code-review.verdict',
+      payload: {
+        round: 1,
+        verdict: 'approve',
+        findings: [],
+        artifact: { kind: 'code-review', rev: 0 },
+      },
     })
     await store.append('b1', {
       actor: KERNEL,
@@ -320,6 +335,40 @@ describe('detail', () => {
     const d = detail((await store.getBuild('b1'))!, await store.getEvents('b1'), NOW)
     expect(d.verify.steps).toEqual([{ step: 'unit', pass: true }])
     expect(d.verify.currentStep).toBeUndefined()
+  })
+
+  // The window where `attempt === verify.attempt` and the real cycle test
+  // disagree: after the approve that opens a new cycle, but before
+  // `verify.started` bumps the attempt. Here `verify.attempt` is still 1 — the
+  // FAILED cycle — so an attempt-keyed filter republishes attempt 1's pass as
+  // current progress, reporting a green step for code that no longer exists.
+  test('a cycle-opening approve retires the previous cycle before the next attempt starts', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await seedBuild(store, { slug: 'b1' })
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'verify.completed',
+      payload: { step: 'unit', attempt: 1, pass: true },
+    })
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'verify.completed',
+      payload: { step: 'e2e', attempt: 1, pass: false },
+    })
+    await store.append('b1', {
+      actor: agentActor('code-review', 's_cr'),
+      type: 'code-review.verdict',
+      payload: {
+        round: 1,
+        verdict: 'approve',
+        findings: [],
+        artifact: { kind: 'code-review', rev: 0 },
+      },
+    })
+    const d = detail((await store.getBuild('b1'))!, await store.getEvents('b1'), NOW)
+    // Still the failed cycle's attempt number — precisely why it can't be the filter.
+    expect(d.verify.attempt).toBe(1)
+    expect(d.verify.steps).toEqual([])
   })
 
   test('a failed step in the current attempt surfaces as a failure', async () => {
