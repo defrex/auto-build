@@ -178,13 +178,17 @@ async function defaultWire(config: Config, opts: DispatchOpts): Promise<Dispatch
       pi: {
         runner: new PiAgentRunner(),
         servesModels: [
+          // OAuth coding providers (what `pi login` writes to auth.json).
+          'openai-codex/',
+          'kimi-coding/',
+          // API-key providers, for keys supplied via env/auth.json.
           'openai/',
           'moonshotai/',
           'cloudflare-workers-ai/',
           'anthropic/',
           'openrouter/',
         ],
-        defaultModel: 'moonshotai/kimi-k3',
+        defaultModel: 'kimi-coding/k3',
       },
     },
     defaultRuntime: 'claude',
