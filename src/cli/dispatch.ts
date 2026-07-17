@@ -46,6 +46,7 @@ import { createTicketSource } from '../ports/tickets/create'
 import type { Forge, TicketSource, WorkspaceProvider } from '../ports/types'
 import { GitWorktreeProvider, type Exec } from '../ports/workspace/git-worktree'
 import { BuildRunner, LeaseHeldError } from '../processes/build-runner'
+import { HarvestRunner } from '../processes/harvest-runner'
 import { Dispatcher } from '../processes/dispatcher'
 import { RemoteBuildStore } from '../store/remote/client'
 import { DEFAULT_LOCAL_ROOT } from '../store/local/store'
@@ -313,6 +314,7 @@ class DispatchLoop {
       repo: opts.targetRepo,
       exec: opts.exec,
       launchRunner: (slug) => this.launchRunner(slug),
+      runHarvest: () => this.runHarvest(),
       ...(nameSlug !== undefined ? { nameSlug } : {}),
       ids: wiring.ids,
       clock: wiring.clock,
@@ -477,6 +479,34 @@ class DispatchLoop {
    * can drain it; a LeaseHeldError is expected (another runner owns it) and
    * only noted.
    */
+  private async runHarvest(): Promise<
+    Awaited<ReturnType<HarvestRunner['run']>>
+  > {
+    const { store, tickets, runtimes, defaultRuntime, ids, clock, storeRef, token } =
+      this.wiring
+    const runner = new HarvestRunner({
+      store,
+      tickets,
+      config: this.config,
+      runtimes,
+      defaultRuntime,
+      repo: this.opts.targetRepo,
+      workspacePath: this.opts.targetRepo,
+      ids,
+      clock,
+      instance: `${this.host}-harvest-${ids('inst')}`,
+      sessionEnv: {
+        AB_STORE: storeRef,
+        ...(token !== undefined ? { AB_TOKEN: token } : {}),
+      },
+    })
+    const result = await runner.run()
+    if (result.outcome !== 'idle' && result.outcome !== 'held') {
+      this.say(`harvest ${result.run} ${result.outcome}`)
+    }
+    return result
+  }
+
   private async launchRunner(slug: string): Promise<void> {
     const { store, runtimes, defaultRuntime, ids, clock, storeRef, token } = this.wiring
     const record = await store.getBuild(slug)
@@ -615,12 +645,22 @@ class DispatchLoop {
       entries.push({ record, state: reduceBuild(events), events })
     }
     const previousSlugs = this.model?.builds.map((build) => build.slug) ?? []
-    const projected = buildDashboard(entries, this.config, {
-      repo: this.opts.targetRepo,
-      mode: this.opts.once === true ? 'once' : 'watch',
-      capacity: this.config.dispatcher.capacity,
-      drained: this.drained,
-    })
+    const repoRecord = await this.wiring.store.getRepo(this.opts.targetRepo)
+    const harvestEvents =
+      repoRecord === null
+        ? []
+        : await this.wiring.store.getRepoEvents(this.opts.targetRepo)
+    const projected = buildDashboard(
+      entries,
+      this.config,
+      {
+        repo: this.opts.targetRepo,
+        mode: this.opts.once === true ? 'once' : 'watch',
+        capacity: this.config.dispatcher.capacity,
+        drained: this.drained,
+      },
+      harvestEvents,
+    )
     const nextSlugs = projected.builds.map((build) => build.slug)
     this.selectedSlug = reconcileSelection(
       previousSlugs,

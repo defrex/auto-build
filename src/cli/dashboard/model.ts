@@ -36,10 +36,12 @@
  * reducer nor the engine is touched.
  */
 import type { AbEvent } from '../../events/catalog'
+import type { HarvestEvent } from '../../events/harvest'
 import type { Config } from '../../config/schema'
 import type { BuildState, PhaseContext, PrLifecycle } from '../../kernel/reducer'
 import { verifyPhase } from '../../ontology'
 import type { BuildRecord } from '../../store/types'
+import { reduceHarvest } from '../../kernel/harvest'
 
 /** The only statuses a listed build can have — queued/done/aborted are
  * filtered out entirely (they are not active work). */
@@ -78,6 +80,16 @@ export interface PipelineStep {
   timing?: StepTiming
 }
 
+export interface DashboardHarvest {
+  kind: 'harvest'
+  run: string
+  status: 'running' | 'completed' | 'escalated' | 'failed'
+  steps: PipelineStep[]
+  observations: number
+  rounds: number
+  detail?: string
+}
+
 export interface DashboardBuild {
   slug: string
   status: EffectiveStatus
@@ -104,6 +116,14 @@ export interface DashboardModel {
   /** Slug identity, never a row index. */
   selectedSlug?: string
   builds: DashboardBuild[]
+  /** Latest run remains visible after terminal completion until a newer run
+   * replaces it. It is display-only and never enters build selection. */
+  harvest?: DashboardHarvest
+  /** Discriminated shared-row projection for consumers that render both. */
+  items?: Array<
+    | ({ kind: 'build' } & DashboardBuild)
+    | DashboardHarvest
+  >
 }
 
 /**
@@ -571,6 +591,97 @@ export function projectBuild(
   }
 }
 
+function harvestStepTiming(
+  occurrences: Array<{
+    step: string
+    startedAt: string
+    completedAt?: string
+  }>,
+  name: string,
+): StepTiming | undefined {
+  const matching = occurrences.filter((occurrence) => occurrence.step === name)
+  if (matching.length === 0) return undefined
+  let accumulatedMs = 0
+  let runningSince: number | undefined
+  for (const occurrence of matching) {
+    const start = Date.parse(occurrence.startedAt)
+    if (occurrence.completedAt !== undefined) {
+      accumulatedMs += Math.max(0, Date.parse(occurrence.completedAt) - start)
+    } else {
+      runningSince = start
+    }
+  }
+  return {
+    accumulatedMs,
+    ...(runningSince !== undefined ? { runningSince } : {}),
+  }
+}
+
+/** Latest repository harvest as a step row. Terminal runs deliberately stay
+ * visible until replaced, so a fast --once workflow is still observable. */
+export function projectHarvest(
+  events: HarvestEvent[],
+): DashboardHarvest | undefined {
+  const run = reduceHarvest(events).latest
+  if (run === undefined) return undefined
+  const terminal = run.status !== 'running'
+  const current = (name: string): boolean => {
+    if (terminal) return false
+    const latest = [...run.steps]
+      .reverse()
+      .find((occurrence) => occurrence.step === name)
+    return latest !== undefined && latest.completedSeq === undefined
+  }
+  const hasCompleted = (name: string): boolean =>
+    run.steps.some(
+      (occurrence) =>
+        occurrence.step === name && occurrence.completedSeq !== undefined,
+    )
+  const rounds = Math.max(
+    0,
+    ...run.proposals.map((proposal) => proposal.round),
+    ...run.reviews.map((review) => review.round),
+    ...run.steps.map((occurrence) => occurrence.round ?? 0),
+  )
+  const count = rounds > 1 ? rounds : undefined
+  const approved = run.reviews.some((review) => review.verdict === 'approve')
+  const synthOutput = run.proposals.length > 0
+  const reviewOutput = run.reviews.length > 0
+  const steps: PipelineStep[] = [
+    step('scan', hasCompleted('scan'), current('scan'), {
+      timing: harvestStepTiming(run.steps, 'scan'),
+    }),
+    step('synthesize', approved || terminal, current('synthesize'), {
+      producedOutput: synthOutput,
+      count,
+      timing: harvestStepTiming(run.steps, 'synthesize'),
+    }),
+    step('review', approved || terminal, current('review'), {
+      producedOutput: reviewOutput,
+      count,
+      timing: harvestStepTiming(run.steps, 'review'),
+    }),
+    step('file', run.status === 'completed', current('file'), {
+      producedOutput: hasCompleted('file'),
+      qualifier: run.status === 'failed' ? 'failed' : undefined,
+      timing: harvestStepTiming(run.steps, 'file'),
+    }),
+  ]
+  return {
+    kind: 'harvest',
+    run: run.run,
+    status: run.status,
+    steps,
+    observations: run.observations.length,
+    rounds,
+    ...(run.escalation !== undefined
+      ? { detail: run.escalation.reason }
+      : run.failure !== undefined
+        ? { detail: run.failure.error }
+        : {}),
+  }
+}
+
 /** Every active build, sorted by slug — a stable frame, so a redraw never
  * reorders rows under the operator's eyes. */
 export function buildDashboard(
@@ -583,11 +694,13 @@ export function buildDashboard(
     drained?: boolean
     selectedSlug?: string
   },
+  harvestEvents: HarvestEvent[] = [],
 ): DashboardModel {
   const builds = entries
     .map(({ record, state, events }) => projectBuild(record, state, config, events))
     .filter((build): build is DashboardBuild => build !== null)
     .sort((a, b) => a.slug.localeCompare(b.slug))
+  const harvest = projectHarvest(harvestEvents)
   return {
     repo: header.repo,
     mode: header.mode,
@@ -595,5 +708,10 @@ export function buildDashboard(
     drained: header.drained ?? false,
     ...(header.selectedSlug !== undefined ? { selectedSlug: header.selectedSlug } : {}),
     builds,
+    ...(harvest !== undefined ? { harvest } : {}),
+    items: [
+      ...(harvest !== undefined ? [harvest] : []),
+      ...builds.map((build) => ({ kind: 'build' as const, ...build })),
+    ],
   }
 }
