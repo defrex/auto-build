@@ -72,6 +72,9 @@ stallRounds = 3
 
 [dispatcher]
 capacity = 2
+
+[tickets]
+source = "file"
 readyLabels = ["autobuild"]
 readyState = "Ready"
 `

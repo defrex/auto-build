@@ -138,7 +138,7 @@ describe('abInit — fresh install', () => {
     // reintroduce provider-dependent all-states eligibility (AUT-10).
     await abInit({ targetRepo: target })
     const config = parseConfig(await readFile(join(target, 'autobuild.toml'), 'utf8'))
-    expect(config.dispatcher.readyState).toBe('ready')
+    expect(config.tickets.readyState).toBe('ready')
   })
 
   test('distRoot defaults relative to the module — identical to an explicit distRoot', async () => {
