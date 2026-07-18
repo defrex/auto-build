@@ -27,9 +27,10 @@ export async function runBinary(
 
   const command = argv[0]
 
-  // Sessionless commands take a repo path, not a build, so they must work with
-  // no AB_* environment set. The list lives in main.ts beside the switch that
-  // implements them; this wiring only routes on it.
+  // Sessionless commands resolve their own repository/store and do not require
+  // a phase tuple; durable controls also take a target slug and inspect raw
+  // AB_SESSION/AB_BUILD only to reject self-control. The list lives in main.ts
+  // beside the switch that implements them; this wiring only routes on it.
   if (
     command === undefined ||
     SESSIONLESS_COMMANDS.has(command) ||

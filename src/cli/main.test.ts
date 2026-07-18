@@ -8,7 +8,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { KERNEL } from '../events/envelope'
+import { KERNEL, agentActor } from '../events/envelope'
+import { openLocalStore } from '../store/local/store'
 import type { MemoryBuildStore } from '../store/memory'
 import { runCli, SESSIONLESS_COMMANDS } from './main'
 import {
@@ -57,13 +58,22 @@ describe('runCli — routing and exit codes', () => {
     }
   })
 
-  test('help documents the status commands, their defaults, and their flags', async () => {
+  test('help documents status and every sessionless build-control command', async () => {
     const d = deps()
     expect(await runCli(['help'], d)).toBe(0)
     const help = d.out.join('\n')
     expect(help).toContain('ab builds [--queued] [--all] [--json] [--store <ref>]')
     expect(help).toContain('ab build status <slug> [--events <n>] [--json] [--store <ref>]')
     expect(help).toContain('running, paused, blocked')
+    for (const command of [
+      'ab pause <slug>',
+      'ab resume <slug>',
+      'ab auto-merge <slug> <on|off>',
+      'ab answer <slug>',
+      'ab abort <slug>',
+    ]) {
+      expect(help).toContain(command)
+    }
   })
 
   test('an unknown command prints the help and exits 1', async () => {
@@ -97,9 +107,18 @@ describe('SESSIONLESS_COMMANDS', () => {
   // resolveCliEnv and exits 1 on absent AB_* before routing. runCli tests
   // cannot see that failure — they never traverse the binary — so the set
   // itself is asserted here, and the binary is smoke-tested in bin-ab.test.ts.
-  test('contains the status commands', () => {
-    expect(SESSIONLESS_COMMANDS.has('builds')).toBe(true)
-    expect(SESSIONLESS_COMMANDS.has('build')).toBe(true)
+  test('contains the status and build-control commands', () => {
+    for (const command of [
+      'builds',
+      'build',
+      'pause',
+      'resume',
+      'auto-merge',
+      'answer',
+      'abort',
+    ]) {
+      expect(SESSIONLESS_COMMANDS.has(command)).toBe(true)
+    }
   })
 
   test('every literal formerly hardcoded in bin/ab.ts survives the lift', () => {
@@ -247,6 +266,208 @@ describe('runCli — builds / build status routing', () => {
     const d2 = deps()
     expect(await runCli(['observe', '--kind', 'followup', '--events', '3', 'x'], d2)).toBe(1)
     expect(d2.err.join('\n')).toContain('unknown flag --events')
+  })
+})
+
+describe('runCli — sessionless build controls', () => {
+  const slug = 'control-build'
+
+  async function seedControlStore(
+    storeRef: string,
+    opts: { escalations?: string[]; queuedSlug?: string } = {},
+  ): Promise<void> {
+    const local = openLocalStore(storeRef)
+    await local.createBuild({ slug, repo: tmp })
+    await local.append(slug, {
+      actor: KERNEL,
+      type: 'runner.attached',
+      payload: { instance: 'runner-1', host: 'host-1', resumedFromSeq: 0 },
+    })
+    for (const id of opts.escalations ?? []) {
+      await local.append(slug, {
+        actor: agentActor('implement', `session-${id}`),
+        type: 'escalation.raised',
+        payload: {
+          id,
+          phase: 'implement',
+          round: 1,
+          source: 'agent',
+          question: `Question ${id}?`,
+        },
+      })
+    }
+    if (opts.queuedSlug !== undefined) {
+      await local.createBuild({ slug: opts.queuedSlug, repo: tmp })
+    }
+    await local.close()
+  }
+
+  function controlDeps(
+    storeRef: string,
+    env: Record<string, string | undefined> = {},
+  ) {
+    const out: string[] = []
+    const err: string[] = []
+    return {
+      workspacePath: tmp,
+      stdout: (line: string) => out.push(line),
+      stderr: (line: string) => err.push(line),
+      exec: async () => ({ stdout: '', stderr: 'not a git repo', exitCode: 128 }),
+      processEnv: { AB_STORE: storeRef, USER: 'cli-op', ...env },
+      out,
+      err,
+    }
+  }
+
+  test('routes every explicit command to its durable event and joins answer text', async () => {
+    const storeRef = join(tmp, 'controls-store')
+    await seedControlStore(storeRef, { escalations: ['esc-1', 'esc-2'] })
+    const invocations = [
+      ['pause', slug],
+      ['resume', slug],
+      ['auto-merge', slug, 'on'],
+      ['auto-merge', slug, 'off'],
+      ['abort', slug],
+      ['answer', slug, 'Use', 'the', 'safe', 'path.'],
+    ]
+    for (const argv of invocations) {
+      const d = controlDeps(storeRef)
+      expect(await runCli(argv, d)).toBe(0)
+      expect(d.err).toEqual([])
+      expect(d.out).toHaveLength(1)
+    }
+
+    const local = openLocalStore(storeRef)
+    const events = await local.getEvents(slug)
+    expect(events.slice(-7).map((event) => event.type)).toEqual([
+      'build.pause-requested',
+      'build.resume-requested',
+      'build.auto-merge-requested',
+      'build.auto-merge-cancelled',
+      'build.abort-requested',
+      'escalation.answered',
+      'escalation.answered',
+    ])
+    const answers = events.filter((event) => event.type === 'escalation.answered')
+    expect(answers.map((event) => event.payload.answer)).toEqual([
+      'Use the safe path.',
+      'Use the safe path.',
+    ])
+    expect(
+      events.slice(-7).every(
+        (event) => event.actor.kind === 'human' && event.actor.user === 'cli-op',
+      ),
+    ).toBe(true)
+    await local.close()
+  })
+
+  test('answer with no text selects retry', async () => {
+    const storeRef = join(tmp, 'retry-store')
+    await seedControlStore(storeRef, { escalations: ['esc-retry'] })
+    const d = controlDeps(storeRef)
+    expect(await runCli(['answer', slug], d)).toBe(0)
+
+    const local = openLocalStore(storeRef)
+    const event = (await local.getEvents(slug)).at(-1)
+    expect(event?.type).toBe('escalation.answered')
+    if (event?.type === 'escalation.answered') {
+      expect(event.payload.resolution).toBe('retry')
+      expect(event.payload.answer).toContain('no feedback')
+    }
+    await local.close()
+  })
+
+  test('every verb refuses an own-phase target before appending', async () => {
+    const storeRef = join(tmp, 'self-store')
+    await seedControlStore(storeRef, { escalations: ['esc-self'] })
+    const attempts = [
+      ['pause', slug],
+      ['resume', slug],
+      ['auto-merge', slug, 'on'],
+      ['auto-merge', slug, 'off'],
+      ['answer', slug, 'retry please'],
+      ['abort', slug],
+    ]
+    for (const argv of attempts) {
+      const d = controlDeps(storeRef, {
+        AB_SESSION: 'phase-session',
+        AB_BUILD: slug,
+      })
+      expect(await runCli(argv, d)).toBe(1)
+      expect(d.err.join('\n')).toContain('own phase session')
+      expect(d.err.join('\n')).toContain('AB_SESSION/AB_BUILD conflict')
+    }
+
+    const local = openLocalStore(storeRef)
+    expect(await local.getEvents(slug)).toHaveLength(2)
+    await local.close()
+  })
+
+  test('a phase session may control a different build', async () => {
+    const storeRef = join(tmp, 'other-build-store')
+    await seedControlStore(storeRef)
+    const d = controlDeps(storeRef, {
+      AB_SESSION: 'phase-session',
+      AB_BUILD: 'another-build',
+    })
+    expect(await runCli(['pause', slug], d)).toBe(0)
+
+    const local = openLocalStore(storeRef)
+    expect((await local.getEvents(slug)).at(-1)?.type).toBe(
+      'build.pause-requested',
+    )
+    await local.close()
+  })
+
+  test('rejects missing, inactive, and unblocked targets with named conflicts', async () => {
+    const storeRef = join(tmp, 'precondition-store')
+    await seedControlStore(storeRef, { queuedSlug: 'queued-build' })
+
+    const missing = controlDeps(storeRef)
+    expect(await runCli(['abort', 'missing-build'], missing)).toBe(1)
+    expect(missing.err.join('\n')).toContain('no build "missing-build"')
+
+    const inactive = controlDeps(storeRef)
+    expect(await runCli(['pause', 'queued-build'], inactive)).toBe(1)
+    expect(inactive.err.join('\n')).toContain('not active (status: queued)')
+
+    const unblocked = controlDeps(storeRef)
+    expect(await runCli(['answer', slug, 'guidance'], unblocked)).toBe(1)
+    expect(unblocked.err.join('\n')).toContain('no open escalations')
+  })
+
+  test('--store overrides AB_STORE for every control shell', async () => {
+    const explicit = join(tmp, 'explicit-controls')
+    await seedControlStore(explicit)
+    const d = controlDeps(join(tmp, 'wrong-store'))
+    expect(
+      await runCli(['pause', slug, '--store', explicit], d),
+    ).toBe(0)
+
+    const local = openLocalStore(explicit)
+    expect((await local.getEvents(slug)).at(-1)?.type).toBe(
+      'build.pause-requested',
+    )
+    await local.close()
+  })
+
+  test('command grammars reject missing values, extras, bad settings, and flags', async () => {
+    const cases = [
+      ['pause'],
+      ['pause', slug, 'extra'],
+      ['resume', slug, '--unknown'],
+      ['auto-merge', slug],
+      ['auto-merge', slug, 'maybe'],
+      ['answer'],
+      ['answer', slug, '--unknown'],
+      ['abort', slug, '--store', '--unknown'],
+    ]
+    for (const argv of cases) {
+      const d = controlDeps(join(tmp, 'grammar-store'))
+      expect(await runCli(argv, d)).toBe(1)
+      expect(d.err.join('\n')).toContain('usage: ab')
+      expect(d.out).toEqual([])
+    }
   })
 })
 

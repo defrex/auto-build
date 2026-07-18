@@ -57,10 +57,13 @@ function testEnv(): Record<string, string> {
   }
 }
 
-async function runBin(args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+async function runBin(
+  args: string[],
+  env: Record<string, string> = {},
+): Promise<{ stdout: string; stderr: string; code: number }> {
   return collect(Bun.spawn(['bun', BIN, ...args], {
     cwd: tmp,
-    env: testEnv(),
+    env: { ...testEnv(), ...env },
     stdout: 'pipe',
     stderr: 'pipe',
   }))
@@ -121,6 +124,52 @@ test('ab build status runs sessionless and exits 1 on an unknown slug', async ()
   expect(result.code).toBe(1)
   expect(result.stderr).toContain('no-such-build')
   expect(result.stderr).not.toContain('AB_BUILD')
+})
+
+test('a real sessionless control command reaches the store and writes a human event', async () => {
+  const local = openLocalStore(join(tmp, 'store'))
+  await local.createBuild({ slug: 'controlled', repo: await realpath(tmp) })
+  await local.append('controlled', {
+    actor: KERNEL,
+    type: 'runner.attached',
+    payload: { instance: 'runner-1', host: 'host-1', resumedFromSeq: 0 },
+  })
+  await local.close()
+
+  const result = await runBin(['pause', 'controlled'])
+  expect(result.code).toBe(0)
+  expect(result.stderr).toBe('')
+  expect(result.stdout).toContain('pause requested')
+
+  const reopened = openLocalStore(join(tmp, 'store'))
+  const event = (await reopened.getEvents('controlled')).at(-1)
+  expect(event?.type).toBe('build.pause-requested')
+  expect(event?.actor).toEqual({ kind: 'human', user: 'dashboard' })
+  await reopened.close()
+})
+
+test('the real binary rejects an own-phase control without changing the log', async () => {
+  const local = openLocalStore(join(tmp, 'store'))
+  await local.createBuild({ slug: 'self-controlled', repo: await realpath(tmp) })
+  await local.append('self-controlled', {
+    actor: KERNEL,
+    type: 'runner.attached',
+    payload: { instance: 'runner-1', host: 'host-1', resumedFromSeq: 0 },
+  })
+  const before = await local.getEvents('self-controlled')
+  await local.close()
+
+  const result = await runBin(['abort', 'self-controlled'], {
+    AB_SESSION: 'phase-session',
+    AB_BUILD: 'self-controlled',
+  })
+  expect(result.code).toBe(1)
+  expect(result.stderr).toContain('own phase session')
+  expect(result.stderr).toContain('AB_SESSION/AB_BUILD conflict')
+
+  const reopened = openLocalStore(join(tmp, 'store'))
+  expect(await reopened.getEvents('self-controlled')).toEqual(before)
+  await reopened.close()
 })
 
 test('implicit state is shared by a main checkout and its linked worktree and ignores HOME', async () => {
