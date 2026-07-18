@@ -642,6 +642,16 @@ Each repository owns one state tree under its main checkout by default:
 | `.autobuild/worktrees/ab-<slug>/` | One git worktree per build. The branch is `ab/<slug>`; the directory name flattens it — every run of characters outside `[A-Za-z0-9._-]` becomes a `-`, so branch `ab/add-rate-limiting` lives at `worktrees/ab-add-rate-limiting/`. |
 | `.autobuild/tickets/` | Default `file` ticket source (`triage/`, `ready/`, `doing/`, `done/`) |
 
+When a build branch is first created, the Git workspace fetches the configured
+base branch's current `origin` tip into a build-specific internal ref and cuts
+the branch from that immutable commit. It does not move local `main`,
+`origin/main`, tags, or `FETCH_HEAD`, so concurrent dispatches cannot overwrite
+one another's selected base. If origin is unavailable, dispatch continues from
+the local base; `workspace.provisioned` records the actual SHA, the `local`
+fallback, and Git's diagnostic. Re-provisioning an existing build branch never
+runs that refresh: it resumes at the branch's current tip without rewinding,
+rebasing, or re-cutting it.
+
 Git's repository/worktree metadata identifies the main checkout, so commands
 run from an autobuild-created linked worktree use the same state tree and ticket
 tracker as the main checkout. Submodules and checkouts using a separate Git

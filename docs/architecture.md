@@ -75,6 +75,27 @@ the internal `slug` role through the normal runtime/model resolver.
 validation, deterministic title fallback, and store-wide numeric collision
 suffix. Existing build records have no mutation path and are never re-slugged.
 
+## Workspace base selection
+
+`src/ports/workspace/git-worktree.ts` owns creation-time Git base selection.
+For a missing build branch it fetches the configured base from `origin` into
+`refs/autobuild/provision/<branch>/base` with no tags, `FETCH_HEAD`, configured
+refmap, or operator-ref updates; resolves that private ref; and creates from the
+immutable SHA. The raw branch path makes the destination unique across
+concurrent builds. A remote fetch/resolution failure falls back to the fully
+qualified local base and retains the Git diagnostic; failure to resolve that
+local commit remains fatal.
+
+The port returns `WorkspaceProvisionResult.base`, whose shared schema lives in
+`src/ontology.ts`. `src/processes/dispatcher.ts` copies it into the strict
+`workspace.provisioned` payload in `src/events/payloads.ts`, so the event log
+records both the actual SHA and `remote | local | existing` source. Existing
+worktree and branch checks precede the fetch, preserving resume at the branch's
+current tip without refresh, rewind, or re-cut. This path is intentionally
+separate from `BuildRunner.refreshReconcileBase`: reconcile refreshes an
+in-flight PR's merge target and fails closed, whereas first provisioning falls
+back locally so dispatch remains available.
+
 ## Agent turn failures
 
 `src/ports/types.ts` makes an agent turn a discriminated completed/failed
