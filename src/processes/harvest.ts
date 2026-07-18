@@ -1,6 +1,5 @@
 /** Deterministic halves of observation harvest: scan, dedup, validation, and
  * proposal rendering. Agent judgment is deliberately absent from this file. */
-import type { AbEvent } from '../events/catalog'
 import type { ArtifactRef } from '../ontology'
 import {
   harvestProposalSetSchema,
@@ -286,9 +285,4 @@ export async function loadScanPacket(
   return harvestScanPacketSchema.parse(
     JSON.parse(new TextDecoder().decode(artifact.content)),
   )
-}
-
-/** Useful in tests and diagnostics: only observation events are relevant. */
-export function observationEvents(events: AbEvent[]): AbEvent[] {
-  return events.filter((event) => event.type === 'observation.recorded')
 }

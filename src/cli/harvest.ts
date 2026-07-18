@@ -13,7 +13,6 @@ import {
 } from '../harvest/schema'
 import type { IdSource } from '../ids'
 import {
-  openHarvestRun,
   proposalArtifactForRound,
   reduceHarvest,
   type HarvestRunState,
@@ -503,8 +502,4 @@ export async function abHarvestStatus(opts: {
   } finally {
     await store.close()
   }
-}
-
-export function activeHarvestRun(events: HarvestEvent[]): HarvestRunState | undefined {
-  return openHarvestRun(reduceHarvest(events))
 }
