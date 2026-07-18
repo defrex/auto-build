@@ -26,7 +26,6 @@ import { join } from 'node:path'
 import { loadConfig } from '../config/load'
 import type { Config } from '../config/schema'
 import type { AbEvent } from '../events/catalog'
-import { humanActor } from '../events/envelope'
 import {
   randomIds,
   randomUuids,
@@ -69,6 +68,11 @@ import {
   type TickReport,
 } from '../processes/dispatcher'
 import { RemoteBuildStore } from '../store/remote/client'
+import {
+  BuildControlError,
+  controlBuild,
+  type BuildControlResult,
+} from './build-control'
 import { resolveRepoState, resolveRepoStatePaths } from './repo-state'
 import { resolveStore } from './store-ref'
 import { systemClock, type BuildStore, type Clock } from '../store/types'
@@ -115,12 +119,6 @@ const DASHBOARD_POLL_MS = 500
  * costs nothing. `--once` runs no tick timer — it renders one snapshot per
  * state (AC 8). */
 const DASHBOARD_TICK_MS = 250
-
-/** `escalation.answered.answer` is schema-nonempty even when `retry` carries no
- * guidance. This fixed audit description makes that absence explicit and is
- * never materialized as phase feedback because the resolution is `retry`. */
-const BARE_RETRY_ANSWER =
-  'Operator requested a bare retry from the dispatch dashboard with no feedback'
 
 type DashboardAction = 'up' | 'down' | 'auto-merge' | 'pause' | 'drain'
 
@@ -407,14 +405,6 @@ class DispatchLoop {
     )
   }
 
-  private dashboardUser(): string {
-    for (const name of ['USER', 'USERNAME']) {
-      const value = this.opts.env[name]?.trim()
-      if (value !== undefined && value !== '') return value
-    }
-    return 'dashboard'
-  }
-
   /** Overlay process-local controls onto the latest store projection. */
   private syncModelControls(): void {
     if (this.model === undefined) return
@@ -449,9 +439,9 @@ class DispatchLoop {
     this.paint()
   }
 
-  private async selectedBuild(
+  private selectedBuildSlug(
     action: 'auto-merge' | 'pause/resume',
-  ): Promise<{ slug: string; state: BuildState } | undefined> {
+  ): string | undefined {
     const selection = this.selection
     if (selection === undefined) {
       this.warn('dashboard action ignored: no active row is selected')
@@ -465,48 +455,54 @@ class DispatchLoop {
       )
       return undefined
     }
-    const slug = selection.slug
-    const record = await this.wiring.store.getBuild(slug)
-    if (record === null || record.repo !== this.opts.targetRepo) {
-      this.warn(`dashboard action ignored: selected build ${slug} disappeared`)
-      await this.renderOnce()
-      return undefined
-    }
-    const state = reduceBuild(await this.wiring.store.getEvents(slug))
-    if (!['running', 'paused', 'blocked'].includes(state.status)) {
-      this.warn(`dashboard action ignored: selected build ${slug} is no longer active`)
-      await this.renderOnce()
-      return undefined
-    }
-    return { slug, state }
+    return selection.slug
+  }
+
+  private async ignoreControlError(
+    surface: 'action' | 'resume',
+    error: unknown,
+  ): Promise<boolean> {
+    if (!(error instanceof BuildControlError)) return false
+    this.warn(`dashboard ${surface} ignored: ${error.message}`)
+    await this.renderOnce()
+    return true
   }
 
   private async togglePause(): Promise<void> {
-    const selected = await this.selectedBuild('pause/resume')
-    if (selected === undefined) return
+    const slug = this.selectedBuildSlug('pause/resume')
+    if (slug === undefined) return
 
-    // A blocker is an escalation gate, not a pause state. It takes precedence
-    // even when the reducer authoritatively reports `paused` (the dashboard
-    // intentionally displays that overlap as BLOCKED + `(paused)`). Opening
-    // the field is process-local and writes nothing until Enter.
-    if (selected.state.openEscalations.length > 0) {
+    let result: BuildControlResult
+    try {
+      result = await controlBuild({
+        store: this.wiring.store,
+        repo: this.opts.targetRepo,
+        slug,
+        env: this.opts.env,
+        action: { kind: 'toggle-pause' },
+      })
+    } catch (error) {
+      if (await this.ignoreControlError('action', error)) return
+      throw error
+    }
+
+    if (result.kind === 'answer-required') {
       this.resumePrompt = {
-        slug: selected.slug,
-        escalationIds: selected.state.openEscalations.map((item) => item.id),
+        slug,
+        escalationIds: result.escalationIds,
         value: '',
       }
       this.syncModelControls()
       this.paint()
       return
     }
-
-    const resume = selected.state.status === 'paused'
-    await this.wiring.store.append(selected.slug, {
-      actor: humanActor(this.dashboardUser()),
-      type: resume ? 'build.resume-requested' : 'build.pause-requested',
-      payload: {},
-    })
-    this.say(`build ${selected.slug}: ${resume ? 'resume' : 'pause'} requested`)
+    if (
+      result.kind !== 'command' ||
+      (result.command !== 'pause' && result.command !== 'resume')
+    ) {
+      throw new Error('build-control returned an invalid pause toggle result')
+    }
+    this.say(`build ${slug}: ${result.command} requested`)
     await this.renderOnce()
   }
 
@@ -517,84 +513,70 @@ class DispatchLoop {
     this.paint()
   }
 
-  /** Submit the prompt as existing escalation-answer events. Empty input is a
-   * retry with no feedback; nonempty input is authoritative guidance. */
+  /** Submit the prompt through the shared build-control service. Empty input
+   * is a retry; nonempty input is authoritative guidance. */
   private async submitResume(prompt: ResumePrompt): Promise<void> {
-    const record = await this.wiring.store.getBuild(prompt.slug)
-    if (record === null || record.repo !== this.opts.targetRepo) {
-      this.clearResumePrompt(prompt.slug)
-      this.warn(`dashboard resume ignored: build ${prompt.slug} disappeared`)
-      await this.renderOnce()
-      return
-    }
-
-    const state = reduceBuild(await this.wiring.store.getEvents(prompt.slug))
-    if (!['running', 'paused', 'blocked'].includes(state.status)) {
-      this.clearResumePrompt(prompt.slug)
-      this.warn(`dashboard resume ignored: build ${prompt.slug} is no longer active`)
-      await this.renderOnce()
-      return
-    }
-
-    const captured = new Set(prompt.escalationIds)
-    const open = state.openEscalations.filter((item) => captured.has(item.id))
-    if (open.length === 0) {
-      this.clearResumePrompt(prompt.slug)
-      this.warn(`dashboard resume ignored: build ${prompt.slug} is no longer blocked by the captured escalation(s)`)
-      await this.renderOnce()
-      return
-    }
-
-    const guidance = prompt.value.trim()
-    const resolution = guidance === '' ? 'retry' : 'guidance'
-    const answer = guidance === '' ? BARE_RETRY_ANSWER : guidance
-    // One stable actor value for the whole multi-escalation operator action.
-    const actor = humanActor(this.dashboardUser())
-    const alsoPaused = state.status === 'paused'
-
-    // BuildStore appends one event at a time. Revalidation above plus a retry
-    // after any partial failure makes this idempotent at the reducer level:
-    // already-answered ids drop out, and only captured ids still open append.
-    for (const escalation of open) {
-      await this.wiring.store.append(prompt.slug, {
-        actor,
-        type: 'escalation.answered',
-        payload: { id: escalation.id, answer, resolution },
+    let result: BuildControlResult
+    try {
+      result = await controlBuild({
+        store: this.wiring.store,
+        repo: this.opts.targetRepo,
+        slug: prompt.slug,
+        env: this.opts.env,
+        action: {
+          kind: 'answer',
+          text: prompt.value,
+          escalationIds: prompt.escalationIds,
+        },
       })
+    } catch (error) {
+      if (error instanceof BuildControlError) {
+        this.clearResumePrompt(prompt.slug)
+      }
+      if (await this.ignoreControlError('resume', error)) return
+      throw error
     }
-    // Paused has reducer precedence over blocked. Clear every escalation first,
-    // then make the runner actionable so no lease sweep can observe a partially
-    // answered set as resumed work.
-    if (alsoPaused) {
-      await this.wiring.store.append(prompt.slug, {
-        actor,
-        type: 'build.resume-requested',
-        payload: {},
-      })
+    if (result.kind !== 'answered') {
+      throw new Error('build-control returned an invalid answer result')
     }
 
     this.clearResumePrompt(prompt.slug)
     this.say(
       `build ${prompt.slug}: blocked resume requested${
-        resolution === 'guidance' ? ' with guidance' : ' without feedback'
+        result.resolution === 'guidance' ? ' with guidance' : ' without feedback'
       }`,
     )
     await this.renderOnce()
   }
 
   private async toggleAutoMerge(): Promise<void> {
-    const selected = await this.selectedBuild('auto-merge')
-    if (selected === undefined) return
-    const cancel = selected.state.autoMerge.requested
-    await this.wiring.store.append(selected.slug, {
-      actor: humanActor(this.dashboardUser()),
-      type: cancel
-        ? 'build.auto-merge-cancelled'
-        : 'build.auto-merge-requested',
-      payload: {},
-    })
+    const slug = this.selectedBuildSlug('auto-merge')
+    if (slug === undefined) return
+
+    let result: BuildControlResult
+    try {
+      result = await controlBuild({
+        store: this.wiring.store,
+        repo: this.opts.targetRepo,
+        slug,
+        env: this.opts.env,
+        action: { kind: 'toggle-auto-merge' },
+      })
+    } catch (error) {
+      if (await this.ignoreControlError('action', error)) return
+      throw error
+    }
+    if (
+      result.kind !== 'command' ||
+      (result.command !== 'auto-merge-on' &&
+        result.command !== 'auto-merge-off')
+    ) {
+      throw new Error('build-control returned an invalid auto-merge toggle result')
+    }
     this.say(
-      `build ${selected.slug}: auto-merge ${cancel ? 'cancelled' : 'requested'}`,
+      `build ${slug}: auto-merge ${
+        result.command === 'auto-merge-off' ? 'cancelled' : 'requested'
+      }`,
     )
     await this.renderOnce()
   }
