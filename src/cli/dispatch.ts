@@ -30,7 +30,10 @@ import { humanActor } from '../events/envelope'
 import { randomIds, type IdSource } from '../ids'
 import { reduceBuild, type BuildState } from '../kernel/reducer'
 import { buildDashboard, type DashboardModel } from './dashboard/model'
-import { renderDashboard } from './dashboard/render'
+import {
+  renderDashboard,
+  type DashboardRendererResolver,
+} from './dashboard/render'
 import {
   moveSelection,
   reconcileSelection,
@@ -166,12 +169,15 @@ export interface DispatchOpts {
   /**
    * The interactive output seam. ABSENT ⇒ non-interactive ⇒ plain — which is
    * exactly today's behavior, so the dashboard can never be the reason a
-   * scripted or piped `ab dispatch` starts emitting escapes. `bin/ab.ts`
-   * constructs the real one over `process.stdout`.
+   * scripted or piped `ab dispatch` starts emitting escapes. The shared binary
+   * wiring constructs the real one over `process.stdout`.
    */
   terminal?: TerminalOut
   /** Injectable normalized keyboard/text source; the binary wraps stdin. */
   input?: TerminalInput
+  /** Optional repo-dev presentation seam. The resolver is called for every
+   * paint; production omits it and remains bound to `renderDashboard`. */
+  resolveDashboardRenderer?: DashboardRendererResolver
 }
 
 /** setTimeout that also resolves the moment ANY stop signal aborts, so OS
@@ -968,8 +974,9 @@ class DispatchLoop {
   private paint(): void {
     const { terminal } = this.opts
     if (this.region === undefined || terminal === undefined || this.model === undefined) return
+    const renderer = this.opts.resolveDashboardRenderer?.() ?? renderDashboard
     this.region.update(
-      renderDashboard(this.model, {
+      renderer(this.model, {
         color: true,
         width: terminal.columns,
         // NOT `terminal.rows` — the region's trailing newline needs a row of
