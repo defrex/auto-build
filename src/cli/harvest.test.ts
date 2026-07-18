@@ -114,6 +114,81 @@ describe('harvest status', () => {
     })
   })
 
+  test('projects an infrastructure stop before resume and the same running run after acknowledgement', async () => {
+    const deps = await fixture()
+    await deps.store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.step.started',
+      payload: { run: 'h_1', step: 'file' },
+    })
+    await deps.store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.proposal.filed',
+      payload: {
+        run: 'h_1',
+        proposalKey: 'cluster-1',
+        ticket: { source: 'fake', id: 'T-1' },
+      },
+    })
+    await deps.store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.failed',
+      payload: {
+        run: 'h_1',
+        step: 'file',
+        attempt: 2,
+        error: 'ticket provider unavailable',
+        willRetry: false,
+      },
+    })
+
+    const before = projectHarvestStatus(
+      '/repo',
+      await deps.store.getRepoEvents('/repo'),
+    )
+    expect(before).toMatchObject({
+      run: 'h_1',
+      status: 'failed',
+      runStatus: 'failed',
+      observations: 1,
+      failure: {
+        step: 'file',
+        attempt: 2,
+        error: 'ticket provider unavailable',
+      },
+      filed: [
+        {
+          proposalKey: 'cluster-1',
+          ticket: { source: 'fake', id: 'T-1' },
+        },
+      ],
+    })
+
+    await deps.store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    await deps.store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    const after = projectHarvestStatus(
+      '/repo',
+      await deps.store.getRepoEvents('/repo'),
+    )
+    expect(after).toMatchObject({
+      run: 'h_1',
+      status: 'running',
+      runStatus: 'running',
+      observations: 1,
+      steps: before.steps,
+      filed: before.filed,
+    })
+    expect(after.failure).toBeUndefined()
+  })
+
   test('shares store precedence and uses the main checkout as journal identity', async () => {
     const store = new MemoryBuildStore({ clock: steppingClock() })
     await store.ensureRepo('/main/repo')

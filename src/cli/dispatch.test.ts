@@ -1541,6 +1541,109 @@ describe('abDispatch interactive keyboard controls', () => {
     }
   }, 30_000)
 
+  test('p resumes a never-paused harvest error, but does not reinterpret escalation', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const input = fakeInput()
+    let run: Promise<void> | undefined
+    try {
+      await fx.store.ensureRepo(fx.origin)
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.started',
+        payload: {
+          run: 'harvest_errored',
+          observations: [{ build: 'observed-build', seq: 1 }],
+          scan: { kind: 'harvest-scan', rev: 0 },
+        },
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.failed',
+        payload: {
+          run: 'harvest_errored',
+          step: 'file',
+          attempt: 2,
+          error: 'ticket provider unavailable',
+          willRetry: false,
+        },
+      })
+      const before = (await fx.store.getRepoEvents(fx.origin)).length
+
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: { USER: 'error-op' },
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 60_000,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      await waitFor(() => /Harvest.*FAILED/.test(stripAnsi(term.all())))
+
+      input.press('pause')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(before).some(
+          (event) => event.type === 'harvest.resume-requested',
+        ),
+      )
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest: error resume requested'),
+      )
+      let added = (await fx.store.getRepoEvents(fx.origin)).slice(before)
+      expect(added.map((event) => event.type)).toEqual([
+        'harvest.resume-requested',
+      ])
+      expect(added[0]?.actor).toEqual({ kind: 'human', user: 'error-op' })
+
+      // Settle the recovery command, then stop the same run by deliberate
+      // escalation. On that state p controls only the repository pause gate.
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.escalated',
+        payload: {
+          run: 'harvest_errored',
+          source: 'agent',
+          reason: 'operator judgment required',
+          observations: [{ build: 'observed-build', seq: 1 }],
+        },
+      })
+      await waitFor(() => /Harvest.*ESCALATED/.test(stripAnsi(term.all())))
+      const beforeEscalatedAction = (await fx.store.getRepoEvents(fx.origin)).length
+      input.press('pause')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin))
+          .slice(beforeEscalatedAction)
+          .some((event) => event.type === 'harvest.pause-requested'),
+      )
+      added = (await fx.store.getRepoEvents(fx.origin)).slice(
+        beforeEscalatedAction,
+      )
+      expect(added.map((event) => event.type)).toEqual([
+        'harvest.pause-requested',
+      ])
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest: pause requested'),
+      )
+
+      input.press('interrupt')
+      await run
+      expect(fx.cliErrors).toEqual([])
+      expect(fx.err).toEqual([])
+    } finally {
+      input.press('interrupt')
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
   test('Down selects by slug; p/m target that build with human events; rapid m toggles in order', async () => {
     const fx = await makeFixture(
       [

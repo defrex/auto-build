@@ -167,12 +167,23 @@ export function reduceHarvest(events: HarvestEvent[]): HarvestState {
         pausedAt = event.ts
         pending.pause = []
         break
-      case 'harvest.resumed':
+      case 'harvest.resumed': {
         paused = false
         pausedSeq = undefined
         pausedAt = undefined
         pending.resume = []
+        // The same acknowledgement opens the repository gate and clears an
+        // infrastructure stop. Only the latest failed run is recoverable:
+        // completed and deliberately escalated runs remain terminal.
+        const latest = order.at(-1)
+        if (latest?.status === 'failed') {
+          latest.status = 'running'
+          delete latest.failure
+          delete latest.terminalSeq
+          delete latest.terminalAt
+        }
         break
+      }
       case 'harvest.started': {
         if (runs.has(event.payload.run)) {
           throw new Error(
@@ -347,6 +358,10 @@ export function reduceHarvest(events: HarvestEvent[]): HarvestState {
       }
       case 'harvest.failed': {
         const run = requireRun(runs, event.payload.run, event)
+        // Completion and deliberate escalation are irrevocable outcomes. A
+        // late infrastructure fact remains in the journal but cannot replace
+        // either with a recoverable error projection.
+        if (run.status !== 'running') break
         run.failure = {
           step: event.payload.step,
           ...(event.payload.round !== undefined
@@ -357,9 +372,10 @@ export function reduceHarvest(events: HarvestEvent[]): HarvestState {
           willRetry: event.payload.willRetry,
         }
         if (!event.payload.willRetry) {
+          // Failed is a parked infrastructure stop, not a completed outcome.
+          // The claim and every workflow artifact remain owned by this run
+          // until an explicit harvest.resumed fact reopens it.
           run.status = 'failed'
-          run.terminalSeq = event.seq
-          run.terminalAt = event.ts
         }
         break
       }
@@ -392,8 +408,9 @@ export function claimedOccurrenceKeys(state: HarvestState): Set<string> {
 }
 
 /** Pure repository-control routing shared by dispatcher and harvest runner.
- * A request is actionable even before its fact acknowledgement; only an
- * acknowledged pause with no pending resume is durably parked. */
+ * Requests are actionable before acknowledgement. An acknowledged pause and a
+ * failed latest run both park the workflow; only a pending resume clears either
+ * stop. Pause intent keeps precedence so a racing pause is settled first. */
 export function decideHarvestControl(
   state: HarvestState,
 ): HarvestControlDecision {
@@ -405,6 +422,12 @@ export function decideHarvestControl(
   }
   if (state.pendingCommands.some((command) => command.command === 'pause')) {
     return { kind: 'acknowledge', command: 'pause' }
+  }
+  if (state.latest?.status === 'failed') {
+    if (state.pendingCommands.some((command) => command.command === 'resume')) {
+      return { kind: 'acknowledge', command: 'resume' }
+    }
+    return { kind: 'park' }
   }
   return { kind: 'proceed' }
 }

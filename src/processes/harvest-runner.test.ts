@@ -719,7 +719,7 @@ describe('HarvestRunner', () => {
     ).toBe(false)
   })
 
-  test('no-terminal sessions retry across process restarts, then fail terminally without hot-looping', async () => {
+  test('a resumed exhausted session gets one re-entry, then re-errors without hot-looping', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'ab-harvest-no-terminal-'))
     roots.push(workspace)
     const store = new MemoryBuildStore({ clock: steppingClock() })
@@ -767,21 +767,64 @@ describe('HarvestRunner', () => {
     })
     expect(calls).toBe(2)
     expect(await tickets.get('fake-1')).toBeNull()
-    expect(await makeRunner('attempt-3').run()).toEqual({ outcome: 'idle' })
+    expect(await makeRunner('uncommanded-park').run()).toEqual({
+      outcome: 'parked',
+      run: 'harvest_1',
+    })
     expect(calls).toBe(2)
+
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    expect(await makeRunner('manual-attempt-3').run()).toMatchObject({
+      outcome: 'failed',
+      launch: 'resumed',
+      run: 'harvest_1',
+    })
+    const afterResume = reduceHarvest(await store.getRepoEvents('/repo'))
+    expect(afterResume.latest).toMatchObject({
+      status: 'failed',
+      failure: { step: 'synthesize', attempt: 3, willRetry: false },
+    })
+    expect(calls).toBe(3)
+    expect(await makeRunner('still-parked').run()).toEqual({
+      outcome: 'parked',
+      run: 'harvest_1',
+    })
+    expect(calls).toBe(3)
   })
 
-  test('a permanent provider failure terminalizes the durable run after one session', async () => {
+  test('a repaired permanent provider failure resumes the stopped occurrence', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'ab-harvest-provider-error-'))
     roots.push(workspace)
     const store = new MemoryBuildStore({ clock: steppingClock() })
     const tickets = new FakeTicketSource()
     const ids = sequentialIds()
     let calls = 0
+    let repaired = false
     const scripted = new ScriptedAgentRunner({
-      script: () => {
+      script: async ({ opts }) => {
         calls += 1
-        return failedTurnResult(KIMI_QUOTA, true)
+        if (!repaired) return failedTurnResult(KIMI_QUOTA, true)
+
+        const env = resolveHarvestCliEnv(opts.env)
+        const deps = { store, env, workspacePath: workspace, ids }
+        await buildHarvestContext(deps)
+        if (opts.skill === 'ab-harvest') {
+          const observations = JSON.parse(
+            await readFile(join(workspace, '.ab', 'observations.json'), 'utf8'),
+          ) as Array<{ occurrence: { build: string; seq: number } }>
+          const file = join(workspace, '.ab', 'repaired-proposals.json')
+          await writeFile(file, JSON.stringify(proposalSet(observations)))
+          await submitHarvestProposals(deps, file)
+        } else {
+          const notes = join(workspace, '.ab', 'repaired-review.md')
+          await writeFile(notes, 'approved after provider repair\n')
+          await submitHarvestVerdict(deps, { verdict: 'approve', notes })
+        }
+        return defaultTurnResult('done')
       },
     })
     await seedObservation(store, 'provider-error', 'quota rejection during harvest')
@@ -830,10 +873,44 @@ describe('HarvestRunner', () => {
     expect(reduceHarvest(events).latest?.status).toBe('failed')
     expect(calls).toBe(1)
 
-    // A fresh process consults the reducer/open-run gate and cannot re-enter
-    // executeSession for this terminal run.
-    expect(await makeRunner('provider-attempt-2').run()).toEqual({ outcome: 'idle' })
+    // No command means no runner work and no new scan/session.
+    expect(await makeRunner('provider-uncommanded').run()).toEqual({
+      outcome: 'parked',
+      run: 'harvest_1',
+    })
     expect(calls).toBe(1)
+
+    repaired = true
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    expect(await makeRunner('provider-repaired').run()).toEqual({
+      outcome: 'completed',
+      launch: 'resumed',
+      run: 'harvest_1',
+    })
+    const repairedEvents = await store.getRepoEvents('/repo')
+    const repairedState = reduceHarvest(repairedEvents)
+    expect(repairedState.latest).toMatchObject({
+      run: 'harvest_1',
+      status: 'completed',
+      observations: [{ build: 'provider-error', seq: 1 }],
+    })
+    expect(
+      repairedEvents.filter((event) => event.type === 'harvest.started'),
+    ).toHaveLength(1)
+    expect(
+      repairedEvents.filter(
+        (event) => event.type === 'harvest.proposals.submitted',
+      ),
+    ).toHaveLength(1)
+    expect(
+      repairedEvents.filter((event) => event.type === 'harvest.review.verdict'),
+    ).toHaveLength(1)
+    expect(calls).toBe(3)
+    expect(await tickets.get('fake-1')).not.toBeNull()
   })
 
   test('max review rounds escalate without filing', async () => {
@@ -1048,6 +1125,146 @@ describe('HarvestRunner', () => {
       )
       expect(filed?.seq).toBeGreaterThan(reservation.seq)
     }
+  })
+
+  test('an errored partial filing resumes with exactly the missing proposal', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'ab-harvest-partial-file-'))
+    roots.push(workspace)
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    const createTitles: string[] = []
+    class RepairableTickets extends FakeTicketSource {
+      repaired = false
+
+      override async create(...args: Parameters<FakeTicketSource['create']>) {
+        createTitles.push(args[0].title)
+        if (!this.repaired && args[0].title === 'Harvested defect 2') {
+          throw new Error('ticket provider rejected the second proposal')
+        }
+        return super.create(...args)
+      }
+    }
+    const tickets = new RepairableTickets()
+    const ids = sequentialIds()
+    await seedObservation(store, 'partial-extra', 'second claimed observation')
+    const seeded = await seedOpenRun({
+      store,
+      tickets,
+      ids,
+      workspace,
+      stage: 'reviewed',
+      makeProposals: (observations) => ({
+        proposals: observations.map((item, index) => ({
+          action: 'create' as const,
+          title: `Harvested defect ${index + 1}`,
+          whatWhy: 'The observation describes a concrete recurring defect.',
+          acceptanceCriteria: ['The recorded defect no longer occurs.'],
+          outOfScope: ['Unrelated cleanup.'],
+          observations: [item.occurrence],
+        })),
+      }),
+    })
+    const claimed = structuredClone(
+      reduceHarvest(await store.getRepoEvents('/repo')).latest!.observations,
+    )
+    const neverRun = new ScriptedAgentRunner({
+      script: () => {
+        throw new Error('an approved filing resume must not start an agent')
+      },
+    })
+    const makeRunner = (instance: string) =>
+      new HarvestRunner({
+        store,
+        tickets,
+        config: config(1),
+        runtimes: { scripted: { runner: neverRun, servesModels: [''] } },
+        defaultRuntime: 'scripted',
+        repo: '/repo',
+        workspacePath: workspace,
+        ids,
+        uuids: randomUuids(),
+        clock: steppingClock(),
+        instance,
+        opts: { heartbeatMs: 100_000, maxSessionAttempts: 2 },
+      })
+
+    expect(await makeRunner('partial-attempt-1').run()).toEqual({
+      outcome: 'failed',
+      launch: 'resumed',
+      run: seeded.run,
+    })
+    expect(await makeRunner('partial-attempt-2').run()).toEqual({
+      outcome: 'failed',
+      launch: 'resumed',
+      run: seeded.run,
+    })
+    let events = await store.getRepoEvents('/repo')
+    let state = reduceHarvest(events)
+    expect(state.latest).toMatchObject({
+      run: seeded.run,
+      status: 'failed',
+      failure: { step: 'file', attempt: 2, willRetry: false },
+      observations: claimed,
+    })
+    expect(state.latest?.filed).toHaveLength(1)
+    expect(createTitles).toEqual([
+      'Harvested defect 1',
+      'Harvested defect 2',
+      'Harvested defect 2',
+    ])
+    expect(await tickets.get('fake-1')).not.toBeNull()
+    expect(await tickets.get('fake-2')).toBeNull()
+
+    expect(await makeRunner('partial-uncommanded').run()).toEqual({
+      outcome: 'parked',
+      run: seeded.run,
+    })
+    expect(createTitles).toHaveLength(3)
+
+    tickets.repaired = true
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    expect(await makeRunner('partial-repaired').run()).toEqual({
+      outcome: 'completed',
+      launch: 'resumed',
+      run: seeded.run,
+    })
+
+    events = await store.getRepoEvents('/repo')
+    state = reduceHarvest(events)
+    expect(state.latest).toMatchObject({
+      run: seeded.run,
+      status: 'completed',
+      observations: claimed,
+    })
+    expect(state.latest?.filed).toHaveLength(2)
+    expect(createTitles).toEqual([
+      'Harvested defect 1',
+      'Harvested defect 2',
+      'Harvested defect 2',
+      'Harvested defect 2',
+    ])
+    expect(await tickets.get('fake-1')).not.toBeNull()
+    expect(await tickets.get('fake-2')).not.toBeNull()
+    expect(
+      events.filter((event) => event.type === 'harvest.started'),
+    ).toHaveLength(1)
+    expect(
+      events.filter((event) => event.type === 'harvest.proposals.submitted'),
+    ).toHaveLength(1)
+    expect(
+      events.filter((event) => event.type === 'harvest.review.verdict'),
+    ).toHaveLength(1)
+    const filings = events.filter(
+      (event) => event.type === 'harvest.proposal.filed',
+    )
+    expect(filings).toHaveLength(2)
+    expect(new Set(filings.map((event) => event.payload.proposalKey)).size).toBe(2)
+    expect(
+      events.filter((event) => event.type === 'harvest.completed'),
+    ).toHaveLength(1)
   })
 
   test('a retry after pre-create interruption reuses the durable reservation', async () => {

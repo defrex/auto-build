@@ -633,7 +633,7 @@ function harvestStepTiming(
   }
 }
 
-/** Latest repository harvest as a step row. Terminal runs deliberately stay
+/** Latest repository harvest as a step row. Stopped and terminal runs stay
  * visible until replaced, and a repository paused before its first run still
  * gets a queryable/selectable row. */
 export function projectHarvest(
@@ -643,9 +643,9 @@ export function projectHarvest(
   const run = state.latest
   if (run === undefined && !state.paused) return undefined
   const occurrences = run?.steps ?? []
-  const terminal = run === undefined || run.status !== 'running'
+  const stopped = run === undefined || run.status !== 'running'
   const current = (name: string): boolean => {
-    if (terminal || state.paused) return false
+    if (stopped || state.paused) return false
     const latest = [...occurrences]
       .reverse()
       .find((occurrence) => occurrence.step === name)
@@ -673,9 +673,26 @@ export function projectHarvest(
   const approved = run?.reviews.some((review) => review.verdict === 'approve') ?? false
   const synthOutput = (run?.proposals.length ?? 0) > 0
   const reviewOutput = (run?.reviews.length ?? 0) > 0
-  const frozenAt = state.pausedAt === undefined
-    ? undefined
-    : Date.parse(state.pausedAt)
+  const failedEvent =
+    run?.status === 'failed'
+      ? [...events]
+          .reverse()
+          .find(
+            (event) =>
+              event.type === 'harvest.failed' &&
+              event.payload.run === run.run &&
+              event.payload.willRetry === false,
+          )
+      : undefined
+  // Both durable stop states freeze any open occurrence. A failure normally
+  // closes its step immediately afterward, but projecting the boundary itself
+  // must never make an errored row look like work is still accumulating time.
+  const frozenAt =
+    state.pausedAt !== undefined
+      ? Date.parse(state.pausedAt)
+      : failedEvent !== undefined
+        ? Date.parse(failedEvent.ts)
+        : undefined
   const steps: PipelineStep[] = [
     step('scan', hasOutcome('scan', 'completed'), current('scan'), {
       qualifier: failedAt('scan') ? 'failed' : undefined,
@@ -684,7 +701,7 @@ export function projectHarvest(
     }),
     step(
       'synthesize',
-      synthOutput && (approved || terminal) && !failedAt('synthesize'),
+      synthOutput && (approved || stopped) && !failedAt('synthesize'),
       current('synthesize'),
       {
         producedOutput: synthOutput || hasCompleted('synthesize'),
@@ -695,7 +712,7 @@ export function projectHarvest(
     ),
     step(
       'review',
-      reviewOutput && (approved || terminal) && !failedAt('review'),
+      reviewOutput && (approved || stopped) && !failedAt('review'),
       current('review'),
       {
         producedOutput: reviewOutput || hasCompleted('review'),

@@ -518,7 +518,8 @@ class DispatchLoop {
     const repo = this.opts.targetRepo
     await store.ensureRepo(repo)
     const state = reduceHarvest(await store.getRepoEvents(repo))
-    const resume = state.paused
+    const errorResume = state.latest?.status === 'failed'
+    const resume = state.paused || errorResume
     await store.appendRepo(repo, {
       actor: humanActor(buildControlUser(this.opts.env)),
       type: resume
@@ -526,7 +527,11 @@ class DispatchLoop {
         : 'harvest.pause-requested',
       payload: {},
     })
-    this.say(`harvest: ${resume ? 'resume' : 'pause'} requested`)
+    this.say(
+      errorResume
+        ? 'harvest: error resume requested'
+        : `harvest: ${resume ? 'resume' : 'pause'} requested`,
+    )
     await this.renderOnce()
   }
 
