@@ -506,19 +506,66 @@ export class Dispatcher {
     const workspacePath = openWorkspace(events)?.ref ?? this.deps.repo
     const prState = await forge.getPrState(workspacePath, pr.number)
 
-    // Auto-merge intent is independent of merged/closed/conflicted lifecycle
-    // observation. Reconcile it only while the PR is still open; enabling may
-    // immediately merge an already-green PR, but the ordinary NEXT poll remains
-    // the sole source of the pr.merged/build.completed facts.
+    // A positive conflict always re-enters reconcile before auto-merge
+    // plumbing. In particular, an ungated fallback can never race ahead of the
+    // conflict event and its full post-reconcile verification cycle.
+    if (prState.state === 'open' && prState.mergeable === false) {
+      // Dedupe: a reduced prState of 'conflicted' means reconcile is already
+      // pending (a `reconcile.completed` returns it to 'open').
+      if (state.prState === 'conflicted') return
+      const baseSha = await this.baseSha(baseBranchOf(events, this.deps.config))
+      await store.append(record.slug, {
+        actor: DISPATCHER,
+        type: 'pr.conflicted',
+        payload: { baseSha },
+      } satisfies EventWrite<'pr.conflicted'>)
+      // The dispatcher never runs agents (§15.7): re-attach a build-runner,
+      // which executes the reconcile epilogue phase.
+      await this.launch(record.slug, launched)
+      report.conflicted += 1
+      return
+    }
+
+    // Native application and the ungated fallback both begin from the same
+    // durable intent predicate. Only `applied` acknowledges the command. A
+    // direct merge is owned solely by this janitor and only after the engine is
+    // parked at awaiting-pr (all verify/finalize work complete).
     if (prState.state === 'open') {
       const autoMerge = pendingAutoMerge(state)
       if (autoMerge !== undefined) {
-        await forge.setAutoMerge(workspacePath, pr.number, autoMerge.enabled)
-        await store.append(record.slug, {
-          actor: DISPATCHER,
-          type: autoMergeApplicationType(autoMerge.enabled),
-          payload: { commandSeq: autoMerge.commandSeq },
-        })
+        const result = await forge.setAutoMerge(
+          workspacePath,
+          pr.number,
+          autoMerge.enabled,
+        )
+        if (result.kind === 'applied') {
+          await store.append(record.slug, {
+            actor: DISPATCHER,
+            type: autoMergeApplicationType(autoMerge.enabled),
+            payload: { commandSeq: autoMerge.commandSeq },
+          })
+        } else if (
+          result.kind === 'ungated' &&
+          autoMerge.enabled &&
+          prState.mergeable === true
+        ) {
+          // Re-read at the last possible point. A cancellation, replacement
+          // command, newly due pipeline work, or application fact suppresses
+          // this attempt; the next tick reclassifies from fresh forge state.
+          const latestEvents = await store.getEvents(record.slug)
+          const latestState = reduceBuild(latestEvents)
+          const latestIntent = pendingAutoMerge(latestState)
+          const decision = decideNext(latestEvents, this.deps.config)
+          if (
+            latestState.pr?.number === pr.number &&
+            latestIntent?.enabled === true &&
+            latestIntent.commandSeq === autoMerge.commandSeq &&
+            decision.kind === 'wait' &&
+            decision.reason === 'awaiting-pr'
+          ) {
+            await forge.squashMerge(workspacePath, pr.number, result.headSha)
+          }
+        }
       }
     }
 
@@ -574,25 +621,10 @@ export class Dispatcher {
         report.closed += 1
         return
       }
-      case 'open': {
-        // mergeable true/null → nothing to do; null means the forge has not
-        // computed mergeability yet — never guess (§15.7).
-        if (prState.mergeable !== false) return
-        // Dedupe: a reduced prState of 'conflicted' means reconcile is
-        // already pending (a `reconcile.completed` returns it to 'open').
-        if (state.prState === 'conflicted') return
-        const baseSha = await this.baseSha(baseBranchOf(events, this.deps.config))
-        await store.append(record.slug, {
-          actor: DISPATCHER,
-          type: 'pr.conflicted',
-          payload: { baseSha },
-        } satisfies EventWrite<'pr.conflicted'>)
-        // The dispatcher never runs agents (§15.7): re-attach a build-runner,
-        // which executes the reconcile epilogue phase.
-        await this.launch(record.slug, launched)
-        report.conflicted += 1
+      case 'open':
+        // Unknown mergeability and transient auto-merge classifications are
+        // retried on a later poll; never guess.
         return
-      }
     }
   }
 
