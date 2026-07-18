@@ -99,8 +99,8 @@ export const harvestEventPayloadSchemas = {
     round: round.optional(),
     observations: z.array(occurrenceKeySchema).min(1),
   }),
-  /** Infrastructure failure. A non-retrying failure remains queryable and is
-   * terminal for the run; retrying failures resume the same claimed snapshot. */
+  /** Infrastructure failure. A non-retrying failure stops the run until an
+   * explicit operator resume; retrying failures resume the same claimed snapshot. */
   'harvest.failed': z.strictObject({
     run: z.string().min(1),
     step: harvestStepSchema,

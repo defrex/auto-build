@@ -429,9 +429,9 @@ export class Dispatcher {
     if (opts.acceptNewWork !== false) await this.dispatch(report, launched)
     // Fire-and-forget by contract: long synthesize/review sessions must not
     // stop janitor, lease sweep, ticket dispatch, or signal handling on later
-    // watch ticks. The durable repository gate suppresses only an acknowledged
-    // pause. Pending pause/resume commands still launch the runner so the
-    // kernel can settle them under the repository lease.
+    // watch ticks. Durable pause and infrastructure-error stops suppress
+    // launch. Pending control commands still launch the runner so the kernel
+    // can settle them under the repository lease.
     await this.triggerHarvest()
     return report
   }

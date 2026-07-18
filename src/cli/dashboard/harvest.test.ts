@@ -5,7 +5,7 @@ import { projectHarvest } from './model'
 import { renderDashboard, stripAnsi } from './render'
 
 describe('dashboard harvest row', () => {
-  test('a terminal synthesize failure marks only synthesize failed and leaves later steps pending', async () => {
+  test('a stopped synthesize failure marks only synthesize failed and leaves later steps pending', async () => {
     const store = new MemoryBuildStore()
     await store.ensureRepo('/repo')
     await store.appendRepoWithArtifacts(
@@ -61,6 +61,10 @@ describe('dashboard harvest row', () => {
 
     const projected = projectHarvest(await store.getRepoEvents('/repo'))!
     const byLabel = new Map(projected.steps.map((step) => [step.label, step]))
+    expect(projected).toMatchObject({
+      status: 'failed',
+      detail: 'no-terminal',
+    })
     expect(byLabel.get('scan')?.state).toBe('done')
     expect(byLabel.get('synthesize')).toMatchObject({
       state: 'provisional',
@@ -70,6 +74,25 @@ describe('dashboard harvest row', () => {
     expect(byLabel.get('review')?.qualifier).toBeUndefined()
     expect(byLabel.get('file')).toMatchObject({ state: 'pending' })
     expect(byLabel.get('file')?.qualifier).toBeUndefined()
+
+    const rendered = stripAnsi(
+      renderDashboard(
+        {
+          repo: '/repo',
+          mode: 'watch',
+          capacity: 1,
+          drained: false,
+          statusLine: '',
+          builds: [],
+          harvest: projected,
+        },
+        { color: true, width: 100, height: 20, now: Date.now() + 60_000 },
+      ).join('\n'),
+    )
+    expect(rendered).toContain('FAILED')
+    expect(rendered).toMatch(/\[x\] scan/)
+    expect(rendered).toMatch(/synthesize\(failed,/)
+    expect(rendered).toContain('no-terminal')
   })
 
   test('projects an acknowledged repository pause, freezes open timing, and supports no-run pauses', async () => {

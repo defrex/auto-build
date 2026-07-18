@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { DISPATCHER, humanActor, KERNEL } from '../events/envelope'
+import { DISPATCHER, agentActor, humanActor, KERNEL } from '../events/envelope'
 import {
   claimedOccurrenceKeys,
   decideHarvestControl,
@@ -97,6 +97,15 @@ describe('reduceHarvest', () => {
       'filed',
       'suppressed',
     ])
+
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    state = reduceHarvest(await store.getRepoEvents('/repo'))
+    expect(state.latest?.status).toBe('completed')
+    expect(openHarvestRun(state)).toBeUndefined()
   })
 
   test('reduces durable pause commands without terminalizing or replacing the open run', async () => {
@@ -184,7 +193,7 @@ describe('reduceHarvest', () => {
     expect([...claimedOccurrenceKeys(state)]).toEqual(['a:7'])
   })
 
-  test('a non-retrying infrastructure failure is terminal but preserves the claim', async () => {
+  test('an errored run parks until resume reopens the same durable snapshot', async () => {
     const store = new MemoryBuildStore({ clock: steppingClock() })
     await store.ensureRepo('/repo')
     await store.appendRepo('/repo', {
@@ -198,24 +207,220 @@ describe('reduceHarvest', () => {
     })
     await store.appendRepo('/repo', {
       actor: KERNEL,
+      type: 'harvest.step.completed',
+      payload: {
+        run: 'h_failed',
+        step: 'synthesize',
+        round: 2,
+        outcome: 'completed',
+        artifact: { kind: 'harvest-proposals', rev: 1 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: agentActor('harvest', 'hs_2'),
+      type: 'harvest.proposals.submitted',
+      payload: {
+        run: 'h_failed',
+        round: 2,
+        artifact: { kind: 'harvest-proposals', rev: 1 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: agentActor('harvest-review', 'hr_2'),
+      type: 'harvest.review.verdict',
+      payload: {
+        run: 'h_failed',
+        round: 2,
+        verdict: 'approve',
+        findings: [],
+        artifact: { kind: 'harvest-review', rev: 1 },
+      },
+    })
+    const reserved = crypto.randomUUID()
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.proposal.id-reserved',
+      payload: { run: 'h_failed', proposalKey: 'cluster-a', id: reserved },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.proposal.filed',
+      payload: {
+        run: 'h_failed',
+        proposalKey: 'cluster-a',
+        ticket: { source: 'fake', id: 'T-1', title: 'Already filed' },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
       type: 'harvest.failed',
       payload: {
         run: 'h_failed',
-        step: 'review',
-        round: 2,
+        step: 'file',
         attempt: 2,
-        error: 'no-terminal',
+        error: 'ticket provider unavailable',
         willRetry: false,
       },
     })
 
+    let state = reduceHarvest(await store.getRepoEvents('/repo'))
+    const preserved = structuredClone({
+      observations: state.latest?.observations,
+      scan: state.latest?.scan,
+      steps: state.latest?.steps,
+      proposals: state.latest?.proposals,
+      reviews: state.latest?.reviews,
+      reservations: state.latest?.reservations,
+      filed: state.latest?.filed,
+    })
+    expect(state.latest).toMatchObject({
+      run: 'h_failed',
+      status: 'failed',
+      failure: { step: 'file', attempt: 2, willRetry: false },
+    })
+    expect(state.latest?.terminalSeq).toBeUndefined()
+    expect(openHarvestRun(state)).toBeUndefined()
+    expect(decideHarvestControl(state)).toEqual({ kind: 'park' })
+    expect([...claimedOccurrenceKeys(state)]).toEqual(['a:1'])
+
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    state = reduceHarvest(await store.getRepoEvents('/repo'))
+    expect(state.latest?.status).toBe('failed')
+    expect(decideHarvestControl(state)).toEqual({
+      kind: 'acknowledge',
+      command: 'resume',
+    })
+
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    state = reduceHarvest(await store.getRepoEvents('/repo'))
+    expect(state.latest).toMatchObject({ run: 'h_failed', status: 'running' })
+    expect(state.latest?.failure).toBeUndefined()
+    expect(state.latest?.terminalSeq).toBeUndefined()
+    expect(openHarvestRun(state)?.run).toBe('h_failed')
+    expect(decideHarvestControl(state)).toEqual({ kind: 'proceed' })
+    expect({
+      observations: state.latest?.observations,
+      scan: state.latest?.scan,
+      steps: state.latest?.steps,
+      proposals: state.latest?.proposals,
+      reviews: state.latest?.reviews,
+      reservations: state.latest?.reservations,
+      filed: state.latest?.filed,
+    }).toEqual(preserved)
+    expect([...claimedOccurrenceKeys(state)]).toEqual(['a:1'])
+  })
+
+  test('one resume clears both a pause gate and an errored run', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await store.ensureRepo('/repo')
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_paused_failed',
+        observations: [{ build: 'a', seq: 2 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.failed',
+      payload: {
+        run: 'h_paused_failed',
+        step: 'review',
+        round: 1,
+        attempt: 1,
+        error: 'provider rejected the turn',
+        willRetry: false,
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.pause-requested',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+
+    expect(decideHarvestControl(reduceHarvest(await store.getRepoEvents('/repo')))).toEqual({
+      kind: 'acknowledge',
+      command: 'resume',
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    const state = reduceHarvest(await store.getRepoEvents('/repo'))
+    expect(state).toMatchObject({
+      paused: false,
+      latest: { run: 'h_paused_failed', status: 'running' },
+    })
+    expect(state.latest?.failure).toBeUndefined()
+    expect([...claimedOccurrenceKeys(state)]).toEqual(['a:2'])
+  })
+
+  test('repository gate resume never reopens a deliberate escalation', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await store.ensureRepo('/repo')
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_escalated',
+        observations: [{ build: 'a', seq: 3 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.escalated',
+      payload: {
+        run: 'h_escalated',
+        source: 'agent',
+        reason: 'human judgment required',
+        observations: [{ build: 'a', seq: 3 }],
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+
     const state = reduceHarvest(await store.getRepoEvents('/repo'))
     expect(state.latest).toMatchObject({
-      status: 'failed',
-      failure: { step: 'review', round: 2, willRetry: false },
+      run: 'h_escalated',
+      status: 'escalated',
+      escalation: { source: 'agent' },
     })
     expect(openHarvestRun(state)).toBeUndefined()
-    expect([...claimedOccurrenceKeys(state)]).toEqual(['a:1'])
   })
 
   test('validates UUID v4 reservations and restricts them to the kernel actor', async () => {

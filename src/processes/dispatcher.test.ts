@@ -1090,6 +1090,55 @@ describe('Dispatcher harvest coordination', () => {
     expect(h.launches).toEqual([])
   })
 
+  test('an errored run stays parked across ticks until a resume requests one settlement launch', async () => {
+    let calls = 0
+    const h = harness({
+      startHarvest: () => {
+        calls += 1
+      },
+    })
+    await seedBuild(h, { slug: 'capacity-holder' })
+    await h.store.claimLease('capacity-holder', 'live-runner', 3_600_000)
+    await h.store.ensureRepo(REPO)
+    await h.store.appendRepo(REPO, {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_errored',
+        observations: [{ build: 'capacity-holder', seq: 1 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    await h.store.appendRepo(REPO, {
+      actor: KERNEL,
+      type: 'harvest.failed',
+      payload: {
+        run: 'h_errored',
+        step: 'file',
+        attempt: 2,
+        error: 'ticket provider unavailable',
+        willRetry: false,
+      },
+    })
+
+    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(await h.dispatcher.tick({ acceptNewWork: false })).toEqual(
+      emptyTickReport(),
+    )
+    expect(calls).toBe(0)
+
+    await h.store.appendRepo(REPO, {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    expect(await h.dispatcher.tick({ acceptNewWork: false })).toEqual(
+      emptyTickReport(),
+    )
+    expect(calls).toBe(1)
+    expect(h.launches).toEqual([])
+  })
+
   test('harvest remains independent of drain and occupied build capacity', async () => {
     let calls = 0
     const h = harness({

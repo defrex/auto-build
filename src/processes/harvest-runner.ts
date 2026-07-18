@@ -164,14 +164,18 @@ export class HarvestRunner {
       await this.startHeartbeat()
       await this.ensureLease()
       let events = await store.getRepoEvents(repo)
-      run = openHarvestRun(reduceHarvest(events))
+      let state = reduceHarvest(events)
+      run = openHarvestRun(state)
 
       // Settle durable operator control before scanning or resuming work. A
-      // pending resume is acknowledged here and then normal threshold/open-run
-      // routing continues in this same lease ownership window.
-      await this.controlBoundary(run?.run)
+      // failed run is parked here before any scan; a pending resume reopens
+      // that same run and normal durable-state routing continues in this lease.
+      await this.controlBoundary(
+        run?.run ?? (state.latest?.status === 'failed' ? state.latest.run : undefined),
+      )
       events = await store.getRepoEvents(repo)
-      run = openHarvestRun(reduceHarvest(events))
+      state = reduceHarvest(events)
+      run = openHarvestRun(state)
 
       if (!run) {
         await this.controlBoundary()
@@ -496,14 +500,32 @@ export class HarvestRunner {
   }): Promise<void> {
     const { store, repo, ids, workspacePath } = this.deps
     await this.ensureLease()
-    const failures = (await store.getRepoEvents(repo)).filter(
-      (event) =>
+    const events = await store.getRepoEvents(repo)
+    const matchingFailures = events.filter(
+      (event): event is Extract<HarvestEvent, { type: 'harvest.failed' }> =>
         event.type === 'harvest.failed' &&
         event.payload.run === spec.run &&
         event.payload.step === spec.step &&
         event.payload.round === spec.round,
-    ).length
-    if (failures >= this.maxSessionAttempts) {
+    )
+    const failures = matchingFailures.length
+    const latestFailure = matchingFailures.at(-1)
+    const current = reduceHarvest(events).runs.find(
+      (candidate) => candidate.run === spec.run,
+    )
+    // A stopping failure may already have consumed the ordinary retry budget.
+    // harvest.resumed deliberately clears that reduced stop and grants one real
+    // re-entry without deleting history or resetting attempt numbers. The next
+    // failure fact restores the guard (and parks the run again).
+    const resumedAfterTerminalFailure =
+      latestFailure?.payload.willRetry === false &&
+      current?.status === 'running' &&
+      current.failure === undefined &&
+      events.some(
+        (event) =>
+          event.type === 'harvest.resumed' && event.seq > latestFailure.seq,
+      )
+    if (failures >= this.maxSessionAttempts && !resumedAfterTerminalFailure) {
       throw new SessionFailure(`${spec.step}@${spec.round} exhausted retries`)
     }
 
@@ -989,7 +1011,9 @@ export class HarvestRunner {
     await this.ensureLease()
     const completed = run.steps.some(
       (occurrence) =>
-        occurrence.step === 'scan' && occurrence.completedSeq !== undefined,
+        occurrence.step === 'scan' &&
+        occurrence.completedSeq !== undefined &&
+        occurrence.outcome === 'completed',
     )
     if (completed) return
     const open = run.steps.some(
