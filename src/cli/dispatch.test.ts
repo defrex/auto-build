@@ -11,7 +11,7 @@
  * in one pass.
  */
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveCliEnv } from './env'
@@ -119,8 +119,11 @@ async function makeFixture(
   clock: Clock = systemClock,
 ): Promise<Fixture> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-dispatch-'))
-  const origin = join(tmp, 'origin')
-  await initOrigin(origin, toml)
+  const originPath = join(tmp, 'origin')
+  await initOrigin(originPath, toml)
+  // Git reports its common directory canonically (macOS temp paths gain the
+  // `/private` prefix), so fixtures use that same repository identity.
+  const origin = await realpath(originPath)
 
   const ids = sequentialIds()
   const store = new MemoryBuildStore({ clock })
@@ -253,6 +256,39 @@ describe('abDispatch guards', () => {
       expect(wired).toBe(false)
     } finally {
       await rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('uses --store over AB_STORE and normalizes either against the main repo', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const seen: string[] = []
+    try {
+      const run = (env: Record<string, string | undefined>, storeRef?: string) =>
+        abDispatch({
+          targetRepo: fx.origin,
+          env,
+          exec: spawnExec,
+          stdout: () => {},
+          stderr: (line) => fx.err.push(line),
+          once: true,
+          ...(storeRef !== undefined ? { storeRef } : {}),
+          wire: (_config, resolved) => {
+            seen.push(resolved.storeRef!)
+            return fx.wire()
+          },
+        })
+
+      await run({ AB_STORE: 'environment-state' }, 'flag-state')
+      await run({ AB_STORE: 'environment-state' })
+      await run({})
+      expect(seen).toEqual([
+        join(fx.origin, 'flag-state'),
+        join(fx.origin, 'environment-state'),
+        join(fx.origin, '.autobuild'),
+      ])
+      expect(fx.err).toEqual([])
+    } finally {
+      await fx.cleanup()
     }
   })
 

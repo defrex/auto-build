@@ -368,6 +368,9 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
       }
       const labels = listFlag(parsed, 'labels')
       const blockedBy = listFlag(parsed, 'blocked-by')
+      if (deps.exec === undefined) {
+        throw new Error("'ab ticket create' needs an exec seam — this is a wiring bug in the ab binary")
+      }
       await abTicketCreate({
         targetRepo: deps.workspacePath,
         title,
@@ -375,6 +378,7 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         ...(labels !== undefined ? { labels } : {}),
         ...(blockedBy !== undefined ? { blockedBy } : {}),
         env: deps.processEnv ?? {},
+        exec: deps.exec,
         stdout,
       })
       return 0
@@ -579,9 +583,13 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
             throw new Error(`unknown argument "${arg}" — ${usage}`)
           }
         }
+        if (deps.exec === undefined) {
+          throw new Error("'ab harvest status' needs an exec seam — this is a wiring bug in the ab binary")
+        }
         await abHarvestStatus({
           repo: deps.workspacePath,
           env: deps.processEnv ?? {},
+          exec: deps.exec,
           stdout,
           json,
           ...(events !== undefined ? { events } : {}),
