@@ -328,7 +328,7 @@ export class HarvestRunner {
         maxRounds: this.deps.config.policy.maxReviewRounds,
         stallRounds: this.deps.config.policy.stallRounds,
       },
-      produce: async (feedback, round) => {
+      produce: async (_feedback, round) => {
         run = await this.refreshRun(run.run)
         const existing = proposalArtifactForRound(run, round)
         if (existing !== undefined) {
@@ -341,7 +341,7 @@ export class HarvestRunner {
           )
           return existing
         }
-        return this.synthesize(run, round, feedback)
+        return this.synthesize(run, round)
       },
       review: async (_artifact, round) => {
         run = await this.refreshRun(run.run)
@@ -384,7 +384,6 @@ export class HarvestRunner {
   private async synthesize(
     run: HarvestRunState,
     round: number,
-    feedback: Feedback | null,
   ): Promise<ArtifactRef> {
     await this.startStep(run.run, 'synthesize', round)
     await this.executeSession({
@@ -393,7 +392,6 @@ export class HarvestRunner {
       skill: installedSkillName('harvest'),
       step: 'synthesize',
       round,
-      feedback,
       producer: true,
       terminal: (event, session) =>
         event.type === 'harvest.proposals.submitted' &&
@@ -460,7 +458,6 @@ export class HarvestRunner {
     skill: string
     step: 'synthesize' | 'review'
     round: number
-    feedback?: Feedback | null
     producer: boolean
     terminal: (event: HarvestEvent, session: string) => boolean
   }): Promise<void> {
