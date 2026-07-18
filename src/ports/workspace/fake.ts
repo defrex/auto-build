@@ -10,7 +10,12 @@
  * a re-run, not a special path — constitution #2), and release of an
  * unknown or already-released workspace is a no-op, never an error.
  */
-import type { WorkspaceHandle, WorkspaceProvider } from '../types'
+import type { WorkspaceBase } from '../../ontology'
+import type {
+  WorkspaceHandle,
+  WorkspaceProvider,
+  WorkspaceProvisionResult,
+} from '../types'
 
 export interface ProvisionRecord {
   repo: string
@@ -26,12 +31,16 @@ export class FakeWorkspaceProvider implements WorkspaceProvider {
   readonly releases: WorkspaceHandle[] = []
 
   private readonly root: string
+  private readonly initialBase: WorkspaceBase
   /** ref → handle for workspaces provisioned and not yet released. */
   private readonly active = new Map<string, WorkspaceHandle>()
+  /** Durable fake branch heads survive release, like real Git branches. */
+  private readonly branchHeads = new Map<string, string>()
   private readonly failures = new Map<'provision' | 'release', Error>()
 
-  constructor(opts: { root?: string } = {}) {
+  constructor(opts: { root?: string; base?: WorkspaceBase } = {}) {
     this.root = opts.root ?? '/fake/workspaces'
+    this.initialBase = opts.base ?? { source: 'remote', sha: 'fake-base-sha' }
   }
 
   /**
@@ -49,17 +58,31 @@ export class FakeWorkspaceProvider implements WorkspaceProvider {
     return this.active.has(ref)
   }
 
+  /** Test seam for commits made between provision calls. */
+  setBranchHead(branch: string, sha: string): void {
+    this.branchHeads.set(branch, sha)
+  }
+
   async provision(opts: {
     repo: string
     baseBranch: string
     branch: string
-  }): Promise<WorkspaceHandle> {
+  }): Promise<WorkspaceProvisionResult> {
     const failure = this.failures.get('provision')
     if (failure) throw failure
     this.provisions.push({ ...opts })
     const ref = `${this.root}/${opts.branch}`
     const existing = this.active.get(ref)
-    if (existing) return { ...existing }
+    if (existing) {
+      return {
+        ...existing,
+        base: {
+          source: 'existing',
+          sha: this.branchHeads.get(opts.branch) ?? this.initialBase.sha,
+        },
+      }
+    }
+
     const handle: WorkspaceHandle = {
       provider: this.name,
       ref,
@@ -67,7 +90,13 @@ export class FakeWorkspaceProvider implements WorkspaceProvider {
       branch: opts.branch,
     }
     this.active.set(ref, handle)
-    return { ...handle }
+
+    const existingSha = this.branchHeads.get(opts.branch)
+    if (existingSha !== undefined) {
+      return { ...handle, base: { source: 'existing', sha: existingSha } }
+    }
+    this.branchHeads.set(opts.branch, this.initialBase.sha)
+    return { ...handle, base: { ...this.initialBase } }
   }
 
   /** Idempotent: releasing an unknown or already-released handle is a no-op
@@ -75,7 +104,12 @@ export class FakeWorkspaceProvider implements WorkspaceProvider {
   async release(handle: WorkspaceHandle): Promise<void> {
     const failure = this.failures.get('release')
     if (failure) throw failure
-    this.releases.push({ ...handle })
+    this.releases.push({
+      provider: handle.provider,
+      ref: handle.ref,
+      path: handle.path,
+      branch: handle.branch,
+    })
     this.active.delete(handle.ref)
   }
 }

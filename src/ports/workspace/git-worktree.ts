@@ -8,7 +8,12 @@
  */
 import { mkdir, realpath } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
-import type { WorkspaceHandle, WorkspaceProvider } from '../types'
+import type { WorkspaceBase } from '../../ontology'
+import type {
+  WorkspaceHandle,
+  WorkspaceProvider,
+  WorkspaceProvisionResult,
+} from '../types'
 
 export interface ExecResult {
   stdout: string
@@ -116,11 +121,72 @@ export class GitWorktreeProvider implements WorkspaceProvider {
     return result
   }
 
+  private shaFrom(
+    dir: string,
+    args: string[],
+    result: ExecResult,
+  ): string {
+    if (result.exitCode !== 0) {
+      throw new GitError(['-C', dir, ...args], result)
+    }
+    const sha = result.stdout.trim()
+    if (sha === '') {
+      throw new GitError(['-C', dir, ...args], {
+        ...result,
+        exitCode: 1,
+        stderr: 'git returned no commit SHA',
+      })
+    }
+    return sha
+  }
+
+  private async resolveCommit(repo: string, ref: string): Promise<string> {
+    const args = ['rev-parse', '--verify', `${ref}^{commit}`]
+    return this.shaFrom(repo, args, await this.git(repo, args))
+  }
+
+  /** Select a new branch's base without mutating any operator or shared
+   * remote-tracking ref. A remote failure is evidence, not a dispatch gate. */
+  private async selectNewBranchBase(
+    repo: string,
+    baseBranch: string,
+    branch: string,
+  ): Promise<WorkspaceBase> {
+    const fetchedRef = `refs/autobuild/provision/${branch}/base`
+    const fetchArgs = [
+      'fetch',
+      '--no-tags',
+      '--no-write-fetch-head',
+      '--refmap=',
+      'origin',
+      `+refs/heads/${baseBranch}:${fetchedRef}`,
+    ]
+    const fetched = await this.git(repo, fetchArgs)
+
+    let remoteError: string | undefined
+    if (fetched.exitCode !== 0) {
+      remoteError = new GitError(['-C', repo, ...fetchArgs], fetched).message
+    } else {
+      const resolveArgs = ['rev-parse', '--verify', `${fetchedRef}^{commit}`]
+      const resolved = await this.git(repo, resolveArgs)
+      if (resolved.exitCode === 0) {
+        return { source: 'remote', sha: this.shaFrom(repo, resolveArgs, resolved) }
+      }
+      remoteError = new GitError(['-C', repo, ...resolveArgs], resolved).message
+    }
+
+    // Remote refresh failures are non-fatal only while the fully qualified
+    // local base is still a usable commit. A missing local base remains a
+    // provisioning error rather than being hidden behind the fallback.
+    const sha = await this.resolveCommit(repo, `refs/heads/${baseBranch}`)
+    return { source: 'local', sha, remoteError }
+  }
+
   async provision(opts: {
     repo: string
     baseBranch: string
     branch: string
-  }): Promise<WorkspaceHandle> {
+  }): Promise<WorkspaceProvisionResult> {
     const { repo, baseBranch, branch } = opts
     // Fails with git's stderr for a missing path or a non-repo directory.
     await this.gitOrThrow(repo, ['rev-parse', '--git-dir'])
@@ -133,41 +199,61 @@ export class GitWorktreeProvider implements WorkspaceProvider {
     if (existing) {
       // Idempotent provision (constitution #2): the registered worktree — at
       // the branch's current tip — is the resume point, not a fresh checkout.
+      const sha = await this.resolveCommit(repo, `refs/heads/${branch}`)
       this.repos.set(existing, repo)
-      return { provider: this.name, ref: existing, path: existing, branch }
+      return {
+        provider: this.name,
+        ref: existing,
+        path: existing,
+        branch,
+        base: { source: 'existing', sha },
+      }
     }
 
     const worktreePath = join(rootDir, sanitizeBranch(branch))
-    const branchExists =
-      (
-        await this.git(repo, [
-          'rev-parse',
-          '--verify',
-          '--quiet',
-          `refs/heads/${branch}`,
-        ])
-      ).exitCode === 0
-    if (branchExists) {
-      // Resume (§15.6-C): the worktree starts at the branch's current tip.
+    const branchRef = `refs/heads/${branch}`
+    const branchArgs = ['rev-parse', '--verify', '--quiet', `${branchRef}^{commit}`]
+    const branchTip = await this.git(repo, branchArgs)
+    if (branchTip.exitCode === 0) {
+      // Resume (§15.6-C): the worktree starts at the branch's current tip and
+      // remote access never occurs for an already-created build branch.
+      const sha = this.shaFrom(repo, branchArgs, branchTip)
       await this.gitOrThrow(repo, ['worktree', 'add', worktreePath, branch])
-    } else {
-      // Creates the branch from baseBranch; an unknown baseBranch fails here
-      // with git's stderr (`invalid reference: …`).
-      await this.gitOrThrow(repo, [
-        'worktree',
-        'add',
-        '-b',
+      this.repos.set(worktreePath, repo)
+      return {
+        provider: this.name,
+        ref: worktreePath,
+        path: worktreePath,
         branch,
-        worktreePath,
-        baseBranch,
-      ])
+        base: { source: 'existing', sha },
+      }
     }
+
+    const base = await this.selectNewBranchBase(repo, baseBranch, branch)
+    // Consume the selected immutable commit, not a mutable name that could
+    // move between fetch and branch creation.
+    await this.gitOrThrow(repo, [
+      'worktree',
+      'add',
+      '-b',
+      branch,
+      worktreePath,
+      base.sha,
+    ])
+    const actualSha = await this.resolveCommit(repo, branchRef)
+    if (actualSha !== base.sha) {
+      throw new Error(
+        `created ${branchRef} at ${actualSha}, expected selected base ${base.sha}`,
+      )
+    }
+
     this.repos.set(worktreePath, repo)
     return {
       provider: this.name,
       ref: worktreePath,
       path: worktreePath,
       branch,
+      base: { ...base, sha: actualSha },
     }
   }
 

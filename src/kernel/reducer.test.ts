@@ -95,6 +95,7 @@ function prelude(): EventWrite[] {
       provider: 'worktree',
       ref: '/ws/auth-rate-limit',
       branch: 'ab/auth-rate-limit',
+      base: { source: 'remote', sha: 'base-sha' },
     }),
     ev('spec.imported', {
       artifact: { kind: 'spec', rev: 0 },
@@ -518,6 +519,7 @@ describe('reduceBuild: walkthrough C — sandbox death and resume (§15.6-C)', (
         provider: 'sandbox',
         ref: 'sb-2',
         branch: 'ab/auth-rate-limit',
+        base: { source: 'existing', sha: 'sha-r1' },
       }),
       ev('runner.attached', {
         instance: 'runner-2',

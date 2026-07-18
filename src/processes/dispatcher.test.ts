@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import { parseConfig } from '../config/load'
 import { DISPATCHER, KERNEL, agentActor, humanActor } from '../events/envelope'
 import { sequentialIds } from '../ids'
+import type { WorkspaceBase } from '../ontology'
 import { FakeForge } from '../ports/forge/fake'
 import { FakeTicketSource } from '../ports/tickets/fake'
 import type { Ticket } from '../ports/types'
@@ -81,13 +82,17 @@ function harness(
     /** Wrap the fake ticket source — e.g. to make dependencyStates throw. */
     wrapTickets?: (source: FakeTicketSource) => FakeTicketSource
     startHarvest?: () => void
+    workspaceBase?: WorkspaceBase
   } = {},
 ) {
   const clock = manualClock()
   const store = new MemoryBuildStore({ clock })
   const fakeTickets = new FakeTicketSource(opts.tickets ?? [])
   const tickets = opts.wrapTickets ? opts.wrapTickets(fakeTickets) : fakeTickets
-  const workspaces = new FakeWorkspaceProvider({ root: '/ws' })
+  const workspaces = new FakeWorkspaceProvider({
+    root: '/ws',
+    ...(opts.workspaceBase ? { base: opts.workspaceBase } : {}),
+  })
   const forge = new FakeForge()
   const launches: string[] = []
   const execCalls: string[][] = []
@@ -151,7 +156,12 @@ async function seedBuild(
     await h.store.append(slug, {
       actor: DISPATCHER,
       type: 'workspace.provisioned',
-      payload: { provider: 'fake', ref: `/ws/ab/${slug}`, branch: `ab/${slug}` },
+      payload: {
+        provider: 'fake',
+        ref: `/ws/ab/${slug}`,
+        branch: `ab/${slug}`,
+        base: { source: 'remote', sha: 'fake-base-sha' },
+      },
     })
   }
   await h.store.append(slug, {
@@ -534,6 +544,7 @@ describe('Dispatcher dispatch', () => {
       provider: 'fake',
       ref: '/ws/ab/add-rate-limiting',
       branch: 'ab/add-rate-limiting',
+      base: { source: 'remote', sha: 'fake-base-sha' },
     })
     expect(events[2]?.payload).toEqual({
       artifact: { kind: 'spec', rev: 0 },
@@ -552,6 +563,21 @@ describe('Dispatcher dispatch', () => {
       { id: 'T-1', body: 'build add-rate-limiting dispatched' },
     ])
     expect(h.launches).toEqual(['add-rate-limiting'])
+  })
+
+  test('copies local fallback evidence from the workspace result into the event', async () => {
+    const base: WorkspaceBase = {
+      source: 'local',
+      sha: 'local-main-sha',
+      remoteError: 'git fetch exited 128: authentication failed',
+    }
+    const h = harness({ tickets: [readyTicket('T-1')], workspaceBase: base })
+
+    expect((await h.dispatcher.tick()).dispatched).toBe(1)
+    const provisioned = (await h.store.getEvents('add-rate-limiting')).find(
+      (event) => event.type === 'workspace.provisioned',
+    )
+    expect(provisioned?.payload.base).toEqual(base)
   })
 
   test('spec-aware naming sees the exact final spec and can surface a buried subject', async () => {
@@ -1003,6 +1029,65 @@ describe('Dispatcher harvest coordination', () => {
     expect(result).not.toBe('timed-out')
     expect(started).toBe(true)
     release()
+  })
+
+  test('an acknowledged pause gates every tick, while an unacknowledged pause still launches settlement', async () => {
+    let calls = 0
+    const h = harness({
+      startHarvest: () => {
+        calls += 1
+      },
+    })
+    await h.store.ensureRepo(REPO)
+    await h.store.appendRepo(REPO, {
+      actor: humanActor('operator'),
+      type: 'harvest.pause-requested',
+      payload: {},
+    })
+
+    await h.dispatcher.tick()
+    expect(calls).toBe(1)
+    await h.store.appendRepo(REPO, {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    await h.dispatcher.tick()
+    await h.dispatcher.tick({ acceptNewWork: false })
+    expect(calls).toBe(1)
+  })
+
+  test('a pending resume reopens harvest launch even while drained and at build capacity', async () => {
+    let calls = 0
+    const h = harness({
+      startHarvest: () => {
+        calls += 1
+      },
+    })
+    await seedBuild(h, { slug: 'capacity-holder' })
+    await h.store.claimLease('capacity-holder', 'live-runner', 3_600_000)
+    await h.store.ensureRepo(REPO)
+    await h.store.appendRepo(REPO, {
+      actor: humanActor('operator'),
+      type: 'harvest.pause-requested',
+      payload: {},
+    })
+    await h.store.appendRepo(REPO, {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    await h.store.appendRepo(REPO, {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+
+    expect(await h.dispatcher.tick({ acceptNewWork: false })).toEqual(
+      emptyTickReport(),
+    )
+    expect(calls).toBe(1)
+    expect(h.launches).toEqual([])
   })
 
   test('harvest remains independent of drain and occupied build capacity', async () => {

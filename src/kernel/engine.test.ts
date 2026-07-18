@@ -152,6 +152,7 @@ function prelude(): EventWrite[] {
       provider: 'worktree',
       ref: '/ws/auth-rate-limit',
       branch: 'ab/auth-rate-limit',
+      base: { source: 'remote', sha: 'base-sha' },
     }),
     ev('spec.imported', {
       artifact: { kind: 'spec', rev: 0 },

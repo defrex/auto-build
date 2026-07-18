@@ -23,6 +23,7 @@ import {
   phaseSchema,
   reviewVerdictKindSchema,
   ticketRefSchema,
+  workspaceBaseSchema,
 } from '../ontology'
 
 const empty = z.strictObject({})
@@ -57,6 +58,7 @@ export const eventPayloadSchemas = {
     provider: z.string().min(1),
     ref: z.string().min(1),
     branch: z.string().min(1),
+    base: workspaceBaseSchema,
   }),
   'workspace.released': empty,
 

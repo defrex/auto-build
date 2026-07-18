@@ -150,7 +150,7 @@ export async function writeFileIn(
   return path
 }
 
-async function initOrigin(dir: string, configToml: string): Promise<void> {
+async function initOrigin(dir: string, configToml: string): Promise<string> {
   // Reconcile fetches the current base from the conventional `origin` remote
   // at phase startup. Keep that seam real in every integration scenario: the
   // dispatcher works from `dir`, while a separate bare repo is its remote.
@@ -167,6 +167,7 @@ async function initOrigin(dir: string, configToml: string): Promise<void> {
   await git(['add', '-A'], dir)
   await git([...GIT_ID, 'commit', '-q', '-m', 'initial'], dir)
   await git(['push', '-q', '-u', 'origin', 'main'], dir)
+  return remote
 }
 
 // ── Event helpers ────────────────────────────────────────────────────────────
@@ -236,8 +237,10 @@ export type SkillHandlers = Record<string, SkillHandler>
 
 export interface E2eHarness {
   tmp: string
-  /** The real origin repo (also the dispatcher's `repo`). */
+  /** The real local checkout (also the dispatcher's `repo`). */
   origin: string
+  /** The bare `origin` remote used by the local checkout. */
+  remote: string
   store: MemoryBuildStore
   clock: ReturnType<typeof steppingClock>
   ids: IdSource
@@ -253,6 +256,9 @@ export interface E2eHarness {
   launched: Array<{ slug: string; runner: BuildRunner }>
   /** Nonzero-exit `ab` invocations (message + stderr). Scenarios assert []. */
   cliErrors: string[]
+  /** Advance bare origin through an independent checkout, deliberately
+   * leaving the dispatcher's local base ref stale. */
+  advanceRemote(changes: Record<string, string>, message: string): Promise<string>
   /** Run the most recently launched BuildRunner to its park point (§11). */
   runLatest(): Promise<BuildState>
   events(slug: string): Promise<AbEvent[]>
@@ -276,7 +282,9 @@ export async function makeHarness(opts: {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-e2e-'))
   const origin = join(tmp, 'origin')
   const configToml = opts.configToml ?? CONFIG_TOML
-  await initOrigin(origin, configToml)
+  const remote = await initOrigin(origin, configToml)
+  const remoteUpdater = join(tmp, 'remote-updater')
+  await git(['clone', '-q', remote, remoteUpdater], tmp)
 
   const clock = steppingClock()
   const ids = sequentialIds()
@@ -397,6 +405,7 @@ export async function makeHarness(opts: {
   return {
     tmp,
     origin,
+    remote,
     store,
     clock,
     ids,
@@ -408,6 +417,17 @@ export async function makeHarness(opts: {
     config,
     launched,
     cliErrors,
+    async advanceRemote(
+      changes: Record<string, string>,
+      message: string,
+    ): Promise<string> {
+      for (const [path, content] of Object.entries(changes)) {
+        await writeFileIn(remoteUpdater, path, content)
+      }
+      const sha = await commitAll(remoteUpdater, message)
+      await git(['push', '-q', 'origin', 'main'], remoteUpdater)
+      return sha
+    },
     async runLatest(): Promise<BuildState> {
       const entry = launched.at(-1)
       if (entry === undefined) throw new Error('runLatest: nothing launched')

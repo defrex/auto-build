@@ -81,8 +81,9 @@ Small, independently runnable, crash-safe:
   `[dispatcher].capacity`. On process startup it also attempts every current
   build for its repo, so re-running `ab dispatch` resumes durable work rather
   than only looking for new tickets. Each tick also owns observation
-  back-pressure: it resumes an unfinished repository harvest, or starts one
-  when the configured count threshold is reached. Cron-friendly.
+  back-pressure: unless the durable repository harvest gate is paused, it
+  resumes an unfinished harvest or starts one when the configured count
+  threshold is reached. Cron-friendly.
 - **harvest-runner** — one staged repository workflow (`scan → synthesize ⇄
   review → file`) under a repository lease; not a build and not a phase.
 - **ingesters** — other outer-loop processes turning signals into proposals (§12).
@@ -320,6 +321,20 @@ sandbox can resume a build a dead sandbox started: pull events, rehydrate
 scratch from latest artifact revisions, continue. v1 structurally could not
 do this.
 
+A Git workspace selects a base only when it creates the build branch. Before
+that first creation it fetches `refs/heads/<baseBranch>` from `origin` into a
+branch-scoped `refs/autobuild/provision/<branch>/base` ref, without updating
+`FETCH_HEAD`, tags, the operator's local base, or a shared remote-tracking ref,
+and creates the branch from the resolved immutable commit. Distinct destination
+refs isolate concurrent dispatches. If fetch or remote-ref resolution fails, it
+creates from the fully qualified local base commit and records the complete
+remote diagnostic. A missing remote and local base remains fatal.
+
+Re-provision is deliberately different: an existing worktree or build branch
+is reused at that branch's current tip before any remote access. It is never
+re-cut, rewound, or rebased from either base ref. This creation-time refresh is
+separate from reconcile's execution-time refresh (§15.7).
+
 ### 7.5 What the PR gets
 
 A summary comment — verdict history, verification results, links into the
@@ -508,7 +523,7 @@ uses a typed, repository-scoped namespace:
 | `ab harvest context` | harvest session | rebuild `.ab/` with claimed observations, reconciled ledger, proposals, prior findings |
 | `ab harvest submit <json>` | synthesize terminal | validate exact occurrence coverage and deposit a proposal artifact/event |
 | `ab harvest verdict <approve\|revise\|escalate> …` | review terminal | deposit notes, stamped findings, and structured verdict |
-| `ab harvest status [--events N] [--json] [--store …]` | operator/read-only | reduce and display the latest repository run |
+| `ab harvest status [--events N] [--json] [--store …]` | operator/read-only | reduce and display the repository pause gate plus the latest run |
 
 Agents never receive TicketSource credentials. Only the deterministic file step
 creates/adopts approved proposals and commits ledger facts.
@@ -666,6 +681,18 @@ the repository lease is the cross-process exclusivity gate. Heartbeats that
 positively report a lapsed lease force the former owner to re-claim or stop at
 the next durable boundary, so a replacement never advances concurrently.
 
+Harvest pause is a repository-wide durable gate, not a run status. A human
+`harvest.pause-requested` is acknowledged by the kernel as `harvest.paused` at
+the next safe unit boundary; no later step, review round, filing unit, or new
+scan starts while that fact stands. The open run, immutable observation claim,
+artifacts, and completed rounds remain unchanged. A human
+`harvest.resume-requested` is acknowledged as `harvest.resumed`; an open run
+continues from its reduced boundary, while an idle repository simply returns to
+normal threshold handling. Dispatch restart never clears the gate. Pending
+control commands remain actionable so a runner can acknowledge them under the
+repository lease; an acknowledged pause with no pending resume suppresses
+launch entirely.
+
 The fixed workflow is:
 
 1. **scan (deterministic)** — subtract all claimed occurrences, reconcile prior
@@ -689,10 +716,11 @@ The fixed workflow is:
 The harvester only proposes: it never claims, readies, grooms, or dispatches a
 proposal. A terminal escalation consumes its claimed snapshot so watch ticks do
 not hot-loop. Completed/cancelled/missing proposal refs remain dedup tombstones.
-Every step brackets start/result events and agent sessions/transcripts, and the
-latest run appears as the selectable `Harvest` row in the dispatch dashboard.
-Its internal run id remains in the repository journal, not in the row. Humans
-still own Triage → Ready.
+Every step brackets start/result events and agent sessions/transcripts, and
+repository harvest appears as the selectable `Harvest` row in the dispatch
+dashboard whenever a latest run or acknowledged pause exists. Its internal run
+id remains in the repository journal, not in the row. Humans still own Triage
+→ Ready.
 
 ## 13. Ticket source policy
 
@@ -733,11 +761,12 @@ sends no caller-supplied issue ID.
 ## 14. Operator UI
 
 The UI layer is defined by the seam, not any implementation: **subscribe to
-events, render, send commands** — commands being events in the same log
-(§15.2.7): `escalation.answered`, `build.pause-requested`,
-`build.resume-requested`, `build.abort-requested`,
-`build.auto-merge-requested`, and `build.auto-merge-cancelled`. The event
-vocabulary *is* the UI API; forge mutation remains kernel/dispatcher plumbing.
+events, render, send commands** — commands being events in the applicable build
+or repository log (§15.2.7): `escalation.answered`,
+`build.pause-requested`, `build.resume-requested`, `build.abort-requested`,
+`build.auto-merge-requested`, `build.auto-merge-cancelled`,
+`harvest.pause-requested`, and `harvest.resume-requested`. The event vocabulary
+*is* the UI API; forge mutation remains kernel/dispatcher plumbing.
 
 - v2.0 front end: terminal, with herdr as the multiplexer.
 - `ab dispatch` on a TTY is an interactive fixed frame. Its first row is one
@@ -751,9 +780,11 @@ vocabulary *is* the UI API; forge mutation remains kernel/dispatcher plumbing.
   keyboard input.
 - The bottom legend is the authoritative key map: Up/Down move through one
   ordered list — optional harvest first, then slug-sorted builds. `p` requests
-  pause/resume when an unblocked build is selected and opens optional resume
-  feedback when it is blocked; `m` toggles durable auto-merge intent; `d`
-  toggles in-memory dispatcher drain; Ctrl-C exits. While the blocked-resume
+  pause/resume when an unblocked build is selected, opens optional resume
+  feedback when it is blocked, and requests repository harvest pause/resume
+  when `Harvest` is selected; `m` toggles durable build auto-merge intent and is
+  an explanatory no-op on `Harvest`; `d` toggles in-memory dispatcher drain;
+  Ctrl-C exits. While the blocked-resume
   field is active, printable keys edit it (including `m`/`p`/`d`), Backspace
   edits, Enter submits, and Escape cancels; navigation and actions are
   suppressed. The field stays bound to its captured build and escalation ids,
@@ -763,12 +794,16 @@ vocabulary *is* the UI API; forge mutation remains kernel/dispatcher plumbing.
   row index. Drain belongs only to one running dispatcher: while on it skips
   new ticket claims but keeps janitor, stale-runner, harvest, and in-flight work
   running; restart defaults it off.
-- The latest repository harvest is projected with the same `PipelineStep`
-  representation and row grammar as builds. Its identity is `Harvest` (never
-  its internal run id); its status is right-aligned and uses the shared status
-  colors, including the display-only `PAUSED` signifier. The row is selectable,
-  but build-only `m` and `p` actions are explanatory no-ops. Harvest pause and
-  resume state, events, and dispatcher gating are not implemented here.
+- Repository harvest is projected with the same `PipelineStep` representation
+  and row grammar as builds. Its identity is `Harvest` (never its internal run
+  id); its status is right-aligned and uses the shared status colors. An
+  acknowledged repository gate renders literal yellow `PAUSED`, suppresses any
+  old open occurrence from appearing current, and freezes its timer at the
+  acknowledgement. The latest run's steps, claim count, and detail remain
+  visible; a pause before the first run still has a row. `p` appends the human
+  request selected from authoritative reduced gate state and reports
+  `harvest: pause requested` / `harvest: resume requested` in the status slot.
+  `m` remains the build-only explanatory no-op.
 - Auto-merge intent uses GitHub-native auto-merge whenever a real merge gate
   exists; on a proved-ungated branch it consents to the guarded non-admin squash
   fallback defined in §15.7.
@@ -824,12 +859,13 @@ interpret outer-loop state.
    columns on the `builds` table, never events — they would drown the log.
 7. **[D2] Operator commands are events in the same log.** Humans append
    `*-requested`/`*-cancelled` events and `escalation.answered`; kernel or
-   dispatcher plumbing acknowledges their effects with fact events. The store
-   is the *only* coordination surface — no side channel — and polling covers
-   commands exactly the way it covers `subscribe`. A runner that is dead still
-   receives pause/resume/abort commands and escalation answers on resume.
-   Auto-merge commands carry desired state until PR plumbing applies them,
-   including when the command predates PR creation.
+   dispatcher plumbing acknowledges their effects with fact events. Build
+   commands use the build stream and harvest commands use the repository
+   journal. The store is the *only* coordination surface — no side channel —
+   and polling covers commands exactly the way it covers `subscribe`. A runner
+   that is dead still receives pause/resume/abort commands and escalation
+   answers on resume. Auto-merge commands carry desired state until PR plumbing
+   applies them, including when the command predates PR creation.
 
 ### 15.3 Catalog
 
@@ -840,8 +876,15 @@ interpret outer-loop state.
 | `build.created` | dispatcher, human | `{ticket: {source, id, url, title}, repo, baseBranch}` |
 | `build.completed` | dispatcher | `{outcome: merged \| closed-unmerged \| abandoned}` |
 | `runner.attached` | kernel | `{instance, host, resumedFromSeq?}` |
-| `workspace.provisioned` | dispatcher, kernel | `{provider, ref, branch}` |
+| `workspace.provisioned` | dispatcher, kernel | `{provider, ref, branch, base: {source: remote, sha} \| {source: local, sha, remoteError} \| {source: existing, sha}}` |
 | `workspace.released` | dispatcher, kernel | `{}` |
+
+`workspace.provisioned.base.sha` is the branch commit actually selected or
+reused. `remote` means first creation from the freshly fetched origin tip;
+`local` is the non-fatal stale-local fallback and must retain why remote was
+unusable; `existing` means resume at an already-created branch tip with no base
+refresh. Historical provisioning facts without `base` remain readable, while
+all new writes require it.
 
 **Operator commands [D2]**
 
@@ -921,6 +964,8 @@ the matching started fact, never the older conflict snapshot.
 
 | Type | Actor | Payload |
 |---|---|---|
+| `harvest.pause-requested` / `harvest.resume-requested` | human | `{}` — durable repository commands |
+| `harvest.paused` / `harvest.resumed` | kernel | `{}` — safe-boundary acknowledgements |
 | `harvest.started` | kernel/dispatcher | `{run, observations: [{build, seq}], scan: artifact}` — atomically claims the snapshot |
 | `harvest.step.started` / `harvest.step.completed` | kernel | `{run, step: scan \| synthesize \| review \| file, round?, outcome?, artifact?}` |
 | `harvest.session.started` / `harvest.session.ended` | kernel | run/session/role/round and transcript/usage facts |
@@ -968,13 +1013,21 @@ fields match, so a stale acknowledgement cannot erase newer intent. The
 operator UI's build list is exactly this reduction over every build in the
 store.
 
+The separate repository harvest reducer derives `paused`, its acknowledgement
+sequence/time, pending pause/resume commands, runs, claims, and the disposition
+ledger from repository events. `harvest.pause-requested` alone does not close or
+change a run; only `harvest.paused` closes the gate. While paused,
+`openHarvestRun` still returns the same running snapshot. Opposing requests
+expire older pending intent, acknowledgements clear requests of their kind, and
+`harvest.resumed` reopens the gate without changing run or claim state.
+
 ### 15.6 Walkthroughs
 
 **Happy path** (elided: `session.started/ended` brackets around every agent
 run):
 
 ```
-build.created → workspace.provisioned → spec.imported → runner.attached
+build.created → workspace.provisioned{base:{source:remote,sha}} → spec.imported → runner.attached
 plan.started{r1} → plan.completed{plan@1}
 plan-review.started{r1} → plan-review.verdict{approve}
 implement.started{r1} → implement.completed{commits, notes@1}
@@ -1000,11 +1053,14 @@ human-resolved and the next reviewer round is told so.
 
 **C — sandbox death:** log ends at `implement.started {round: 2}`; heartbeat
 column goes stale → dispatcher expires the lease, provisions a fresh
-sandbox → `workspace.provisioned` → `runner.attached {resumedFromSeq}` →
-reducer says implement r2 started-not-completed → re-run the phase from its
-start: fetch the branch at round 1's pushed `head` [D3], `ab context`
-rehydrates scratch from the store, fresh session. Uncommitted round-2 work
-is lost by design (§7.3 — phase boundaries are the resume points).
+sandbox → `workspace.provisioned {base: {source: existing, sha: <round-1
+head>}}` → `runner.attached {resumedFromSeq}` → reducer says implement r2
+started-not-completed → re-run the phase from its start. The provider restores
+the already-created branch at round 1's pushed `head` [D3]; the Git adapter
+checks that branch before remote access and never re-cuts it from a newer base.
+`ab context` rehydrates scratch from the store into a fresh session.
+Uncommitted round-2 work is lost by design (§7.3 — phase boundaries are the
+resume points).
 
 A new `ab dispatch` process does not wait for the ordinary stale-lease sweep
 to discover work: on its first tick it attempts every actionable,

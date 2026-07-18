@@ -26,12 +26,14 @@ import { join } from 'node:path'
 import { loadConfig } from '../config/load'
 import type { Config } from '../config/schema'
 import type { AbEvent } from '../events/catalog'
+import { humanActor } from '../events/envelope'
 import {
   randomIds,
   randomUuids,
   type IdSource,
   type UuidSource,
 } from '../ids'
+import { reduceHarvest } from '../kernel/harvest'
 import { reduceBuild, type BuildState } from '../kernel/reducer'
 import {
   buildDashboard,
@@ -70,6 +72,7 @@ import {
 import { RemoteBuildStore } from '../store/remote/client'
 import {
   BuildControlError,
+  buildControlUser,
   controlBuild,
   type BuildControlResult,
 } from './build-control'
@@ -451,7 +454,7 @@ class DispatchLoop {
       this.say(
         action === 'auto-merge'
           ? 'Harvest auto-merge unavailable: select a build'
-          : 'Harvest pause/resume unavailable: harvest controls are not implemented',
+          : 'Harvest pause/resume unavailable: select a build',
       )
       return undefined
     }
@@ -469,6 +472,10 @@ class DispatchLoop {
   }
 
   private async togglePause(): Promise<void> {
+    if (this.selection?.kind === 'harvest') {
+      await this.toggleHarvestPause()
+      return
+    }
     const slug = this.selectedBuildSlug('pause/resume')
     if (slug === undefined) return
 
@@ -503,6 +510,23 @@ class DispatchLoop {
       throw new Error('build-control returned an invalid pause toggle result')
     }
     this.say(`build ${slug}: ${result.command} requested`)
+    await this.renderOnce()
+  }
+
+  private async toggleHarvestPause(): Promise<void> {
+    const { store } = this.wiring
+    const repo = this.opts.targetRepo
+    await store.ensureRepo(repo)
+    const state = reduceHarvest(await store.getRepoEvents(repo))
+    const resume = state.paused
+    await store.appendRepo(repo, {
+      actor: humanActor(buildControlUser(this.opts.env)),
+      type: resume
+        ? 'harvest.resume-requested'
+        : 'harvest.pause-requested',
+      payload: {},
+    })
+    this.say(`harvest: ${resume ? 'resume' : 'pause'} requested`)
     await this.renderOnce()
   }
 
@@ -747,8 +771,9 @@ class DispatchLoop {
         this.recordHarvestResult(result)
         if (
           !this.stopped &&
-          result.outcome !== 'idle' &&
-          result.outcome !== 'held'
+          (result.outcome === 'completed' ||
+            result.outcome === 'escalated' ||
+            result.outcome === 'failed')
         ) {
           this.say(`harvest ${result.run} ${result.outcome}`)
         }

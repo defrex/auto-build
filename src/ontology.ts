@@ -172,6 +172,24 @@ export const commitRangeSchema = z.strictObject({
 })
 export type CommitRange = z.infer<typeof commitRangeSchema>
 
+/** How a workspace's branch tip was selected at provision time. */
+export const workspaceBaseSchema = z.discriminatedUnion('source', [
+  z.strictObject({
+    source: z.literal('remote'),
+    sha: z.string().min(1),
+  }),
+  z.strictObject({
+    source: z.literal('local'),
+    sha: z.string().min(1),
+    remoteError: z.string().min(1),
+  }),
+  z.strictObject({
+    source: z.literal('existing'),
+    sha: z.string().min(1),
+  }),
+])
+export type WorkspaceBase = z.infer<typeof workspaceBaseSchema>
+
 // ── Feedback (producer round input — SPEC §10, §15.3 implement.started) ──────
 
 export const feedbackSchema = z.union([

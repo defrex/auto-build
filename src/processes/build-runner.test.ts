@@ -295,7 +295,12 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
     await store.append(SLUG, {
       actor: DISPATCHER,
       type: 'workspace.provisioned',
-      payload: { provider: handle.provider, ref: handle.ref, branch: handle.branch },
+      payload: {
+        provider: handle.provider,
+        ref: handle.ref,
+        branch: handle.branch,
+        base: handle.base,
+      },
     })
     await store.appendWithArtifacts(
       SLUG,
