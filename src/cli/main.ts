@@ -16,6 +16,11 @@ import type { Forge } from '../ports/types'
 import type { Exec } from '../ports/workspace/git-worktree'
 import type { IdSource } from '../ids'
 import { artifactGet, artifactPut } from './artifact'
+import {
+  abBuildControl,
+  type BuildControlAction,
+  type BuildControlResult,
+} from './build-control'
 import { buildContext, type ContextManifest } from './context'
 import { abDispatch } from './dispatch'
 import type { DashboardRendererResolver } from './dashboard/render'
@@ -38,8 +43,9 @@ import {
 } from './harvest'
 
 /**
- * Commands that run OUTSIDE build sessions (§16.3, §8.8, §3.3) — they take a
- * repo path, not a build, so they must work with no AB_* environment set.
+ * Commands that run OUTSIDE phase sessions (§16.3, §8.8, §3.3). Repository
+ * commands resolve the cwd; durable controls additionally take a target build
+ * slug. None requires the ambient AB_* phase tuple.
  *
  * `src/cli/binary.ts` routes on this set: a command absent from it goes through
  * `resolveCliEnv`, which REQUIRES AB_STORE/AB_BUILD/AB_PHASE/AB_SESSION and
@@ -55,6 +61,11 @@ export const SESSIONLESS_COMMANDS = new Set([
   'dispatch',
   'builds',
   'build',
+  'pause',
+  'resume',
+  'auto-merge',
+  'answer',
+  'abort',
   'models',
   'help',
   '--help',
@@ -86,9 +97,9 @@ export interface SessionlessCliDeps {
   workspacePath: string
   stdout: (line: string) => void
   stderr: (line: string) => void
-  /** Process environment for sessionless commands that need adapter secrets
-   * (ticket create, dispatch — §8.8); distinct from `env`, the resolved
-   * ambient auth. */
+  /** Raw process environment for sessionless store selection, operator
+   * provenance/self-control checks, and adapter secrets; distinct from `env`,
+   * the resolved phase-session tuple. */
   processEnv?: Record<string, string | undefined>
   /** Stop signal for long-running sessionless commands (`ab dispatch`'s watch
    * loop); the binary aborts it on SIGINT. */
@@ -137,8 +148,8 @@ function requireSession(command: string, deps: SessionlessCliDeps): CliDeps {
   ) {
     throw new Error(
       `'ab ${command}' runs inside a build session — the runner sets AB_STORE, ` +
-        'AB_BUILD, AB_PHASE, AB_SESSION for every session (SPEC §8.1, D8); only ' +
-        "'ab init' and 'ab upgrade' run outside one.",
+        'AB_BUILD, AB_PHASE, AB_SESSION for every session (SPEC §8.1, D8). ' +
+        'Use `ab help` for commands that run sessionless.',
     )
   }
   return { ...deps, store, env, forge, exec, ids, clock }
@@ -179,6 +190,13 @@ const HELP = [
   '  ab build status <slug> [--events <n>] [--json] [--store <ref>]',
   '                                         detailed state for one build — escalations, sessions, verify, PR, lease;',
   '                                         --events <n> appends the newest n events (read-only, runs outside sessions)',
+  '  ab pause <slug> [--store <ref>]        request that an active build pause (sessionless)',
+  '  ab resume <slug> [--store <ref>]       request that an active build resume (sessionless)',
+  '  ab auto-merge <slug> <on|off> [--store <ref>]',
+  '                                         request or cancel native squash auto-merge (sessionless)',
+  '  ab answer <slug> [<text>] [--store <ref>]',
+  '                                         answer every open escalation: guidance with text, bare retry without; resumes a paused build last (sessionless)',
+  '  ab abort <slug> [--store <ref>]        request that an active build abort (sessionless)',
   '  ab harvest status [--events <n>] [--json] [--store <ref>]',
   '                                         latest repository harvest workflow and paper trail (read-only)',
   '  ab harvest context [--json]            hydrate harvest session inputs',
@@ -245,6 +263,86 @@ function flagValue(value: string | undefined, name: string, usage: string): stri
     )
   }
   return value
+}
+
+interface ParsedBuildControlArgs {
+  positionals: string[]
+  storeRef?: string
+}
+
+/** New operator commands parse --store locally so it cannot leak into the
+ * phase-command flag vocabulary. */
+function parseBuildControlArgs(
+  args: string[],
+  usage: string,
+): ParsedBuildControlArgs {
+  const positionals: string[] = []
+  let storeRef: string | undefined
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!
+    if (arg === '--store') {
+      if (storeRef !== undefined) {
+        throw new Error(`--store may be supplied only once — ${usage}`)
+      }
+      storeRef = flagValue(args[(i += 1)], 'store', usage)
+    } else if (arg.startsWith('--')) {
+      throw new Error(`unknown argument "${arg}" — ${usage}`)
+    } else {
+      positionals.push(arg)
+    }
+  }
+  return {
+    positionals,
+    ...(storeRef !== undefined ? { storeRef } : {}),
+  }
+}
+
+function buildControlConfirmation(result: BuildControlResult): string {
+  switch (result.kind) {
+    case 'command': {
+      const outcome: Record<typeof result.command, string> = {
+        pause: 'pause requested',
+        resume: 'resume requested',
+        abort: 'abort requested',
+        'auto-merge-on': 'auto-merge requested',
+        'auto-merge-off': 'auto-merge cancelled',
+      }
+      return `build ${result.slug}: ${outcome[result.command]}`
+    }
+    case 'answered':
+      return (
+        `build ${result.slug}: answered ${result.count} open escalation${
+          result.count === 1 ? '' : 's'
+        } with ${result.resolution}` +
+        (result.resumed ? '; resume requested' : '')
+      )
+    case 'answer-required':
+      throw new Error(
+        'build-control requested interactive feedback for an explicit CLI command',
+      )
+  }
+}
+
+async function runBuildControl(
+  deps: SessionlessCliDeps,
+  slug: string,
+  action: BuildControlAction,
+  storeRef?: string,
+): Promise<void> {
+  if (deps.exec === undefined) {
+    throw new Error(
+      "build-control commands need an exec seam — this is a wiring bug in the ab binary",
+    )
+  }
+  const result = await abBuildControl({
+    targetRepo: deps.workspacePath,
+    env: deps.processEnv ?? {},
+    exec: deps.exec,
+    slug,
+    action,
+    ...(storeRef !== undefined ? { storeRef } : {}),
+  })
+  deps.stdout(buildControlConfirmation(result))
 }
 
 function stringFlag(parsed: ParsedArgs, name: string): string | undefined {
@@ -556,6 +654,61 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         ...(storeRef !== undefined ? { storeRef } : {}),
         ...(deps.clock !== undefined ? { now: deps.clock } : {}),
       })
+      return 0
+    }
+
+    case 'pause':
+    case 'resume':
+    case 'abort': {
+      const usage = `usage: ab ${command} <slug> [--store <ref>]`
+      const parsed = parseBuildControlArgs(rest, usage)
+      if (parsed.positionals.length !== 1) throw new Error(usage)
+      await runBuildControl(
+        deps,
+        parsed.positionals[0]!,
+        { kind: command },
+        parsed.storeRef,
+      )
+      return 0
+    }
+
+    case 'auto-merge': {
+      const usage =
+        'usage: ab auto-merge <slug> <on|off> [--store <ref>]'
+      const parsed = parseBuildControlArgs(rest, usage)
+      const [slug, setting] = parsed.positionals
+      if (
+        parsed.positionals.length !== 2 ||
+        slug === undefined ||
+        (setting !== 'on' && setting !== 'off')
+      ) {
+        throw new Error(usage)
+      }
+      await runBuildControl(
+        deps,
+        slug,
+        { kind: setting === 'on' ? 'auto-merge-on' : 'auto-merge-off' },
+        parsed.storeRef,
+      )
+      return 0
+    }
+
+    case 'answer': {
+      const usage =
+        'usage: ab answer <slug> [<text>] [--store <ref>]'
+      const parsed = parseBuildControlArgs(rest, usage)
+      const [slug, ...text] = parsed.positionals
+      if (slug === undefined) throw new Error(usage)
+      const answer = text.join(' ')
+      await runBuildControl(
+        deps,
+        slug,
+        {
+          kind: 'answer',
+          ...(answer !== '' ? { text: answer } : {}),
+        },
+        parsed.storeRef,
+      )
       return 0
     }
 
