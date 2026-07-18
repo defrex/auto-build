@@ -253,6 +253,72 @@ test('a. happy path: ready ticket → dispatch → pipeline → PR → janitor m
   expect(reduced.outcome).toBe('merged')
 }, 30_000)
 
+test('a1. dispatch cuts a new branch from remote main while local main is stale', async () => {
+  const h = await track(
+    makeHarness({ handlers: happyHandlers(), tickets: [readyTicket('T-1')] }),
+  )
+  const staleLocalSha = await git(['rev-parse', 'refs/heads/main'], h.origin)
+  const remoteSha = await h.advanceRemote(
+    { 'remote-only.txt': 'landed before dispatch\n' },
+    'base: remote-only change',
+  )
+  expect(remoteSha).not.toBe(staleLocalSha)
+  expect(await git(['rev-parse', 'refs/heads/main'], h.origin)).toBe(staleLocalSha)
+
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    dispatched: 1,
+  })
+  const events = await h.events(SLUG)
+  expect(typesOf(events)).toEqual([
+    'build.created',
+    'workspace.provisioned',
+    'spec.imported',
+  ])
+  const provisioned = ofType(events, 'workspace.provisioned')[0]!
+  expect(provisioned.payload.base).toEqual({ source: 'remote', sha: remoteSha })
+  expect(await git(['rev-parse', 'HEAD'], provisioned.payload.ref)).toBe(remoteSha)
+  expect(existsSync(join(provisioned.payload.ref, 'remote-only.txt'))).toBe(true)
+  // Provisioning uses a private destination ref; operator-owned local refs
+  // remain exactly as stale as they were before dispatch.
+  expect(await git(['rev-parse', 'refs/heads/main'], h.origin)).toBe(staleLocalSha)
+  expect(await git(['rev-parse', 'refs/remotes/origin/main'], h.origin)).toBe(
+    staleLocalSha,
+  )
+}, 30_000)
+
+test('a1. unavailable origin still dispatches from local main and records why', async () => {
+  const h = await track(
+    makeHarness({ handlers: happyHandlers(), tickets: [readyTicket('T-1')] }),
+  )
+  const localSha = await git(['rev-parse', 'refs/heads/main'], h.origin)
+  await git(['remote', 'remove', 'origin'], h.origin)
+
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    dispatched: 1,
+  })
+  const events = await h.events(SLUG)
+  expect(typesOf(events)).toEqual([
+    'build.created',
+    'workspace.provisioned',
+    'spec.imported',
+  ])
+  const provisioned = ofType(events, 'workspace.provisioned')[0]!
+  expect(provisioned.payload.base.source).toBe('local')
+  if (provisioned.payload.base.source !== 'local') {
+    throw new Error('expected local fallback evidence')
+  }
+  expect(provisioned.payload.base.sha).toBe(localSha)
+  expect(provisioned.payload.base.remoteError).toContain(
+    'fetch --no-tags --no-write-fetch-head',
+  )
+  expect(provisioned.payload.base.remoteError).toMatch(
+    /origin.*repository|repository.*origin/i,
+  )
+  expect(await git(['rev-parse', 'HEAD'], provisioned.payload.ref)).toBe(localSha)
+}, 30_000)
+
 test('gated CLEAN auto-merge requested before finalize remains GitHub-native', async () => {
   const h = await track(
     makeHarness({ handlers: happyHandlers(), tickets: [readyTicket('T-1')] }),

@@ -320,6 +320,20 @@ sandbox can resume a build a dead sandbox started: pull events, rehydrate
 scratch from latest artifact revisions, continue. v1 structurally could not
 do this.
 
+A Git workspace selects a base only when it creates the build branch. Before
+that first creation it fetches `refs/heads/<baseBranch>` from `origin` into a
+branch-scoped `refs/autobuild/provision/<branch>/base` ref, without updating
+`FETCH_HEAD`, tags, the operator's local base, or a shared remote-tracking ref,
+and creates the branch from the resolved immutable commit. Distinct destination
+refs isolate concurrent dispatches. If fetch or remote-ref resolution fails, it
+creates from the fully qualified local base commit and records the complete
+remote diagnostic. A missing remote and local base remains fatal.
+
+Re-provision is deliberately different: an existing worktree or build branch
+is reused at that branch's current tip before any remote access. It is never
+re-cut, rewound, or rebased from either base ref. This creation-time refresh is
+separate from reconcile's execution-time refresh (§15.7).
+
 ### 7.5 What the PR gets
 
 A summary comment — verdict history, verification results, links into the
@@ -840,8 +854,15 @@ interpret outer-loop state.
 | `build.created` | dispatcher, human | `{ticket: {source, id, url, title}, repo, baseBranch}` |
 | `build.completed` | dispatcher | `{outcome: merged \| closed-unmerged \| abandoned}` |
 | `runner.attached` | kernel | `{instance, host, resumedFromSeq?}` |
-| `workspace.provisioned` | dispatcher, kernel | `{provider, ref, branch}` |
+| `workspace.provisioned` | dispatcher, kernel | `{provider, ref, branch, base: {source: remote, sha} \| {source: local, sha, remoteError} \| {source: existing, sha}}` |
 | `workspace.released` | dispatcher, kernel | `{}` |
+
+`workspace.provisioned.base.sha` is the branch commit actually selected or
+reused. `remote` means first creation from the freshly fetched origin tip;
+`local` is the non-fatal stale-local fallback and must retain why remote was
+unusable; `existing` means resume at an already-created branch tip with no base
+refresh. Historical provisioning facts without `base` remain readable, while
+all new writes require it.
 
 **Operator commands [D2]**
 
@@ -974,7 +995,7 @@ store.
 run):
 
 ```
-build.created → workspace.provisioned → spec.imported → runner.attached
+build.created → workspace.provisioned{base:{source:remote,sha}} → spec.imported → runner.attached
 plan.started{r1} → plan.completed{plan@1}
 plan-review.started{r1} → plan-review.verdict{approve}
 implement.started{r1} → implement.completed{commits, notes@1}
@@ -1000,11 +1021,14 @@ human-resolved and the next reviewer round is told so.
 
 **C — sandbox death:** log ends at `implement.started {round: 2}`; heartbeat
 column goes stale → dispatcher expires the lease, provisions a fresh
-sandbox → `workspace.provisioned` → `runner.attached {resumedFromSeq}` →
-reducer says implement r2 started-not-completed → re-run the phase from its
-start: fetch the branch at round 1's pushed `head` [D3], `ab context`
-rehydrates scratch from the store, fresh session. Uncommitted round-2 work
-is lost by design (§7.3 — phase boundaries are the resume points).
+sandbox → `workspace.provisioned {base: {source: existing, sha: <round-1
+head>}}` → `runner.attached {resumedFromSeq}` → reducer says implement r2
+started-not-completed → re-run the phase from its start. The provider restores
+the already-created branch at round 1's pushed `head` [D3]; the Git adapter
+checks that branch before remote access and never re-cuts it from a newer base.
+`ab context` rehydrates scratch from the store into a fresh session.
+Uncommitted round-2 work is lost by design (§7.3 — phase boundaries are the
+resume points).
 
 A new `ab dispatch` process does not wait for the ordinary stale-lease sweep
 to discover work: on its first tick it attempts every actionable,
