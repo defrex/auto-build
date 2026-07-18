@@ -43,7 +43,11 @@ function record(overrides: Partial<BuildRecord> = {}): BuildRecord {
   }
 }
 
-const fakeExec: Exec = async () => ({ stdout: `${REPO}/.git\n`, stderr: '', exitCode: 0 })
+const fakeExec: Exec = async () => ({
+  stdout: `${REPO}/.git\n${REPO}/.git\n${REPO}\n`,
+  stderr: '',
+  exitCode: 0,
+})
 
 /** A store seeded with one build per spec; each gets its own event log. */
 async function seedBuild(
@@ -560,12 +564,27 @@ describe('statusFilter', () => {
 })
 
 describe('currentRepo', () => {
-  // Agents run inside linked worktrees; --git-common-dir is what resolves back
-  // to the main repo there, and its dirname is the repo root.
-  test('resolves the main repo root from --git-common-dir', async () => {
+  // Status re-exports the shared resolver: linked worktree topology resolves
+  // through Git's worktree registry to the main checkout.
+  test('resolves the main repo root from linked-worktree metadata', async () => {
     const exec: Exec = async (cmd) => {
-      expect(cmd).toContain('--git-common-dir')
-      return { stdout: '/Users/dev/code/acme-app/.git\n', stderr: '', exitCode: 0 }
+      if (cmd[1] === 'rev-parse') {
+        expect(cmd).toContain('--git-common-dir')
+        return {
+          stdout:
+            '/Users/dev/code/acme-app/.git/worktrees/build\n' +
+            '/Users/dev/code/acme-app/.git\n' +
+            '/worktrees/build\n',
+          stderr: '',
+          exitCode: 0,
+        }
+      }
+      expect(cmd).toEqual(['git', 'worktree', 'list', '--porcelain', '-z'])
+      return {
+        stdout: 'worktree /Users/dev/code/acme-app\0HEAD abc\0\0',
+        stderr: '',
+        exitCode: 0,
+      }
     }
     expect(await currentRepo('/anywhere', exec)).toBe('/Users/dev/code/acme-app')
   })

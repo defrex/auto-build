@@ -68,7 +68,7 @@ describe('harvest status', () => {
     const store = new MemoryBuildStore({ clock: steppingClock() })
     await store.ensureRepo('/main/repo')
     const exec = async () => ({
-      stdout: '/main/repo/.git\n',
+      stdout: '/main/repo/.git\n/main/repo/.git\n/main/repo\n',
       stderr: '',
       exitCode: 0,
     })

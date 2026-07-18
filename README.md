@@ -623,9 +623,11 @@ Each repository owns one state tree under its main checkout by default:
 | `.autobuild/worktrees/ab-<slug>/` | One git worktree per build. The branch is `ab/<slug>`; the directory name flattens it — every run of characters outside `[A-Za-z0-9._-]` becomes a `-`, so branch `ab/add-rate-limiting` lives at `worktrees/ab-add-rate-limiting/`. |
 | `.autobuild/tickets/` | Default `file` ticket source (`triage/`, `ready/`, `doing/`, `done/`) |
 
-Git's common directory identifies the main checkout, so commands run from an
-autobuild-created linked worktree use the same state tree and ticket tracker as
-the main checkout. There is no machine-level or home-directory fallback.
+Git's repository/worktree metadata identifies the main checkout, so commands
+run from an autobuild-created linked worktree use the same state tree and ticket
+tracker as the main checkout. Submodules and checkouts using a separate Git
+directory remain distinct repositories with state beneath their own working
+trees. There is no machine-level or home-directory fallback.
 
 Store selection is identical everywhere: explicit `--store <ref>` wins over a
 nonempty `AB_STORE`, which wins over `<main-repo>/.autobuild`. A local override

@@ -22,16 +22,22 @@ async function git(cwd: string, ...args: string[]): Promise<void> {
 }
 
 describe('resolveMainRepo', () => {
-  test('uses the absolute Git common directory', async () => {
+  test('uses the top level when the Git and common directories are equal', async () => {
     const exec: Exec = async (cmd, opts) => {
       expect(cmd).toEqual([
         'git',
         'rev-parse',
         '--path-format=absolute',
+        '--git-dir',
         '--git-common-dir',
+        '--show-toplevel',
       ])
       expect(opts.cwd).toBe('/worktree')
-      return { stdout: '/main/repo/.git\n', stderr: '', exitCode: 0 }
+      return {
+        stdout: '/main/repo/.git\n/main/repo/.git\n/main/repo\n',
+        stderr: '',
+        exitCode: 0,
+      }
     }
     expect(await resolveMainRepo('/worktree', exec)).toBe('/main/repo')
   })
@@ -61,6 +67,51 @@ describe('resolveMainRepo', () => {
     const canonicalMain = await realpath(main)
     expect(await resolveMainRepo(main, spawnExec)).toBe(canonicalMain)
     expect(await resolveMainRepo(linked, spawnExec)).toBe(canonicalMain)
+  })
+
+  test('keeps sibling submodule checkouts as distinct repository roots', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ab-repo-state-submodule-'))
+    cleanup.push(root)
+    const child = join(root, 'child-origin')
+    const parent = join(root, 'parent')
+
+    await git(root, 'init', '-b', 'main', child)
+    await git(child, 'config', 'user.email', 'test@example.com')
+    await git(child, 'config', 'user.name', 'Test')
+    await Bun.write(join(child, 'README.md'), 'child\n')
+    await git(child, 'add', 'README.md')
+    await git(child, 'commit', '-m', 'child fixture')
+
+    await git(root, 'init', '-b', 'main', parent)
+    await git(parent, 'config', 'user.email', 'test@example.com')
+    await git(parent, 'config', 'user.name', 'Test')
+    await Bun.write(join(parent, 'README.md'), 'parent\n')
+    await git(parent, 'add', 'README.md')
+    await git(parent, 'commit', '-m', 'parent fixture')
+    await git(
+      parent,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      child,
+      'sub-a',
+    )
+    await git(
+      parent,
+      '-c',
+      'protocol.file.allow=always',
+      'submodule',
+      'add',
+      child,
+      'sub-b',
+    )
+
+    const subA = await realpath(join(parent, 'sub-a'))
+    const subB = await realpath(join(parent, 'sub-b'))
+    expect(await resolveMainRepo(subA, spawnExec)).toBe(subA)
+    expect(await resolveMainRepo(subB, spawnExec)).toBe(subB)
+    expect(subA).not.toBe(subB)
   })
 })
 
@@ -116,11 +167,19 @@ describe('resolveRepoStatePaths', () => {
 })
 
 test('resolveRepoState selects paths after resolving repository identity', async () => {
-  const exec: Exec = async () => ({
-    stdout: '/main/repo/.git\n',
-    stderr: '',
-    exitCode: 0,
-  })
+  const exec: Exec = async (cmd) =>
+    cmd[1] === 'rev-parse'
+      ? {
+          stdout:
+            '/main/repo/.git/worktrees/linked\n/main/repo/.git\n/linked\n',
+          stderr: '',
+          exitCode: 0,
+        }
+      : {
+          stdout: 'worktree /main/repo\0HEAD abc\0branch refs/heads/main\0\0',
+          stderr: '',
+          exitCode: 0,
+        }
   expect(
     await resolveRepoState({
       targetRepo: '/linked',

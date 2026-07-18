@@ -380,10 +380,13 @@ By default, each Git repository owns one self-contained state tree at
 - `worktrees/` — autobuild-created Git worktrees.
 - `tickets/` — the default location for the `file` ticket source.
 
-The main checkout comes from Git's absolute common directory, not the current
-worktree's top level. Commands run in an autobuild-created linked worktree
-therefore read the main checkout's state and file tickets. There is no
-home-directory fallback: a repository with no state tree starts empty.
+The main checkout comes from Git's absolute repository/worktree topology, not
+blindly from the current worktree's top level or the parent of its Git common
+directory. Commands run in an autobuild-created linked worktree therefore read
+the main checkout's state and file tickets, while submodules and
+separate-Git-dir checkouts keep distinct roots beneath their own working trees.
+There is no home-directory fallback: a repository with no state tree starts
+empty.
 
 Every command uses the same precedence: explicit `--store <ref>` > nonempty
 `AB_STORE` > `<main-repo>/.autobuild`. Relative local overrides are normalized

@@ -286,10 +286,12 @@ unchanged for build callers.
 1. **Local** — one self-contained state tree at
    `<main-repo>/.autobuild/` by default: `autobuild.sqlite`, content-addressed
    `blobs/`, Git `worktrees/`, and the file source's default `tickets/` tree.
-   The main checkout is derived from Git's absolute common directory, so a
-   command run inside a linked worktree resolves the same state. There is no
-   home-directory fallback or machine-global state location. Selection is
-   uniform for sessionless commands: explicit `--store` > nonempty `AB_STORE`
+   The main checkout is derived from Git's absolute repository/worktree
+   topology, so a command run inside a linked worktree resolves the same state,
+   while submodules and separate-Git-dir checkouts retain their own working-tree
+   roots. There is no home-directory fallback or machine-global state
+   location. Selection is uniform for sessionless commands: explicit `--store`
+   > nonempty `AB_STORE`
    > repository default. A local override is normalized against the main repo
    and relocates the complete local tree, including worktrees and default file
    tickets. An explicitly configured `[tickets].dir` remains repo-relative.

@@ -235,7 +235,7 @@ describe('abTicketCreate', () => {
     await abTicketCreate({
       targetRepo: join(tmp, 'linked-worktree'),
       exec: async () => ({
-        stdout: `${join(tmp, '.git')}\n`,
+        stdout: `${join(tmp, '.git')}\n${join(tmp, '.git')}\n${tmp}\n`,
         stderr: '',
         exitCode: 0,
       }),
@@ -361,7 +361,11 @@ describe('runCli — ticket routing', () => {
     return {
       deps: {
         workspacePath: tmp,
-        exec: async () => ({ stdout: `${join(tmp, '.git')}\n`, stderr: '', exitCode: 0 }),
+        exec: async () => ({
+          stdout: `${join(tmp, '.git')}\n${join(tmp, '.git')}\n${tmp}\n`,
+          stderr: '',
+          exitCode: 0,
+        }),
         stdout: (line: string) => out.push(line),
         stderr: (line: string) => err.push(line),
       },
