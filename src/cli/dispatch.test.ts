@@ -1516,7 +1516,7 @@ describe('abDispatch interactive keyboard controls', () => {
       try {
         return await happyFinalize(cli)
       } catch (error) {
-        if (!String(error).includes('protected branch rules are not configured')) {
+        if (!String(error).includes('permission denied enabling native auto-merge')) {
           throw error
         }
         await cli.run(['escalate', blocker])
@@ -1534,11 +1534,11 @@ describe('abDispatch interactive keyboard controls', () => {
       workspacePath: string,
       number: number,
       enabled: boolean,
-    ): Promise<void> => {
+    ) => {
       if (enabled) {
-        throw new Error('protected branch rules are not configured')
+        throw new Error('permission denied enabling native auto-merge')
       }
-      await nativeSetAutoMerge(workspacePath, number, enabled)
+      return nativeSetAutoMerge(workspacePath, number, enabled)
     }
 
     const term = fakeTerminal()
@@ -1639,7 +1639,7 @@ describe('abDispatch interactive keyboard controls', () => {
         events.filter((event) => event.type === 'escalation.raised'),
       ).toHaveLength(1)
       expect(fx.cliErrors).toHaveLength(1)
-      expect(fx.cliErrors[0]).toContain('protected branch rules are not configured')
+      expect(fx.cliErrors[0]).toContain('permission denied enabling native auto-merge')
     } finally {
       if (!planReleased) releasePlan()
       input.press('interrupt')

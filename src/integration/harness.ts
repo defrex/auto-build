@@ -270,6 +270,8 @@ export async function makeHarness(opts: {
    * CONFIG_TOML, so every existing scenario is untouched; a scenario proving
    * two-axis routing (§9) supplies its own `[roles.default]`/phase roles. */
   configToml?: string
+  /** Forge gate existence is independent from current PR mergeability. */
+  gatePresence?: 'present' | 'absent'
 }): Promise<E2eHarness> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-e2e-'))
   const origin = join(tmp, 'origin')
@@ -279,7 +281,7 @@ export async function makeHarness(opts: {
   const clock = steppingClock()
   const ids = sequentialIds()
   const store = new MemoryBuildStore({ clock })
-  const forge = new FakeForge()
+  const forge = new FakeForge({ gatePresence: opts.gatePresence ?? 'present' })
   const tickets = new FakeTicketSource(opts.tickets ?? [])
   const ticketSource: TicketSource = opts.ticketSource ?? tickets
   const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })

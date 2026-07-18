@@ -252,12 +252,20 @@ test('a. happy path: ready ticket → dispatch → pipeline → PR → janitor m
   expect(reduced.outcome).toBe('merged')
 }, 30_000)
 
-test('auto-merge requested before finalize is applied as native squash and completes on the next poll', async () => {
+test('gated CLEAN auto-merge requested before finalize remains GitHub-native', async () => {
   const h = await track(
     makeHarness({ handlers: happyHandlers(), tickets: [readyTicket('T-1')] }),
   )
 
   await h.dispatcher.tick()
+  const realOpen = h.forge.openPr.bind(h.forge)
+  h.forge.openPr = async (opts) => {
+    const pr = await realOpen(opts)
+    // A satisfied required gate is CLEAN; it must not switch ownership merely
+    // because all current requirements happen to pass.
+    h.forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    return pr
+  }
   const command = await h.store.append(SLUG, {
     actor: humanActor('operator'),
     type: 'build.auto-merge-requested',
@@ -291,6 +299,65 @@ test('auto-merge requested before finalize is applied as native squash and compl
     'build.completed',
   ])
   expect(reduceBuild(final).outcome).toBe('merged')
+}, 30_000)
+
+test('ungated auto-merge intent finalizes, guarded-squashes in janitor, and completes without escalation', async () => {
+  const h = await track(
+    makeHarness({
+      handlers: happyHandlers(),
+      tickets: [readyTicket('T-1')],
+      gatePresence: 'absent',
+    }),
+  )
+
+  await h.dispatcher.tick()
+  const realOpen = h.forge.openPr.bind(h.forge)
+  h.forge.openPr = async (opts) => {
+    const pr = await realOpen(opts)
+    h.forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    return pr
+  }
+  await h.store.append(SLUG, {
+    actor: humanActor('operator'),
+    type: 'build.auto-merge-requested',
+    payload: {},
+  })
+
+  const parked = await h.runLatest()
+  expect(h.cliErrors).toEqual([])
+  expect(parked.prState).toBe('open')
+  let events = await h.events(SLUG)
+  expect(typesOf(events)).toContain('finalize.completed')
+  expect(typesOf(events)).not.toContain('pr.auto-merge-enabled')
+  expect(typesOf(events)).not.toContain('escalation.raised')
+  expect(h.forge.squashMergeCalls).toEqual([]) // finalize never lands the PR
+
+  // First janitor poll owns the fallback. It writes no speculative merge fact;
+  // the guarded command itself moves only the fake forge's external state.
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    claimRaces: 1,
+  })
+  expect(h.forge.squashMergeCalls).toHaveLength(1)
+  expect(h.forge.squashMergeCalls[0]).toMatchObject({
+    number: 1,
+    expectedHeadSha: 'sha-1',
+  })
+  events = await h.events(SLUG)
+  expect(typesOf(events)).not.toContain('pr.merged')
+  expect(typesOf(events)).not.toContain('pr.auto-merge-enabled')
+
+  // The next ordinary observation settles the existing lifecycle vocabulary.
+  expect(await h.dispatcher.tick()).toEqual({ ...emptyTickReport(), merged: 1 })
+  const final = await h.events(SLUG)
+  expect(typesOf(final).slice(-3)).toEqual([
+    'pr.merged',
+    'workspace.released',
+    'build.completed',
+  ])
+  expect(reduceBuild(final).status).toBe('done')
+  expect(reduceBuild(final).outcome).toBe('merged')
+  expect(typesOf(final)).not.toContain('escalation.raised')
 }, 30_000)
 
 // ── a2. Reconcile refreshes a moved base at execution time (§15.7) ──────────

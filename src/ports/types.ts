@@ -112,6 +112,14 @@ export type PrState =
   | { state: 'merged'; sha: string }
   | { state: 'closed' }
 
+/** Result of reconciling durable auto-merge intent with the forge. Native
+ * state is acknowledged only by `applied`; the other results deliberately
+ * leave the command pending for a later janitor poll. */
+export type AutoMergeResult =
+  | { kind: 'applied' }
+  | { kind: 'ungated'; headSha: string }
+  | { kind: 'deferred' }
+
 export interface Forge {
   readonly name: string
   /** Push a local branch to the remote (from the workspace's working copy). */
@@ -126,15 +134,24 @@ export interface Forge {
   /** Janitor poll (§15.7): merged/closed/mergeability for one PR. */
   getPrState(workspacePath: string, number: number): Promise<PrState>
   /**
-   * Set GitHub-native auto-merge desired state. Enabling uses the repository's
-   * squash merge standard and leaves required checks as GitHub's gate; it is
-   * never an admin/direct merge. The operation is idempotent and safe to retry
-   * across the forge-call/event-append crash window.
+   * Reconcile GitHub-native auto-merge desired state. Enabling returns an
+   * ungated candidate only after proving the base branch has no merge-blocking
+   * gate; transient merge states are deferred. The operation is idempotent and
+   * safe to retry across the forge-call/event-append crash window.
    */
   setAutoMerge(
     workspacePath: string,
     number: number,
     enabled: boolean,
+  ): Promise<AutoMergeResult>
+  /**
+   * Perform a normal squash merge, guarded by the inspected PR head. This is
+   * never an admin/force operation: forge-side protection still applies.
+   */
+  squashMerge(
+    workspacePath: string,
+    number: number,
+    expectedHeadSha: string,
   ): Promise<void>
   /** Post the build's summary comment (§7.5). */
   commentOnPr(workspacePath: string, number: number, body: string): Promise<void>

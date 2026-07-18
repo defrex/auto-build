@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { Exec, ExecResult, TempFileWriter } from './github'
-import { GitHubForge } from './github'
+import { GitHubForge, rulesetsHaveMergeGate } from './github'
 
 interface ExecCall {
   cmd: string[]
@@ -274,76 +274,318 @@ describe('GitHubForge.getPrState', () => {
   })
 })
 
+describe('rulesetsHaveMergeGate', () => {
+  const pullRequestParameters = {
+    required_approving_review_count: 0,
+    dismiss_stale_reviews_on_push: false,
+    require_code_owner_review: false,
+    require_last_push_approval: false,
+    required_review_thread_resolution: false,
+  }
+
+  test('known structural rules and a zero-requirement pull-request rule are not gates', () => {
+    expect(
+      rulesetsHaveMergeGate([
+        { type: 'required_linear_history' },
+        { type: 'non_fast_forward' },
+        { type: 'pull_request', parameters: pullRequestParameters },
+      ]),
+    ).toBe(false)
+  })
+
+  test('every supported waiting-rule family is recognized as a gate', () => {
+    const rules = [
+      { type: 'merge_queue', parameters: {} },
+      { type: 'required_signatures' },
+      {
+        type: 'required_status_checks',
+        parameters: { required_status_checks: [{ context: 'ci' }] },
+      },
+      {
+        type: 'required_deployments',
+        parameters: { required_deployment_environments: ['production'] },
+      },
+      { type: 'workflows', parameters: { workflows: [{ path: 'ci.yml' }] } },
+      {
+        type: 'code_scanning',
+        parameters: { code_scanning_tools: [{ tool: 'CodeQL' }] },
+      },
+      {
+        type: 'pull_request',
+        parameters: {
+          ...pullRequestParameters,
+          required_review_thread_resolution: true,
+        },
+      },
+    ]
+    expect(rulesetsHaveMergeGate(rules)).toBe(true)
+  })
+})
+
 describe('GitHubForge.setAutoMerge', () => {
-  test('enables GitHub-native auto-merge with squash and no check-bypassing flags', async () => {
+  const view = (
+    mergeStateStatus = 'CLEAN',
+    autoMergeRequest: Record<string, unknown> | null = null,
+  ) => ({
+    stdout: JSON.stringify({
+      autoMergeRequest,
+      mergeStateStatus,
+      headRefOid: 'head-42',
+      baseRefName: 'main',
+    }),
+  })
+  const repo = { stdout: JSON.stringify({ nameWithOwner: 'acme/app' }) }
+  const classic = (rule: Record<string, unknown> | null = null) => ({
+    stdout: JSON.stringify({
+      data: { repository: { ref: { branchProtectionRule: rule } } },
+    }),
+  })
+  const classicRule = (over: Record<string, unknown> = {}) => ({
+    requiresStatusChecks: false,
+    requiresApprovingReviews: false,
+    requiredApprovingReviewCount: 0,
+    requiresCodeOwnerReviews: false,
+    requireLastPushApproval: false,
+    requiresConversationResolution: false,
+    requiresDeployments: false,
+    requiresCommitSignatures: false,
+    ...over,
+  })
+  const noGate = [repo, classic(), { stdout: '[]' }]
+
+  test('CLEAN plus a real gate uses native squash auto-merge even though requirements are satisfied', async () => {
     const { forge, calls } = makeForge([
-      { stdout: JSON.stringify({ autoMergeRequest: null }) },
+      view('CLEAN'),
+      repo,
+      classic(classicRule({ requiresStatusChecks: true })),
+      { stdout: '[]' },
       {},
     ])
-    await forge.setAutoMerge('/ws/build-1', 42, true)
-    expect(calls).toEqual([
-      {
-        cmd: ['gh', 'pr', 'view', '42', '--json', 'autoMergeRequest'],
-        cwd: '/ws/build-1',
-      },
-      {
-        cmd: ['gh', 'pr', 'merge', '42', '--auto', '--squash'],
-        cwd: '/ws/build-1',
-      },
-    ])
+    expect(await forge.setAutoMerge('/ws/build-1', 42, true)).toEqual({
+      kind: 'applied',
+    })
+    expect(calls[0]).toEqual({
+      cmd: [
+        'gh',
+        'pr',
+        'view',
+        '42',
+        '--json',
+        'autoMergeRequest,mergeStateStatus,headRefOid,baseRefName',
+      ],
+      cwd: '/ws/build-1',
+    })
+    expect(calls[1]).toEqual({
+      cmd: ['gh', 'repo', 'view', '--json', 'nameWithOwner'],
+      cwd: '/ws/build-1',
+    })
+    expect(calls[2]!.cmd.slice(0, 4)).toEqual(['gh', 'api', 'graphql', '-f'])
+    expect(calls[2]!.cmd).toContain('qualifiedRef=refs/heads/main')
+    expect(calls[3]).toEqual({
+      cmd: ['gh', 'api', 'repos/acme/app/rules/branches/main'],
+      cwd: '/ws/build-1',
+    })
+    expect(calls.at(-1)).toEqual({
+      cmd: ['gh', 'pr', 'merge', '42', '--auto', '--squash'],
+      cwd: '/ws/build-1',
+    })
     expect(calls.flatMap((call) => call.cmd)).not.toContain('--admin')
   })
 
-  test('disables native auto-merge with exact argv', async () => {
+  test('an active inherited ruleset gate also retains native ownership', async () => {
+    const rules = [
+      {
+        type: 'required_status_checks',
+        ruleset_source_type: 'Organization',
+        parameters: { required_status_checks: [{ context: 'ci' }] },
+      },
+    ]
     const { forge, calls } = makeForge([
-      { stdout: JSON.stringify({ autoMergeRequest: { mergeMethod: 'SQUASH' } }) },
+      view(),
+      repo,
+      classic(),
+      { stdout: JSON.stringify(rules) },
       {},
     ])
-    await forge.setAutoMerge('/ws/build-1', 42, false)
+    expect(await forge.setAutoMerge('/ws/build-1', 42, true)).toEqual({
+      kind: 'applied',
+    })
+    expect(calls.at(-1)!.cmd).toEqual([
+      'gh',
+      'pr',
+      'merge',
+      '42',
+      '--auto',
+      '--squash',
+    ])
+  })
+
+  test('CLEAN or UNSTABLE with two successful negative probes returns a guarded direct candidate', async () => {
+    for (const state of ['CLEAN', 'UNSTABLE'] as const) {
+      const { forge, calls } = makeForge([view(state), ...noGate])
+      expect(await forge.setAutoMerge('/ws/build-1', 42, true)).toEqual({
+        kind: 'ungated',
+        headSha: 'head-42',
+      })
+      expect(calls.some((call) => call.cmd.includes('merge'))).toBe(false)
+    }
+  })
+
+  test('ungated transient/conflict states defer, while an unexplained blocker fails', async () => {
+    for (const state of ['UNKNOWN', 'DIRTY'] as const) {
+      const { forge } = makeForge([view(state), ...noGate])
+      expect(await forge.setAutoMerge('/ws/build-1', 42, true)).toEqual({
+        kind: 'deferred',
+      })
+    }
+    const blocked = makeForge([view('BLOCKED'), ...noGate])
+    await expect(
+      blocked.forge.setAutoMerge('/ws/build-1', 42, true),
+    ).rejects.toThrow('BLOCKED')
+  })
+
+  test('HAS_HOOKS is never treated as ungated and delegates to native auto-merge', async () => {
+    const { forge, calls } = makeForge([view('HAS_HOOKS'), ...noGate, {}])
+    expect(await forge.setAutoMerge('/ws/build-1', 42, true)).toEqual({
+      kind: 'applied',
+    })
+    expect(calls.at(-1)!.cmd).toEqual([
+      'gh',
+      'pr',
+      'merge',
+      '42',
+      '--auto',
+      '--squash',
+    ])
+  })
+
+  test('disabling inspects only native state, so future merge-state enums cannot block cancellation', async () => {
+    const { forge, calls } = makeForge([
+      {
+        stdout: JSON.stringify({
+          autoMergeRequest: { mergeMethod: 'SQUASH' },
+        }),
+      },
+      {},
+    ])
+    expect(await forge.setAutoMerge('/ws/build-1', 42, false)).toEqual({
+      kind: 'applied',
+    })
+    expect(calls[0]).toEqual({
+      cmd: ['gh', 'pr', 'view', '42', '--json', 'autoMergeRequest'],
+      cwd: '/ws/build-1',
+    })
     expect(calls.at(-1)).toEqual({
       cmd: ['gh', 'pr', 'merge', '42', '--disable-auto'],
       cwd: '/ws/build-1',
     })
+    expect(calls).toHaveLength(2)
   })
 
-  test('an idempotent retry only inspects state and performs no mutation', async () => {
-    for (const [enabled, autoMergeRequest] of [
-      [true, { mergeMethod: 'SQUASH' }],
-      [false, null],
+  test('idempotent desired state only inspects the PR', async () => {
+    for (const [enabled, response] of [
+      [true, view('UNKNOWN', { mergeMethod: 'SQUASH' })],
+      [false, { stdout: JSON.stringify({ autoMergeRequest: null }) }],
     ] as const) {
-      const { forge, calls } = makeForge([
-        { stdout: JSON.stringify({ autoMergeRequest }) },
-      ])
-      await forge.setAutoMerge('/ws/build-1', 42, enabled)
-      expect(calls).toEqual([
-        {
-          cmd: ['gh', 'pr', 'view', '42', '--json', 'autoMergeRequest'],
-          cwd: '/ws/build-1',
-        },
-      ])
+      const { forge, calls } = makeForge([response])
+      expect(await forge.setAutoMerge('/ws/build-1', 42, enabled)).toEqual({
+        kind: 'applied',
+      })
+      expect(calls).toHaveLength(1)
     }
   })
 
-  test('inspection and mutation failures propagate with their exact command', async () => {
+  test('probe, inspection, and native mutation failures propagate and never return direct eligibility', async () => {
     const inspect = makeForge([{ exitCode: 1, stderr: 'not found' }])
     await expect(inspect.forge.setAutoMerge('/ws/build-1', 42, true)).rejects.toThrow(
-      'gh pr view 42 --json autoMergeRequest',
+      'gh pr view 42 --json autoMergeRequest,mergeStateStatus,headRefOid,baseRefName',
+    )
+
+    const probe = makeForge([
+      view(),
+      repo,
+      { exitCode: 1, stderr: 'resource not accessible' },
+    ])
+    await expect(probe.forge.setAutoMerge('/ws/build-1', 42, true)).rejects.toThrow(
+      'gh api graphql',
     )
 
     const mutate = makeForge([
-      { stdout: JSON.stringify({ autoMergeRequest: null }) },
-      { exitCode: 1, stderr: 'auto-merge is not allowed' },
+      view(),
+      repo,
+      classic(classicRule({ requiresStatusChecks: true })),
+      { stdout: '[]' },
+      { exitCode: 1, stderr: 'permission denied' },
     ])
     await expect(mutate.forge.setAutoMerge('/ws/build-1', 42, true)).rejects.toThrow(
       'gh pr merge 42 --auto --squash',
     )
   })
 
-  test('malformed state is rejected rather than guessing', async () => {
-    const { forge } = makeForge([{ stdout: '{}' }])
-    await expect(forge.setAutoMerge('/ws/build-1', 42, true)).rejects.toThrow(
+  test('unknown or malformed active rules fail closed', async () => {
+    const unknown = makeForge([
+      view(),
+      repo,
+      classic(),
+      { stdout: JSON.stringify([{ type: 'future_required_ai_review' }]) },
+    ])
+    await expect(
+      unknown.forge.setAutoMerge('/ws/build-1', 42, true),
+    ).rejects.toThrow('unknown active GitHub ruleset rule type')
+
+    const malformed = makeForge([
+      view(),
+      repo,
+      classic(),
+      { stdout: JSON.stringify([{ type: 'pull_request', parameters: {} }]) },
+    ])
+    await expect(
+      malformed.forge.setAutoMerge('/ws/build-1', 42, true),
+    ).rejects.toThrow('unexpected parameters')
+  })
+
+  test('malformed or future PR state is rejected rather than guessed', async () => {
+    const malformed = makeForge([{ stdout: '{}' }])
+    await expect(
+      malformed.forge.setAutoMerge('/ws/build-1', 42, true),
+    ).rejects.toThrow('unexpected output')
+
+    const future = makeForge([view('FUTURE_STATE')])
+    await expect(future.forge.setAutoMerge('/ws/build-1', 42, true)).rejects.toThrow(
       'unexpected output',
     )
+  })
+})
+
+describe('GitHubForge.squashMerge', () => {
+  test('uses a head-guarded normal squash with no bypass or alternate merge mode', async () => {
+    const { forge, calls } = makeForge()
+    await forge.squashMerge('/ws/build-1', 42, 'head-42')
+    expect(calls).toEqual([
+      {
+        cmd: [
+          'gh',
+          'pr',
+          'merge',
+          '42',
+          '--squash',
+          '--match-head-commit',
+          'head-42',
+        ],
+        cwd: '/ws/build-1',
+      },
+    ])
+    const argv = calls[0]!.cmd
+    for (const forbidden of ['--admin', '--force', '--rebase', '--auto']) {
+      expect(argv).not.toContain(forbidden)
+    }
+  })
+
+  test('command failures remain visible', async () => {
+    const { forge } = makeForge([{ exitCode: 1, stderr: 'head sha mismatch' }])
+    await expect(
+      forge.squashMerge('/ws/build-1', 42, 'stale-head'),
+    ).rejects.toThrow('head sha mismatch')
   })
 })
 

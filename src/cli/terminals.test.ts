@@ -349,7 +349,14 @@ describe('ab done — finalize', () => {
     expect(comment.body).toContain(`build: ${BUILD}`)
   })
 
-  test('a pre-PR auto-merge request is applied natively and acknowledged', async () => {
+  test('a pre-PR auto-merge request on gated CLEAN is applied natively and acknowledged', async () => {
+    class GatedCleanForge extends FakeForge {
+      override async openPr(opts: Parameters<FakeForge['openPr']>[0]) {
+        const pr = await super.openPr(opts)
+        this.setPrState(pr.number, { state: 'open', mergeable: true })
+        return pr
+      }
+    }
     const request = await store.append(BUILD, {
       actor: humanActor('operator'),
       type: 'build.auto-merge-requested',
@@ -363,6 +370,7 @@ describe('ab done — finalize', () => {
       store,
       env: makeEnv({ phase: 'finalize' }),
       workspacePath: workspace,
+      forge: new GatedCleanForge(),
     })
 
     await done(deps)
@@ -381,6 +389,79 @@ describe('ab done — finalize', () => {
     expect(applied?.payload).toEqual({ commandSeq: request.seq })
     expect(events.map((event) => event.type)).toContain('finalize.completed')
     expect(events.map((event) => event.type)).toContain('pr.auto-merge-enabled')
+  })
+
+  test('proved ungated CLEAN finalizes successfully but leaves intent pending for the janitor', async () => {
+    class UngatedCleanForge extends FakeForge {
+      constructor() {
+        super({ gatePresence: 'absent' })
+      }
+      override async openPr(opts: Parameters<FakeForge['openPr']>[0]) {
+        const pr = await super.openPr(opts)
+        this.setPrState(pr.number, { state: 'open', mergeable: true })
+        return pr
+      }
+    }
+    await store.append(BUILD, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    await store.putArtifact(BUILD, {
+      kind: 'pr-description',
+      content: '# Add auth rate limiting\n\nBody.\n',
+    })
+    const forge = new UngatedCleanForge()
+
+    const event = await done(
+      makeDeps({
+        store,
+        env: makeEnv({ phase: 'finalize' }),
+        workspacePath: workspace,
+        forge,
+      }),
+    )
+
+    expect(event.type).toBe('finalize.completed')
+    expect(forge.squashMergeCalls).toEqual([])
+    expect(forge.autoMergeCalls).toEqual([
+      {
+        workspacePath: workspace,
+        number: 1,
+        enabled: true,
+        changed: false,
+      },
+    ])
+    const types = (await store.getEvents(BUILD)).map((entry) => entry.type)
+    expect(types).not.toContain('pr.auto-merge-enabled')
+    expect(types).not.toContain('escalation.raised')
+  })
+
+  test('ungated transient state also finalizes without falsely acknowledging native state', async () => {
+    const forge = new FakeForge({ gatePresence: 'absent' }) // just-opened = UNKNOWN
+    await store.append(BUILD, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    await store.putArtifact(BUILD, {
+      kind: 'pr-description',
+      content: '# Add auth rate limiting\n\nBody.\n',
+    })
+
+    await done(
+      makeDeps({
+        store,
+        env: makeEnv({ phase: 'finalize' }),
+        workspacePath: workspace,
+        forge,
+      }),
+    )
+
+    const types = (await store.getEvents(BUILD)).map((entry) => entry.type)
+    expect(types).toContain('finalize.completed')
+    expect(types).not.toContain('pr.auto-merge-enabled')
+    expect(forge.squashMergeCalls).toEqual([])
   })
 
   test('re-reads intent after openPr, so a command landing during finalize is not missed', async () => {
@@ -426,7 +507,7 @@ describe('ab done — finalize', () => {
 
   test('auto-merge forge failure leaves finalize uncommitted and retryable', async () => {
     class RejectingAutoMergeForge extends FakeForge {
-      override async setAutoMerge(): Promise<void> {
+      override async setAutoMerge(): Promise<never> {
         throw new Error('repository policy disables auto-merge')
       }
     }

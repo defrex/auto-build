@@ -14,7 +14,12 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
-import type { Forge, PrRef, PrState } from '../types'
+import {
+  classifyAutoMergeEnable,
+  mergeStateStatuses,
+  type MergeGatePresence,
+} from '../../kernel/auto-merge'
+import type { AutoMergeResult, Forge, PrRef, PrState } from '../types'
 
 export interface ExecResult {
   stdout: string
@@ -66,12 +71,223 @@ const prStateJson = z.strictObject({
   mergeCommit: z.strictObject({ oid: z.string().min(1) }).nullable(),
 })
 
-// GitHub returns a nullable object whose inner fields are not needed here: the
-// presence of the request is the native auto-merge state. Keeping the value
-// `unknown` avoids coupling the port to GitHub's actor/merge-method projection.
-const autoMergeJson = z.strictObject({
-  autoMergeRequest: z.unknown().nullable(),
+// Disabling needs only native desired state. Keep this schema separate from
+// enable-only routing facts so a future mergeStateStatus cannot prevent an
+// operator from revoking consent.
+const nativeAutoMergeJson = z.strictObject({
+  autoMergeRequest: z.object({}).passthrough().nullable(),
 })
+
+// Enabling additionally needs the two independent routing facts. `gh --json`
+// returns exactly these requested fields, so an unknown merge-state enum or a
+// missing head/base is a hard parse failure rather than fallback eligibility.
+const autoMergeJson = z.strictObject({
+  ...nativeAutoMergeJson.shape,
+  mergeStateStatus: z.enum(mergeStateStatuses),
+  headRefOid: z.string().min(1),
+  baseRefName: z.string().min(1),
+})
+
+const repoIdentityJson = z.strictObject({
+  nameWithOwner: z.string().min(3),
+})
+
+const classicProtectionJson = z.strictObject({
+  data: z.strictObject({
+    repository: z
+      .strictObject({
+        ref: z
+          .strictObject({
+            branchProtectionRule: z
+              .strictObject({
+                requiresStatusChecks: z.boolean(),
+                requiresApprovingReviews: z.boolean(),
+                requiredApprovingReviewCount: z.number().int().nonnegative(),
+                requiresCodeOwnerReviews: z.boolean(),
+                requireLastPushApproval: z.boolean(),
+                requiresConversationResolution: z.boolean(),
+                requiresDeployments: z.boolean(),
+                requiresCommitSignatures: z.boolean(),
+              })
+              .nullable(),
+          })
+          .nullable(),
+      })
+      .nullable(),
+  }),
+})
+
+const rulesetRulesJson = z.array(
+  z
+    .object({
+      type: z.string().min(1),
+      parameters: z.unknown().optional(),
+    })
+    .passthrough(),
+)
+
+const pullRequestRuleParameters = z
+  .object({
+    required_approving_review_count: z.number().int().nonnegative(),
+    require_code_owner_review: z.boolean(),
+    require_last_push_approval: z.boolean(),
+    required_review_thread_resolution: z.boolean(),
+  })
+  .passthrough()
+
+const requiredStatusRuleParameters = z
+  .object({ required_status_checks: z.array(z.unknown()) })
+  .passthrough()
+const requiredDeploymentsRuleParameters = z
+  .object({ required_deployment_environments: z.array(z.string()) })
+  .passthrough()
+const requiredWorkflowsRuleParameters = z
+  .object({ workflows: z.array(z.unknown()) })
+  .passthrough()
+const requiredCodeScanningRuleParameters = z
+  .object({
+    code_scanning_tools: z.array(z.unknown()).optional(),
+    required_code_scanning_tools: z.array(z.unknown()).optional(),
+  })
+  .refine(
+    (value) =>
+      value.code_scanning_tools !== undefined ||
+      value.required_code_scanning_tools !== undefined,
+    { message: 'a code-scanning tools array is required' },
+  )
+  .passthrough()
+const mergeQueueRuleParameters = z.object({}).passthrough()
+
+/** Exact-ref classic protection query. A rule may exist yet contain only
+ * structural restrictions; only requirements that can block landing count as
+ * a merge gate. */
+const CLASSIC_PROTECTION_QUERY = [
+  'query($owner:String!,$name:String!,$qualifiedRef:String!){',
+  'repository(owner:$owner,name:$name){',
+  'ref(qualifiedName:$qualifiedRef){',
+  'branchProtectionRule{',
+  'requiresStatusChecks requiresApprovingReviews requiredApprovingReviewCount',
+  'requiresCodeOwnerReviews requireLastPushApproval',
+  'requiresConversationResolution requiresDeployments requiresCommitSignatures',
+  '}',
+  '}',
+  '}',
+  '}',
+].join(' ')
+
+const STRUCTURAL_RULE_TYPES = new Set([
+  'creation',
+  'update',
+  'deletion',
+  'required_linear_history',
+  'non_fast_forward',
+  'commit_message_pattern',
+  'commit_author_email_pattern',
+  'committer_email_pattern',
+  'branch_name_pattern',
+  'tag_name_pattern',
+  'file_path_restriction',
+  'max_file_path_length',
+  'file_extension_restriction',
+  'max_file_size',
+])
+
+function parseRuleParameters<S extends z.ZodType>(
+  schema: S,
+  parameters: unknown,
+  type: string,
+): z.infer<S> {
+  const parsed = schema.safeParse(parameters)
+  if (!parsed.success) {
+    throw new Error(
+      `unexpected parameters for active GitHub ruleset rule ${type}: ${parsed.error}`,
+    )
+  }
+  return parsed.data
+}
+
+/** Whether any active repository/organization rule matching one branch
+ * carries a real merge-blocking requirement. Unknown future types fail closed. */
+export function rulesetsHaveMergeGate(
+  rules: z.infer<typeof rulesetRulesJson>,
+): boolean {
+  let present = false
+  for (const rule of rules) {
+    switch (rule.type) {
+      case 'merge_queue':
+        parseRuleParameters(mergeQueueRuleParameters, rule.parameters, rule.type)
+        present = true
+        break
+      case 'required_signatures':
+        present = true
+        break
+      case 'required_status_checks': {
+        const parameters = parseRuleParameters(
+          requiredStatusRuleParameters,
+          rule.parameters,
+          rule.type,
+        )
+        present = parameters.required_status_checks.length > 0 || present
+        break
+      }
+      case 'required_deployments': {
+        const parameters = parseRuleParameters(
+          requiredDeploymentsRuleParameters,
+          rule.parameters,
+          rule.type,
+        )
+        present = parameters.required_deployment_environments.length > 0 || present
+        break
+      }
+      case 'workflows':
+      case 'required_workflows': {
+        const parameters = parseRuleParameters(
+          requiredWorkflowsRuleParameters,
+          rule.parameters,
+          rule.type,
+        )
+        present = parameters.workflows.length > 0 || present
+        break
+      }
+      case 'required_code_scanning':
+      case 'code_scanning': {
+        const parameters = parseRuleParameters(
+          requiredCodeScanningRuleParameters,
+          rule.parameters,
+          rule.type,
+        )
+        const tools =
+          parameters.code_scanning_tools ??
+          parameters.required_code_scanning_tools ??
+          []
+        present = tools.length > 0 || present
+        break
+      }
+      case 'pull_request': {
+        const parameters = parseRuleParameters(
+          pullRequestRuleParameters,
+          rule.parameters,
+          rule.type,
+        )
+        present =
+          parameters.required_approving_review_count > 0 ||
+          parameters.require_code_owner_review ||
+          parameters.require_last_push_approval ||
+          parameters.required_review_thread_resolution ||
+          present
+        break
+      }
+      default:
+        if (!STRUCTURAL_RULE_TYPES.has(rule.type)) {
+          throw new Error(
+            `unknown active GitHub ruleset rule type ${JSON.stringify(rule.type)}; ` +
+              'cannot prove the branch has no merge-blocking gate',
+          )
+        }
+    }
+  }
+  return present
+}
 
 /** §15.7: mergeable false is what makes the janitor emit `pr.conflicted`. */
 const MERGEABLE_MAP = {
@@ -114,6 +330,79 @@ export class GitHubForge implements Forge {
         `unexpected output from \`${cmd.join(' ')}\`: ${String(error)}`,
       )
     }
+  }
+
+  /** Probe both GitHub gate systems for the PR's exact base branch. Only two
+   * successful negative probes prove absence; command/schema/auth failures
+   * throw and therefore can never authorize a direct merge. */
+  private async mergeGatePresence(
+    workspacePath: string,
+    baseRefName: string,
+  ): Promise<MergeGatePresence> {
+    const repoCmd = ['gh', 'repo', 'view', '--json', 'nameWithOwner']
+    const identity = this.parseJson(
+      repoIdentityJson,
+      await this.run(repoCmd, workspacePath),
+      repoCmd,
+    )
+    const parts = identity.nameWithOwner.split('/')
+    if (parts.length !== 2 || parts[0] === '' || parts[1] === '') {
+      throw new Error(
+        `unexpected GitHub repository identity ${JSON.stringify(identity.nameWithOwner)}`,
+      )
+    }
+    const [owner, name] = parts as [string, string]
+
+    const classicCmd = [
+      'gh',
+      'api',
+      'graphql',
+      '-f',
+      `query=${CLASSIC_PROTECTION_QUERY}`,
+      '-F',
+      `owner=${owner}`,
+      '-F',
+      `name=${name}`,
+      '-F',
+      `qualifiedRef=refs/heads/${baseRefName}`,
+    ]
+    const classic = this.parseJson(
+      classicProtectionJson,
+      await this.run(classicCmd, workspacePath),
+      classicCmd,
+    )
+    if (classic.data.repository === null) {
+      throw new Error(`GitHub gate probe could not resolve repository ${identity.nameWithOwner}`)
+    }
+    if (classic.data.repository.ref === null) {
+      throw new Error(
+        `GitHub gate probe could not resolve base branch ${JSON.stringify(baseRefName)}`,
+      )
+    }
+    const protection = classic.data.repository.ref.branchProtectionRule
+    const classicGate =
+      protection !== null &&
+      (protection.requiresStatusChecks ||
+        protection.requiresApprovingReviews ||
+        protection.requiredApprovingReviewCount > 0 ||
+        protection.requiresCodeOwnerReviews ||
+        protection.requireLastPushApproval ||
+        protection.requiresConversationResolution ||
+        protection.requiresDeployments ||
+        protection.requiresCommitSignatures)
+
+    const rulesCmd = [
+      'gh',
+      'api',
+      `repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/rules/branches/${encodeURIComponent(baseRefName)}`,
+    ]
+    const rules = this.parseJson(
+      rulesetRulesJson,
+      await this.run(rulesCmd, workspacePath),
+      rulesCmd,
+    )
+    const rulesetGate = rulesetsHaveMergeGate(rules)
+    return classicGate || rulesetGate ? 'present' : 'absent'
   }
 
   /** [D1]: rebase is banned and branches are never rewritten — never force. */
@@ -219,36 +508,90 @@ export class GitHubForge implements Forge {
   }
 
   /**
-   * Native auto-merge setter. Inspect first so retries are harmless: the forge
-   * call may have succeeded before its correlated application event landed.
-   * `--auto --squash` preserves required-check gating and the repository's D1
-   * merge standard; there is deliberately no `--admin` fallback.
+   * Reconcile native auto-merge state. A native idempotent hit is acknowledged
+   * immediately. Otherwise enabling is classified from authoritative gate
+   * existence plus the complete current merge-state enum; only a proved
+   * ungated stable PR is returned as a direct candidate.
    */
   async setAutoMerge(
     workspacePath: string,
     number: number,
     enabled: boolean,
-  ): Promise<void> {
+  ): Promise<AutoMergeResult> {
+    // Cancellation must remain usable when GitHub adds a merge-state enum:
+    // inspect only the one field disabling actually needs.
+    if (!enabled) {
+      const disableViewCmd = [
+        'gh',
+        'pr',
+        'view',
+        String(number),
+        '--json',
+        'autoMergeRequest',
+      ]
+      const disableView = this.parseJson(
+        nativeAutoMergeJson,
+        await this.run(disableViewCmd, workspacePath),
+        disableViewCmd,
+      )
+      if (disableView.autoMergeRequest !== null) {
+        await this.run(
+          ['gh', 'pr', 'merge', String(number), '--disable-auto'],
+          workspacePath,
+        )
+      }
+      return { kind: 'applied' }
+    }
+
     const viewCmd = [
       'gh',
       'pr',
       'view',
       String(number),
       '--json',
-      'autoMergeRequest',
+      'autoMergeRequest,mergeStateStatus,headRefOid,baseRefName',
     ]
     const view = this.parseJson(
       autoMergeJson,
       await this.run(viewCmd, workspacePath),
       viewCmd,
     )
-    const currentlyEnabled = view.autoMergeRequest !== null
-    if (currentlyEnabled === enabled) return
+    if (view.autoMergeRequest !== null) return { kind: 'applied' }
 
+    const gate = await this.mergeGatePresence(workspacePath, view.baseRefName)
+    const disposition = classifyAutoMergeEnable(view.mergeStateStatus, gate)
+    switch (disposition.kind) {
+      case 'native':
+        await this.run(
+          ['gh', 'pr', 'merge', String(number), '--auto', '--squash'],
+          workspacePath,
+        )
+        return { kind: 'applied' }
+      case 'direct':
+        return { kind: 'ungated', headSha: view.headRefOid }
+      case 'deferred':
+        return { kind: 'deferred' }
+      case 'error':
+        throw new Error(disposition.reason)
+    }
+  }
+
+  /** Normal guarded squash — no admin, force, rebase, or native-auto flag. */
+  async squashMerge(
+    workspacePath: string,
+    number: number,
+    expectedHeadSha: string,
+  ): Promise<void> {
     await this.run(
-      enabled
-        ? ['gh', 'pr', 'merge', String(number), '--auto', '--squash']
-        : ['gh', 'pr', 'merge', String(number), '--disable-auto'],
+      [
+        'gh',
+        'pr',
+        'merge',
+        String(number),
+        '--squash',
+        '--match-head-commit',
+        expectedHeadSha,
+      ],
       workspacePath,
     )
   }

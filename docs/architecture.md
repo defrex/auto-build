@@ -89,19 +89,26 @@ suffix. Existing build records have no mutation path and are never re-slugged.
 
 The dashboard is an operator command producer, not forge plumbing. Its `p` and
 `m` handlers append human-actor events through the BuildStore; build-runner and
-dispatcher code acknowledge pause/resume and reconcile native auto-merge via
-the `Forge` port. On a blocked row, `p` instead opens slug/escalation-bound
-process state: Enter appends one human `escalation.answered` per captured id
-(`retry` for blank input, `guidance` for text), then requests resume too if the
-reduced build was paused. Escape writes nothing. The field is overlaid on the
-pure dashboard model, so blocker rows and polling remain live while terminal
-input edits synchronously; only submission joins the serialized operation
-queue. Reattachment remains the ordinary dispatcher lease sweep. The automatic
-startup path in `src/processes/dispatcher.ts` is unchanged and retries only an
-all-policy escalation set without input. `d` is the other process-local state:
-it gates only the current dispatcher's ticket-claim stage and resets on restart.
-Raw input and live-region output have separate adapters so keypresses cannot
-write into or tear a rendered frame.
+dispatcher code acknowledge pause/resume and reconcile auto-merge via the
+`Forge` port. On a blocked row, `p` instead opens slug/escalation-bound process
+state: Enter appends one human `escalation.answered` per captured id (`retry`
+for blank input, `guidance` for text), then requests resume too if the reduced
+build was paused. Escape writes nothing. The field is overlaid on the pure
+dashboard model, so blocker rows and polling remain live while terminal input
+edits synchronously; only submission joins the serialized operation queue.
+Reattachment remains the ordinary dispatcher lease sweep. The GitHub adapter
+combines exact-branch classic protection and active ruleset probes with the
+complete PR merge-state enum: a real gate keeps native auto-merge ownership,
+while only two successful negative probes can return a guarded direct-squash
+candidate. `Dispatcher.checkPr` is the sole fallback owner and additionally
+requires positive mergeability, unchanged latest intent, and
+`decideNext(...)=awaiting-pr`; the normal non-admin merge is head-SHA guarded
+and completion remains an observed `pr.merged` fact on the next poll. The
+automatic startup path in `src/processes/dispatcher.ts` is unchanged and
+retries only an all-policy escalation set without input. `d` is the other
+process-local state: it gates only the current dispatcher's ticket-claim stage
+and resets on restart. Raw input and live-region output have separate adapters
+so keypresses cannot write into or tear a rendered frame.
 
 ## Development
 

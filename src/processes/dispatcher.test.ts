@@ -210,6 +210,18 @@ async function seedLoopsApproved(h: Harness, slug: string): Promise<void> {
   })
 }
 
+/** Seed a fully green build parked in the post-PR epilogue. */
+async function seedAwaitingPr(h: Harness, slug = 'auth-limit'): Promise<string> {
+  await seedBuild(h, { slug })
+  await seedLoopsApproved(h, slug)
+  await h.store.append(slug, {
+    actor: KERNEL,
+    type: 'finalize.completed',
+    payload: { pr: PR },
+  })
+  return slug
+}
+
 const PR = { number: 1, url: 'https://fake.forge/pr/1', headSha: 'head-1' }
 
 // ── Quality gate heuristic (§6.3) ────────────────────────────────────────────
@@ -1549,6 +1561,382 @@ describe('Dispatcher janitor', () => {
       'workspace.released',
       'build.completed',
     ])
+  })
+
+  test('ungated CLEAN uses guarded squash only while awaiting-pr, then settles by observation', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setPrHeadSha(1, PR.headSha)
+    h.forge.setGatePresence(1, 'absent')
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+
+    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(h.forge.isAutoMergeEnabled(1)).toBe(false)
+    expect(h.forge.squashMergeCalls).toEqual([
+      {
+        workspacePath: `/ws/ab/${slug}`,
+        number: 1,
+        expectedHeadSha: PR.headSha,
+      },
+    ])
+    const afterMergeCall = await h.store.getEvents(slug)
+    expect(afterMergeCall.some((e) => e.type === 'pr.auto-merge-enabled')).toBe(false)
+    expect(afterMergeCall.some((e) => e.type === 'pr.merged')).toBe(false)
+
+    // The forge call is not a speculative event. The ordinary next poll sees
+    // the landed PR and emits the existing completion facts.
+    expect(await h.dispatcher.tick()).toEqual({ ...emptyTickReport(), merged: 1 })
+    const final = await h.store.getEvents(slug)
+    expect(final.map((e) => e.type).slice(-3)).toEqual([
+      'pr.merged',
+      'workspace.released',
+      'build.completed',
+    ])
+    expect(final.at(-1)?.payload).toEqual({ outcome: 'merged' })
+  })
+
+  test('ungated UNSTABLE and BEHIND are safe candidates, but positive mergeability is still required', async () => {
+    for (const [index, mergeState] of ['UNSTABLE', 'BEHIND'].entries()) {
+      const h = harness()
+      const slug = await seedAwaitingPr(h, `ungated-${index}`)
+      await h.store.append(slug, {
+        actor: humanActor('operator'),
+        type: 'build.auto-merge-requested',
+        payload: {},
+      })
+      h.forge.setPrState(1, { state: 'open', mergeable: index === 0 ? null : true })
+      h.forge.setMergeStateStatus(1, mergeState as 'UNSTABLE' | 'BEHIND')
+      h.forge.setGatePresence(1, 'absent')
+      await h.store.claimLease(slug, 'runner-live', 60_000)
+
+      await h.dispatcher.tick()
+      expect(h.forge.squashMergeCalls).toHaveLength(index === 0 ? 0 : 1)
+    }
+  })
+
+  test('no intent or cancelled intent never invokes the direct merge', async () => {
+    const noIntent = harness()
+    const noIntentSlug = await seedAwaitingPr(noIntent)
+    noIntent.forge.setPrState(1, { state: 'open', mergeable: true })
+    noIntent.forge.setGatePresence(1, 'absent')
+    await noIntent.store.claimLease(noIntentSlug, 'runner-live', 60_000)
+    await noIntent.dispatcher.tick()
+    expect(noIntent.forge.autoMergeCalls).toEqual([])
+    expect(noIntent.forge.squashMergeCalls).toEqual([])
+
+    const cancelled = harness()
+    const cancelledSlug = await seedAwaitingPr(cancelled)
+    await cancelled.store.append(cancelledSlug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    const cancel = await cancelled.store.append(cancelledSlug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-cancelled',
+      payload: {},
+    })
+    cancelled.forge.setPrState(1, { state: 'open', mergeable: true })
+    cancelled.forge.setGatePresence(1, 'absent')
+    await cancelled.store.claimLease(cancelledSlug, 'runner-live', 60_000)
+    await cancelled.dispatcher.tick()
+    expect(cancelled.forge.squashMergeCalls).toEqual([])
+    const applied = (await cancelled.store.getEvents(cancelledSlug)).at(-1)
+    expect(applied?.type).toBe('pr.auto-merge-disabled')
+    expect(applied?.payload).toEqual({ commandSeq: cancel.seq })
+  })
+
+  test('a cancellation landing after classification is caught by the last-moment event reload', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setGatePresence(1, 'absent')
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+    const realSet = h.forge.setAutoMerge.bind(h.forge)
+    h.forge.setAutoMerge = async (...args) => {
+      const result = await realSet(...args)
+      await h.store.append(slug, {
+        actor: humanActor('operator'),
+        type: 'build.auto-merge-cancelled',
+        payload: {},
+      })
+      return result
+    }
+
+    await h.dispatcher.tick()
+    expect(h.forge.squashMergeCalls).toEqual([])
+    expect((await h.forge.getPrState('/repo', 1)).state).toBe('open')
+  })
+
+  test('a head race or direct command failure surfaces and writes no speculative merge fact', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setGatePresence(1, 'absent')
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+    const realSet = h.forge.setAutoMerge.bind(h.forge)
+    h.forge.setAutoMerge = async (...args) => {
+      const result = await realSet(...args)
+      if (result.kind === 'ungated') h.forge.setPrHeadSha(1, 'new-head')
+      return result
+    }
+
+    await expect(h.dispatcher.tick()).rejects.toThrow('head changed')
+    expect(h.forge.squashMergeCalls).toEqual([])
+    expect((await h.store.getEvents(slug)).some((e) => e.type === 'pr.merged')).toBe(
+      false,
+    )
+  })
+
+  test('BLOCKED/probe failures surface; HAS_HOOKS delegates to native and never falls back', async () => {
+    const blocked = harness()
+    const blockedSlug = await seedAwaitingPr(blocked)
+    await blocked.store.append(blockedSlug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    blocked.forge.setPrState(1, { state: 'open', mergeable: true })
+    blocked.forge.setMergeStateStatus(1, 'BLOCKED')
+    blocked.forge.setGatePresence(1, 'absent')
+    await blocked.store.claimLease(blockedSlug, 'runner-live', 60_000)
+    await expect(blocked.dispatcher.tick()).rejects.toThrow('BLOCKED')
+    expect(blocked.forge.squashMergeCalls).toEqual([])
+
+    const probe = harness()
+    const probeSlug = await seedAwaitingPr(probe)
+    await probe.store.append(probeSlug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    probe.forge.setPrState(1, { state: 'open', mergeable: true })
+    probe.forge.setGateProbeError(1, 'ruleset probe forbidden')
+    await probe.store.claimLease(probeSlug, 'runner-live', 60_000)
+    await expect(probe.dispatcher.tick()).rejects.toThrow('ruleset probe forbidden')
+    expect(probe.forge.squashMergeCalls).toEqual([])
+
+    const hooks = harness()
+    const hooksSlug = await seedAwaitingPr(hooks)
+    await hooks.store.append(hooksSlug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    hooks.forge.setPrState(1, { state: 'open', mergeable: true })
+    hooks.forge.setMergeStateStatus(1, 'HAS_HOOKS')
+    hooks.forge.setGatePresence(1, 'absent')
+    await hooks.store.claimLease(hooksSlug, 'runner-live', 60_000)
+    await hooks.dispatcher.tick()
+    expect(hooks.forge.isAutoMergeEnabled(1)).toBe(true)
+    expect(hooks.forge.squashMergeCalls).toEqual([])
+  })
+
+  test('fallback waits for finalize post-steps before landing', async () => {
+    const h = harness({ toml: '[finalize]\nsteps = ["release-notes"]\n' })
+    const slug = await seedAwaitingPr(h)
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setGatePresence(1, 'absent')
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+
+    await h.dispatcher.tick()
+    expect(h.forge.squashMergeCalls).toEqual([])
+    await h.store.append(slug, {
+      actor: agentActor('release-notes', 's_9'),
+      type: 'finalize.step-completed',
+      payload: { step: 'release-notes', ok: true },
+    })
+    await h.dispatcher.tick()
+    expect(h.forge.squashMergeCalls).toHaveLength(1)
+  })
+
+  test('fallback waits for the full post-reconcile verify cycle', async () => {
+    const toml = [
+      '[commands]',
+      'test = "bun test"',
+      '[verify]',
+      'steps = ["unit"]',
+      '[verify.unit]',
+      'kind = "check"',
+      'command = "test"',
+    ].join('\n')
+    const h = harness({ toml })
+    const slug = await seedBuild(h)
+    await seedLoopsApproved(h, slug)
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'verify.started',
+      payload: { step: 'unit', attempt: 1 },
+    })
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'verify.completed',
+      payload: { step: 'unit', attempt: 1, pass: true },
+    })
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'finalize.completed',
+      payload: { pr: PR },
+    })
+    await h.store.append(slug, {
+      actor: DISPATCHER,
+      type: 'pr.conflicted',
+      payload: { baseSha: 'base-old' },
+    })
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'reconcile.started',
+      payload: { attempt: 1, baseSha: 'base-old' },
+    })
+    await h.store.append(slug, {
+      actor: agentActor('reconcile', 's_9'),
+      type: 'reconcile.completed',
+      payload: {
+        mergeCommit: 'merge-1',
+        artifact: { kind: 'reconcile-notes', rev: 0 },
+      },
+    })
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setGatePresence(1, 'absent')
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+
+    await h.dispatcher.tick()
+    expect(h.forge.squashMergeCalls).toEqual([])
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'verify.started',
+      payload: { step: 'unit', attempt: 2 },
+    })
+    await h.store.append(slug, {
+      actor: KERNEL,
+      type: 'verify.completed',
+      payload: { step: 'unit', attempt: 2, pass: true },
+    })
+    await h.dispatcher.tick()
+    expect(h.forge.squashMergeCalls).toHaveLength(1)
+  })
+
+  test('a pending cancellation disables native auto-merge before recording a new conflict', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    const enable = await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    await h.store.append(slug, {
+      actor: DISPATCHER,
+      type: 'pr.auto-merge-enabled',
+      payload: { commandSeq: enable.seq },
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: true })
+    h.forge.setAutoMergeState(1, true)
+    const cancel = await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-cancelled',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: false })
+
+    expect(await h.dispatcher.tick()).toEqual({
+      ...emptyTickReport(),
+      conflicted: 1,
+    })
+    expect(h.forge.isAutoMergeEnabled(1)).toBe(false)
+    expect(h.forge.autoMergeCalls).toEqual([
+      {
+        workspacePath: `/ws/ab/${slug}`,
+        number: 1,
+        enabled: false,
+        changed: true,
+      },
+    ])
+    const events = await h.store.getEvents(slug)
+    expect(events.map((event) => event.type).slice(-2)).toEqual([
+      'pr.auto-merge-disabled',
+      'pr.conflicted',
+    ])
+    expect(events.at(-2)?.payload).toEqual({ commandSeq: cancel.seq })
+  })
+
+  test('a cancellation arriving during an existing conflict is applied without waiting for reconcile', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    const enable = await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    await h.store.append(slug, {
+      actor: DISPATCHER,
+      type: 'pr.auto-merge-enabled',
+      payload: { commandSeq: enable.seq },
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: false })
+    h.forge.setAutoMergeState(1, true)
+    await h.store.append(slug, {
+      actor: DISPATCHER,
+      type: 'pr.conflicted',
+      payload: { baseSha: 'base-old' },
+    })
+    const cancel = await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-cancelled',
+      payload: {},
+    })
+    await h.store.claimLease(slug, 'runner-live', 60_000)
+
+    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(h.forge.isAutoMergeEnabled(1)).toBe(false)
+    const events = await h.store.getEvents(slug)
+    expect(events.at(-1)?.type).toBe('pr.auto-merge-disabled')
+    expect(events.at(-1)?.payload).toEqual({ commandSeq: cancel.seq })
+    expect(events.filter((event) => event.type === 'pr.conflicted')).toHaveLength(1)
+  })
+
+  test('a conflict is routed to reconcile before any native or direct auto-merge attempt', async () => {
+    const h = harness()
+    const slug = await seedAwaitingPr(h)
+    await h.store.append(slug, {
+      actor: humanActor('operator'),
+      type: 'build.auto-merge-requested',
+      payload: {},
+    })
+    h.forge.setPrState(1, { state: 'open', mergeable: false })
+    h.forge.setGatePresence(1, 'absent')
+
+    expect(await h.dispatcher.tick()).toEqual({
+      ...emptyTickReport(),
+      conflicted: 1,
+    })
+    expect(h.forge.autoMergeCalls).toEqual([])
+    expect(h.forge.squashMergeCalls).toEqual([])
   })
 
   test('conflicted PR: pr.conflicted{baseSha} + runner re-attach, deduped while pending', async () => {

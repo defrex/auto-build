@@ -678,13 +678,15 @@ vocabulary *is* the UI API; forge mutation remains kernel/dispatcher plumbing.
 - `ab dispatch` on a TTY is an interactive fleet dashboard. Its bottom legend
   is the authoritative key map: Up/Down select a build by slug identity, `p`
   requests pause/resume when unblocked and opens optional resume feedback when
-  blocked, `m` toggles GitHub-native auto-merge, `d` toggles in-memory
+  blocked, `m` toggles durable auto-merge intent, `d` toggles in-memory
   dispatcher drain, and Ctrl-C exits. While the blocked-resume field is active,
   printable keys edit it (including `m`/`p`/`d`), Backspace edits, Enter submits,
   and Escape cancels; navigation and build actions are suppressed. The field is
   slug-bound process state, polling remains live, and the selected build's
-  blocker rows remain visible. `--plain` (and non-TTY output) remains
-  line-oriented and reads no keyboard input.
+  blocker rows remain visible. Auto-merge intent uses GitHub-native auto-merge
+  whenever a real merge gate exists; on a proved-ungated branch it consents to
+  the guarded non-admin squash fallback defined in §15.7. `--plain` (and
+  non-TTY output) remains line-oriented and reads no keyboard input.
 - Selection survives repaint/re-sort by tracking the build slug. Drain belongs
   only to one running dispatcher: while on it skips new ticket claims but keeps
   janitor, stale-runner, harvest, and in-flight work running; restart defaults
@@ -815,7 +817,7 @@ janitor, `reconcile.*` by a re-attached build-runner)
 
 | Type | Actor | Payload |
 |---|---|---|
-| `pr.auto-merge-enabled` / `pr.auto-merge-disabled` | kernel, dispatcher | `{commandSeq}` (correlated application fact) |
+| `pr.auto-merge-enabled` / `pr.auto-merge-disabled` | kernel, dispatcher | `{commandSeq}` (correlated native-state application fact; never emitted for a direct candidate) |
 | `pr.merged` | dispatcher | `{sha}` |
 | `pr.closed` | dispatcher | `{}` |
 | `pr.conflicted` | dispatcher | `{baseSha}` (detection-time snapshot/evidence) |
@@ -951,11 +953,18 @@ builds. A merged-PR fixup request is a *new ticket*, never a reopened build.
 - **PR → main: squash merge.** Main stays linear, one commit per build —
   which keeps reverts (one commit → one new ticket), release notes, and
   history archaeology clean. `pr.merged {sha}` records the squash commit as
-  the build's landing point. An operator may toggle GitHub-native auto-merge:
-  enabling uses `gh pr merge --auto --squash`, never `--admin` or a direct
-  merge, so GitHub's required checks remain the gate. If checks are already
-  green GitHub may merge immediately; the janitor still observes that result
-  on its next ordinary poll before completing the build.
+  the build's landing point. The operator's `m` command is durable consent to
+  merge. Whenever the exact base branch has a real merge-blocking gate
+  (classic protection or an active repository/inherited organization
+  ruleset), enabling uses GitHub-native `gh pr merge --auto --squash`; this is
+  true even when every requirement is currently satisfied and GitHub reports
+  `CLEAN`. When both gate probes authoritatively report no gate, the janitor
+  may instead run a normal guarded squash (`--squash --match-head-commit`) —
+  never `--admin`, force, or rebase. The fallback additionally requires the PR
+  to be positively mergeable and the engine to be parked at `awaiting-pr`, so
+  finalize post-steps and every post-reconcile verify step have completed.
+  Unknown gate data, unknown/future merge states, opaque blockers, auth errors,
+  and permission failures fail closed; none authorizes the fallback.
 - **main → feature branch: merge commit.** A stale branch is refreshed by
   merging base *into* it, resolving conflicts once against current main.
 - **Rebase is banned**, for two reasons. Operationally: at this system's
@@ -969,13 +978,23 @@ builds. A merged-PR fixup request is a *new ticket*, never a reopened build.
   branch, so mid-build provenance is untouched.
 
 Auto-merge desired state is durable across PR creation. Finalize re-reads the
-log after opening/adopting the PR and applies any unmatched command before
-committing `finalize.completed`; later commands are applied by the janitor on
-open PRs. The setter is idempotent and every application fact cites the human
-command seq. Thus a crash after the forge call but before the fact append
-retries safely, while a newer cancellation remains distinguishable from a
-stale enable acknowledgement. Cancellation disables native auto-merge on an
-existing PR or clears the pre-PR desired flag.
+log after opening/adopting the PR and reconciles any unmatched command before
+committing `finalize.completed`; later commands are reconciled by the janitor
+on open PRs. `pr.auto-merge-enabled`/`disabled` acknowledges only a confirmed
+native desired state and cites the human command seq. An ungated or
+transient result leaves intent pending and finalize completes normally; the
+janitor is the sole owner of a direct fallback. Immediately before that call it
+re-reads the log, requires the same latest command seq still requests merge,
+and checks the deterministic engine is at `awaiting-pr`. Cancellation therefore
+prevents a fallback and disables native auto-merge when one exists.
+
+Both native and direct forge calls precede their durable observation. Native
+application is idempotent across the forge-call/event-append crash window. A
+direct squash emits no speculative event: whether the call succeeds and the
+process lives or dies, the next ordinary forge poll observes the landed PR and
+emits `pr.merged`, then workspace release and `build.completed`. The expected
+head SHA rejects a changed-head race, and a normal (non-admin) merge remains
+subject to protection added after the probe.
 
 **Conflicts re-enter the pipeline via `reconcile`.** When the janitor's
 mergeability check fails it emits `pr.conflicted {baseSha}` and re-attaches

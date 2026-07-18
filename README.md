@@ -6,11 +6,13 @@ PR, and reconciles conflicts against your base branch — as a sequence of agent
 sessions driven by deterministic code. Once the PR lands, it records the merge
 and closes the build out.
 
-**Autobuild never bypasses your merge gates.** It opens PRs and watches them.
-You can land one yourself or press `m` in the dispatch dashboard to request
-GitHub-native squash auto-merge; required checks still decide when it lands,
-and `m` cancels the request. The last word on what enters your base branch
-stays with you.
+**Autobuild never bypasses your merge gates.** You can land a PR yourself or
+press `m` in the dispatch dashboard to give durable auto-merge consent. A
+branch with required checks or reviews always uses GitHub-native squash
+`--auto`, so those gates decide when it lands. Only when GitHub authoritatively
+reports that the branch has no merge-blocking gate may the dispatcher perform a
+normal, head-guarded squash itself; it never uses admin or force. Press `m`
+again to cancel the request.
 
 **Who it's for:** maintainers of a repository who have a backlog of
 well-understood, self-contained work and would rather review outcomes than
@@ -34,7 +36,9 @@ queryable paper trail.
    deciding alone. The dispatch dashboard accepts optional free-text guidance
    when you resume a blocked build.
 3. **Reviewing and choosing when to land the PR.** Merge it yourself, or opt a
-   selected build into GitHub-native auto-merge from the dashboard.
+   selected build into auto-merge from the dashboard. On gated branches GitHub
+   owns the wait; on proved-ungated branches that consent permits Autobuild's
+   guarded squash fallback.
 
 ---
 
@@ -105,9 +109,13 @@ an early adopter.
 
 **Limitations.** Each of these is current behavior, not a roadmap note:
 
-- **No direct/admin merges.** The dashboard can request GitHub-native
-  `--auto --squash`, but never uses `--admin` and never bypasses required
-  checks. A build reaches `merged` only after GitHub reports that it landed.
+- **No gate bypass or admin merge.** Gated branches always use GitHub-native
+  `--auto --squash`. On a branch proved to have no merge-blocking classic
+  protection or active ruleset, auto-merge intent permits one normal
+  `--squash --match-head-commit` fallback after verification/finalize work is
+  complete and the PR is positively mergeable. It never uses `--admin`, force,
+  or rebase. A build reaches `merged` only after the next poll observes that it
+  landed.
 - **One dispatcher per repository.** Ticket claiming is read-check-write; it is
   safe only under that rule.
 - **Capacity is per-repo.** `[dispatcher].capacity` defaults to 1. There is no
@@ -415,7 +423,7 @@ normal key legend, or the active feedback field with its editing controls:
 | Key | Action |
 |---|---|
 | Up / Down | Move the slug-based build selection. Repaints and re-sorts keep the same build selected. |
-| `m` | Toggle GitHub-native squash auto-merge for the selected build. Pre-PR intent is remembered; required checks are never bypassed. |
+| `m` | Toggle durable auto-merge intent for the selected build. Pre-PR intent is remembered; gated branches use GitHub-native auto-merge, while proved-ungated branches may use the guarded non-admin squash fallback. |
 | `p` | Request pause, resume an authoritatively paused unblocked build, or open optional feedback for a blocked build. The current agent step finishes before pause takes effect. |
 | `d` | Toggle drain for this dispatcher process: stop claiming new tickets while janitor, stale-runner, and in-flight work continue. Restart resets drain off. |
 | Enter / Escape | While blocked-resume feedback is open, submit / cancel. Backspace edits; all printable keys, including `m`, `p`, and `d`, are text rather than dashboard actions. |
@@ -437,9 +445,11 @@ and the header shows `intake ON` or `intake DRAINED`. Pipes, redirects, and
 
 Each tick runs in this order:
 
-1. **janitor** — polls open PRs; applies outstanding native auto-merge intent,
-   completes merged/closed builds, routes conflicted ones to `reconcile`, and
-   cleans up aborted builds.
+1. **janitor** — polls open PRs; reconciles outstanding auto-merge intent,
+   performs the guarded squash fallback only for proved-ungated, positively
+   mergeable builds parked after all verification/finalize work, completes
+   merged/closed builds, routes conflicts to `reconcile`, and cleans up aborted
+   builds.
 2. **startup resume** — first tick of an invocation only; attempts every
    actionable current build and automatically retries only an all-`policy`
    escalation set. Agent/stall questions remain parked for a human. Later ticks
