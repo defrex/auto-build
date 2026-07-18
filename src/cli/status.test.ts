@@ -760,7 +760,7 @@ describe('store selection', () => {
     expect(seen[0]).toBe('/explicit')
     expect(seen[1]).toBe('/from-env')
     expect(seen[2]).toBe('/explicit')
-    expect(seen[3]).toContain('autobuild') // DEFAULT_LOCAL_ROOT
+    expect(seen[3]).toBe(`${REPO}/.autobuild`)
   })
 
   test('AB_TOKEN is passed through for remote refs', async () => {
