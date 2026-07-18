@@ -97,16 +97,21 @@ describe('resolveRepoStatePaths', () => {
     })
   })
 
-  test('uses flag over environment over default and ignores a blank environment value', () => {
+  test('uses nonblank flag over environment over default', () => {
     expect(
       resolveRepoStatePaths({ repo, storeRef: 'flag', envStore: 'environment' }).storeRef,
     ).toBe('/code/example/flag')
     expect(resolveRepoStatePaths({ repo, envStore: 'environment' }).storeRef).toBe(
       '/code/example/environment',
     )
-    expect(resolveRepoStatePaths({ repo, envStore: '  ' }).storeRef).toBe(
-      '/code/example/.autobuild',
-    )
+    expect(
+      resolveRepoStatePaths({ repo, storeRef: '', envStore: 'environment' }).storeRef,
+    ).toBe('/code/example/environment')
+    expect(resolveRepoStatePaths({ repo, storeRef: '  ', envStore: '' })).toMatchObject({
+      storeRef: '/code/example/.autobuild',
+      localStateRoot: '/code/example/.autobuild',
+      worktreeRoot: '/code/example/.autobuild/worktrees',
+    })
   })
 })
 

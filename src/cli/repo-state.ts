@@ -60,7 +60,7 @@ function nonBlank(value: string | undefined): string | undefined {
 
 /**
  * Select state with one precedence rule for every sessionless command:
- * explicit `--store` > non-blank `AB_STORE` > repository-local default.
+ * non-blank explicit `--store` > non-blank `AB_STORE` > repository-local default.
  *
  * A local selection relocates the whole local tree, including worktrees. A
  * remote store has no filesystem root, so its worktrees remain local beneath
@@ -73,7 +73,7 @@ export function resolveRepoStatePaths(opts: {
 }): RepoStatePaths {
   const repo = resolve(opts.repo)
   const defaultLocalRoot = join(repo, LOCAL_STATE_DIR)
-  const selected = opts.storeRef ?? nonBlank(opts.envStore) ?? defaultLocalRoot
+  const selected = nonBlank(opts.storeRef) ?? nonBlank(opts.envStore) ?? defaultLocalRoot
   const remote = isRemoteStoreRef(selected)
   const storeRef = remote ? selected : resolve(repo, selected)
   const localStateRoot = remote ? defaultLocalRoot : storeRef
