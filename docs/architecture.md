@@ -79,10 +79,18 @@ suffix. Existing build records have no mutation path and are never re-slugged.
 The dashboard is an operator command producer, not forge plumbing. Its `p` and
 `m` handlers append human-actor events through the BuildStore; build-runner and
 dispatcher code acknowledge pause/resume and reconcile native auto-merge via
-the `Forge` port. `d` is the sole exception because drain is intentionally
-process-local: it gates only the current dispatcher's ticket-claim stage and is
-reset by restart. Raw input and live-region output have separate adapters so
-keypresses cannot write into or tear a rendered frame.
+the `Forge` port. On a blocked row, `p` instead opens slug/escalation-bound
+process state: Enter appends one human `escalation.answered` per captured id
+(`retry` for blank input, `guidance` for text), then requests resume too if the
+reduced build was paused. Escape writes nothing. The field is overlaid on the
+pure dashboard model, so blocker rows and polling remain live while terminal
+input edits synchronously; only submission joins the serialized operation
+queue. Reattachment remains the ordinary dispatcher lease sweep. The automatic
+startup path in `src/processes/dispatcher.ts` is unchanged and retries only an
+all-policy escalation set without input. `d` is the other process-local state:
+it gates only the current dispatcher's ticket-claim stage and resets on restart.
+Raw input and live-region output have separate adapters so keypresses cannot
+write into or tear a rendered frame.
 
 ## Development
 
