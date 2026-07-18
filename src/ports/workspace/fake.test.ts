@@ -12,17 +12,46 @@ describe('FakeWorkspaceProvider', () => {
       ref: '/ws/ab/fix-login',
       path: '/ws/ab/fix-login',
       branch: 'ab/fix-login',
+      base: { source: 'remote', sha: 'fake-base-sha' },
     })
     expect(provider.provisions).toEqual([OPTS])
     expect(provider.isActive(handle.ref)).toBe(true)
   })
 
-  test('provision is idempotent per branch (resume is a re-run — SPEC §15.6-C)', async () => {
+  test('provision distinguishes first creation from idempotent reuse', async () => {
     const provider = new FakeWorkspaceProvider({ root: '/ws' })
     const first = await provider.provision(OPTS)
     const second = await provider.provision(OPTS)
-    expect(second).toEqual(first)
+    expect(second).toEqual({
+      ...first,
+      base: { source: 'existing', sha: 'fake-base-sha' },
+    })
     expect(provider.provisions).toHaveLength(2)
+  })
+
+  test('configured fallback evidence is returned and the branch head survives release', async () => {
+    const provider = new FakeWorkspaceProvider({
+      root: '/ws',
+      base: {
+        source: 'local',
+        sha: 'local-sha',
+        remoteError: 'origin unavailable',
+      },
+    })
+    const first = await provider.provision(OPTS)
+    expect(first.base).toEqual({
+      source: 'local',
+      sha: 'local-sha',
+      remoteError: 'origin unavailable',
+    })
+
+    provider.setBranchHead(OPTS.branch, 'implemented-sha')
+    await provider.release(first)
+    const resumed = await provider.provision(OPTS)
+    expect(resumed.base).toEqual({
+      source: 'existing',
+      sha: 'implemented-sha',
+    })
   })
 
   test('release journals and is idempotent', async () => {

@@ -886,6 +886,7 @@ export class Dispatcher {
           provider: handle.provider,
           ref: handle.ref,
           branch: handle.branch,
+          base: handle.base,
         },
       } satisfies EventWrite<'workspace.provisioned'>)
 

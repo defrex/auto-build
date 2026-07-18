@@ -3,7 +3,7 @@
  * The kernel and processes depend only on these types; adapters live in
  * `ports/<port>/` and fakes for seam tests in `ports/fakes/`.
  */
-import type { TicketRef } from '../ontology'
+import type { TicketRef, WorkspaceBase } from '../ontology'
 
 // ── TicketSource (SPEC §3.2, §13) ────────────────────────────────────────────
 //
@@ -87,13 +87,18 @@ export interface WorkspaceHandle {
   branch: string
 }
 
+export interface WorkspaceProvisionResult extends WorkspaceHandle {
+  /** Durable evidence for the commit this provision selected or reused. */
+  base: WorkspaceBase
+}
+
 export interface WorkspaceProvider {
   readonly name: string
   provision(opts: {
     repo: string
     baseBranch: string
     branch: string
-  }): Promise<WorkspaceHandle>
+  }): Promise<WorkspaceProvisionResult>
   release(handle: WorkspaceHandle): Promise<void>
 }
 
