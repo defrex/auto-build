@@ -144,6 +144,98 @@ describe('FakeForge', () => {
     expect(forge.autoMergeCalls).toEqual([])
   })
 
+  test('gate presence is independent: gated CLEAN applies native, ungated CLEAN is a candidate', async () => {
+    const gated = new FakeForge({ gatePresence: 'present' })
+    const gatedPr = await gated.openPr(prOpts())
+    gated.setPrState(gatedPr.number, { state: 'open', mergeable: true })
+    expect(await gated.setAutoMerge('/ws/a', gatedPr.number, true)).toEqual({
+      kind: 'applied',
+    })
+    expect(gated.isAutoMergeEnabled(gatedPr.number)).toBe(true)
+
+    const ungated = new FakeForge({
+      gatePresence: 'absent',
+      headSha: 'expected-head',
+    })
+    const ungatedPr = await ungated.openPr(prOpts())
+    ungated.setPrState(ungatedPr.number, { state: 'open', mergeable: true })
+    expect(await ungated.setAutoMerge('/ws/a', ungatedPr.number, true)).toEqual({
+      kind: 'ungated',
+      headSha: 'expected-head',
+    })
+    expect(ungated.isAutoMergeEnabled(ungatedPr.number)).toBe(false)
+  })
+
+  test('ungated UNKNOWN defers; UNSTABLE remains direct-merge eligible', async () => {
+    const forge = new FakeForge({ gatePresence: 'absent' })
+    const pr = await forge.openPr(prOpts())
+    expect(await forge.setAutoMerge('/ws/a', pr.number, true)).toEqual({
+      kind: 'deferred',
+    })
+    forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    forge.setMergeStateStatus(pr.number, 'UNSTABLE')
+    expect(await forge.setAutoMerge('/ws/a', pr.number, true)).toEqual({
+      kind: 'ungated',
+      headSha: pr.headSha,
+    })
+  })
+
+  test('guarded squash journals separately and becomes observable as merged', async () => {
+    const forge = new FakeForge({
+      gatePresence: 'absent',
+      headSha: 'head-1',
+      mergeSha: 'squash-1',
+    })
+    const pr = await forge.openPr(prOpts())
+    forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    const candidate = await forge.setAutoMerge('/ws/a', pr.number, true)
+    expect(candidate).toEqual({ kind: 'ungated', headSha: 'head-1' })
+
+    await forge.squashMerge('/ws/a', pr.number, 'head-1')
+    expect(forge.squashMergeCalls).toEqual([
+      { workspacePath: '/ws/a', number: pr.number, expectedHeadSha: 'head-1' },
+    ])
+    expect(await forge.getPrState('/ws/a', pr.number)).toEqual({
+      state: 'merged',
+      sha: 'squash-1',
+    })
+  })
+
+  test('guarded squash rejects a moved head and never journals or lands it', async () => {
+    const forge = new FakeForge({ gatePresence: 'absent', headSha: 'old-head' })
+    const pr = await forge.openPr(prOpts())
+    forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    const candidate = await forge.setAutoMerge('/ws/a', pr.number, true)
+    expect(candidate).toEqual({ kind: 'ungated', headSha: 'old-head' })
+    forge.setPrHeadSha(pr.number, 'new-head')
+
+    await expect(
+      forge.squashMerge('/ws/a', pr.number, 'old-head'),
+    ).rejects.toThrow('head changed')
+    expect(forge.squashMergeCalls).toEqual([])
+    expect(await forge.getPrState('/ws/a', pr.number)).toEqual({
+      state: 'open',
+      mergeable: true,
+    })
+  })
+
+  test('gate-probe errors and unexplained blockers surface instead of self-merging', async () => {
+    const forge = new FakeForge({ gatePresence: 'absent' })
+    const pr = await forge.openPr(prOpts())
+    forge.setPrState(pr.number, { state: 'open', mergeable: true })
+    forge.setGateProbeError(pr.number, 'rulesets forbidden')
+    await expect(forge.setAutoMerge('/ws/a', pr.number, true)).rejects.toThrow(
+      'rulesets forbidden',
+    )
+
+    forge.setGatePresence(pr.number, 'absent')
+    forge.setMergeStateStatus(pr.number, 'BLOCKED')
+    await expect(forge.setAutoMerge('/ws/a', pr.number, true)).rejects.toThrow(
+      'BLOCKED',
+    )
+    expect(forge.squashMergeCalls).toEqual([])
+  })
+
   test('commentOnPr journals comments in order', async () => {
     const forge = new FakeForge()
     const { number } = await forge.openPr(prOpts())

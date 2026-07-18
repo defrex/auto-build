@@ -348,13 +348,14 @@ export async function done(
       // applies the same desired state again.
       const latest = await store.getEvents(env.build)
       const autoMerge = pendingAutoMerge(reduceBuild(latest))
-      if (autoMerge !== undefined) {
-        await deps.forge.setAutoMerge(
-          deps.workspacePath,
-          pr.number,
-          autoMerge.enabled,
-        )
-      }
+      const autoMergeResult =
+        autoMerge === undefined
+          ? undefined
+          : await deps.forge.setAutoMerge(
+              deps.workspacePath,
+              pr.number,
+              autoMerge.enabled,
+            )
 
       const event = await store.append(env.build, {
         actor: KERNEL,
@@ -365,7 +366,7 @@ export async function done(
       // The PR terminal is the D5 commit point. Its secondary correlated fact
       // is best-effort after that point: if this append fails, the janitor sees
       // the still-unmatched command and retries the idempotent forge operation.
-      if (autoMerge !== undefined) {
+      if (autoMerge !== undefined && autoMergeResult?.kind === 'applied') {
         try {
           await store.append(env.build, {
             actor: KERNEL,
