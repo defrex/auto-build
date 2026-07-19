@@ -1523,7 +1523,7 @@ describe('abDispatch interactive keyboard controls', () => {
       )
       expect(await fx.store.getRepoEvents(fx.origin)).toEqual(beforeRepo)
       for (const slug of ['alpha-work', 'beta-work']) {
-        expect(await fx.store.getEvents(slug)).toEqual(beforeBuilds.get(slug))
+        expect(await fx.store.getEvents(slug)).toEqual(beforeBuilds.get(slug)!)
       }
 
       input.press('down')
