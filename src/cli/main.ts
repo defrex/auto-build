@@ -506,8 +506,7 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
           }
           intervalMs = Math.round(seconds * 1000)
         } else if (arg === '--store') {
-          storeRef = rest[(i += 1)]
-          if (storeRef === undefined) throw new Error(`--store requires a value — ${usage}`)
+          storeRef = flagValue(rest[(i += 1)], 'store', usage)
         } else {
           throw new Error(`unknown argument "${arg}" — ${usage}`)
         }
