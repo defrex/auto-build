@@ -376,6 +376,54 @@ describe('abDispatch --once', () => {
     }
   }, 30_000)
 
+  test('initial intake off skips new claims while janitor still advances existing builds', async () => {
+    const fx = await makeFixture(
+      readyTicket('T-existing', { title: 'Existing work' }),
+      happyHandlers(),
+      DISPATCH_CONFIG_TOML.replace('capacity = 1', 'capacity = 2'),
+    )
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+      const [existing] = await fx.store.listBuilds()
+      expect(existing).toBeDefined()
+      expect(fx.tickets.claims).toEqual(['T-existing'])
+
+      fx.forge.setPrState(1, { state: 'merged', sha: 'merged-existing' })
+      fx.tickets.add(readyTicket('T-new', { title: 'New work' }))
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        intake: false,
+        wire: fx.wire,
+      })
+
+      expect(fx.tickets.claims).toEqual(['T-existing'])
+      expect((await fx.store.listBuilds()).map((record) => record.slug)).toEqual([
+        existing!.slug,
+      ])
+      expect(
+        (await fx.store.getEvents(existing!.slug)).some(
+          (event) =>
+            event.type === 'build.completed' && event.payload.outcome === 'merged',
+        ),
+      ).toBe(true)
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
   test('routes the slug role to a one-shot capability with the full spec and configured model', async () => {
     const toml = `${DISPATCH_CONFIG_TOML}
 [roles.default]
@@ -694,6 +742,143 @@ model = "gpt-slug-name"
       expect(await fx.tickets.get('fake-2')).toBeNull()
       expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(eventCount)
       expect(fx.cliErrors).toEqual([])
+      expect(fx.err).toEqual([])
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('automatically recovers a failed approved run before starting anything new', async () => {
+    const fx = await makeFixture(
+      [],
+      happyHandlers(),
+      `${DISPATCH_CONFIG_TOML}\n[harvest]\nthreshold = 1\n`,
+    )
+    const run = 'h_failed_dispatch'
+    const out: string[] = []
+    try {
+      await fx.store.createBuild({ slug: 'failed-source', repo: fx.origin })
+      await fx.store.append('failed-source', {
+        actor: agentActor('implement', 's_failed'),
+        type: 'observation.recorded',
+        payload: {
+          id: 'obs-failed-dispatch',
+          kind: 'latent-bug',
+          summary: 'recover this approved run automatically',
+        },
+      })
+      const scan = await scanUnclaimedObservations(fx.store, fx.origin)
+      const packet = await makeHarvestScanPacket({
+        store: fx.store,
+        tickets: fx.tickets,
+        repo: fx.origin,
+        run,
+        observations: scan.observations,
+        state: scan.state,
+      })
+      await fx.store.appendRepoWithArtifacts(
+        fx.origin,
+        [{ kind: 'harvest-scan', content: JSON.stringify(packet) }],
+        (deposited) => ({
+          actor: KERNEL,
+          type: 'harvest.started',
+          payload: {
+            run,
+            observations: scan.observations.map((item) => item.occurrence),
+            scan: { kind: deposited[0]!.kind, rev: deposited[0]!.revision },
+          },
+        }),
+      )
+      await fx.store.appendRepoWithArtifacts(
+        fx.origin,
+        [
+          {
+            kind: 'harvest-proposals',
+            content: JSON.stringify({
+              proposals: [
+                {
+                  action: 'create',
+                  title: 'Recover approved harvest automatically',
+                  whatWhy: 'The approved work must survive an infrastructure stop.',
+                  acceptanceCriteria: ['The frozen proposal is filed once.'],
+                  outOfScope: ['Starting a replacement harvest run.'],
+                  observations: scan.observations.map(
+                    (item) => item.occurrence,
+                  ),
+                },
+              ],
+            }),
+          },
+        ],
+        (deposited) => ({
+          actor: agentActor('harvest', 'hs_failed'),
+          type: 'harvest.proposals.submitted',
+          payload: {
+            run,
+            round: 1,
+            artifact: { kind: deposited[0]!.kind, rev: deposited[0]!.revision },
+          },
+        }),
+      )
+      await fx.store.appendRepoWithArtifacts(
+        fx.origin,
+        [{ kind: 'harvest-review', content: 'approved before failure\n' }],
+        (deposited) => ({
+          actor: agentActor('harvest-review', 'hr_failed'),
+          type: 'harvest.review.verdict',
+          payload: {
+            run,
+            round: 1,
+            verdict: 'approve',
+            findings: [],
+            artifact: { kind: deposited[0]!.kind, rev: deposited[0]!.revision },
+          },
+        }),
+      )
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.failed',
+        payload: {
+          run,
+          step: 'file',
+          attempt: 2,
+          error: 'temporary ticket outage',
+          willRetry: false,
+        },
+      })
+
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: (line) => out.push(line),
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+      })
+
+      const events = await fx.store.getRepoEvents(fx.origin)
+      expect(reduceHarvest(events).latest).toMatchObject({
+        run,
+        status: 'completed',
+        recoveryRequests: [
+          { attempt: 1, limit: 2, acknowledgedSeq: expect.any(Number) },
+        ],
+      })
+      expect(
+        events.filter((event) => event.type === 'harvest.started'),
+      ).toHaveLength(1)
+      expect(
+        events.filter(
+          (event) => event.type === 'harvest.recovery-requested',
+        ),
+      ).toHaveLength(1)
+      expect(
+        events.filter((event) => event.type === 'harvest.proposal.filed'),
+      ).toHaveLength(1)
+      expect(await fx.tickets.get('fake-1')).not.toBeNull()
+      expect(await fx.tickets.get('fake-2')).toBeNull()
+      expect(out).toContain('tick: harvestResumed=1 harvestCompleted=1')
       expect(fx.err).toEqual([])
     } finally {
       await fx.cleanup()
@@ -1055,7 +1240,7 @@ type FakeInputKey =
   | 'down'
   | 'auto-merge'
   | 'pause'
-  | 'drain'
+  | 'letter-d'
   | 'interrupt'
   | 'enter'
   | 'backspace'
@@ -1067,7 +1252,7 @@ function fakeInputEvent(key: FakeInputKey): TerminalInputEvent {
       return { type: 'text', text: 'm' }
     case 'pause':
       return { type: 'text', text: 'p' }
-    case 'drain':
+    case 'letter-d':
       return { type: 'text', text: 'd' }
     default:
       return { type: key }
@@ -1276,7 +1461,7 @@ describe('abDispatch --once with an interactive terminal', () => {
     }
   }, 30_000)
 
-  test('dashboard warnings are retained for the first frame and never hit stderr', async () => {
+  test('the global row accepts an early p before the first projection, even with no body rows', async () => {
     const fx = await makeFixture([], happyHandlers())
     const term = fakeTerminal()
     const input = fakeInput(['pause'])
@@ -1295,9 +1480,37 @@ describe('abDispatch --once with an interactive terminal', () => {
       })
       expect(out).toEqual([])
       expect(fx.err).toEqual([])
-      expect(stripAnsi(term.all())).toContain(
-        'dashboard action ignored: no active row is selected',
-      )
+      const painted = stripAnsi(term.all())
+      expect(painted).toContain('> Auto Build')
+      expect(painted).toContain('intake OFF')
+      expect(painted).toContain('dispatcher intake OFF')
+      expect(painted).toContain('no active builds')
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('startup Up/Down clamp on global, so a following p still toggles intake', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const input = fakeInput(['up', 'down', 'pause'])
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      const painted = stripAnsi(term.all())
+      expect(painted).toContain('> Auto Build')
+      expect(painted).toContain('dispatcher intake OFF')
+      expect(painted).not.toContain('no active row is selected')
+      expect(fx.err).toEqual([])
     } finally {
       await fx.cleanup()
     }
@@ -1633,7 +1846,7 @@ describe('abDispatch --once with an interactive terminal', () => {
 })
 
 describe('abDispatch interactive keyboard controls', () => {
-  test('harvest is selected first; p writes durable pause/resume commands while m remains build-only', async () => {
+  test('global is selected first; harvest/build p route by row while m remains build-only', async () => {
     const fx = await makeFixture(
       [
         readyTicket('T-alpha-harvest', { title: 'Alpha work' }),
@@ -1693,8 +1906,19 @@ describe('abDispatch interactive keyboard controls', () => {
         terminal: term,
         input,
       })
-      await waitFor(() => /^> .*Harvest/m.test(stripAnsi(term.all())))
+      await waitFor(() => stripAnsi(term.all()).includes('> Auto Build'))
 
+      input.press('auto-merge')
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('Dispatcher auto-merge unavailable: select a build'),
+      )
+      expect(await fx.store.getRepoEvents(fx.origin)).toEqual(beforeRepo)
+      for (const slug of ['alpha-work', 'beta-work']) {
+        expect(await fx.store.getEvents(slug)).toEqual(beforeBuilds.get(slug)!)
+      }
+
+      input.press('down')
+      await waitFor(() => /^> .*Harvest/m.test(stripAnsi(term.all())))
       input.press('auto-merge')
       await waitFor(() => stripAnsi(term.all()).includes('Harvest auto-merge unavailable'))
       input.press('pause')
@@ -1717,6 +1941,7 @@ describe('abDispatch interactive keyboard controls', () => {
         ),
       )
       await waitFor(() => stripAnsi(term.all()).includes('harvest: resume requested'))
+      expect(stripAnsi(term.all())).toContain('intake ON')
 
       const repoAdded = (await fx.store.getRepoEvents(fx.origin)).slice(
         beforeRepo.length,
@@ -1769,7 +1994,7 @@ describe('abDispatch interactive keyboard controls', () => {
     }
   }, 30_000)
 
-  test('p resumes a never-paused harvest error, but does not reinterpret escalation', async () => {
+  test('p acknowledges exhausted harvest attention, but does not reinterpret escalation', async () => {
     const fx = await makeFixture([], happyHandlers())
     const term = fakeTerminal()
     const input = fakeInput()
@@ -1796,6 +2021,43 @@ describe('abDispatch interactive keyboard controls', () => {
           willRetry: false,
         },
       })
+      for (const attempt of [1, 2]) {
+        await fx.store.appendRepo(fx.origin, {
+          actor: KERNEL,
+          type: 'harvest.recovery-requested',
+          payload: { run: 'harvest_errored', attempt, limit: 2 },
+        })
+        await fx.store.appendRepo(fx.origin, {
+          actor: KERNEL,
+          type: 'harvest.resumed',
+          payload: {},
+        })
+        await fx.store.appendRepo(fx.origin, {
+          actor: KERNEL,
+          type: 'harvest.failed',
+          payload: {
+            run: 'harvest_errored',
+            step: 'file',
+            attempt: attempt + 2,
+            error: 'ticket provider unavailable',
+            willRetry: false,
+          },
+        })
+      }
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.recovery-exhausted',
+        payload: {
+          run: 'harvest_errored',
+          step: 'file',
+          error: 'ticket provider unavailable',
+          attempts: 2,
+          limit: 2,
+          releasedObservations: [{ build: 'observed-build', seq: 1 }],
+          committedDispositions: [],
+          pendingProposals: [],
+        },
+      })
       const before = (await fx.store.getRepoEvents(fx.origin)).length
 
       run = abDispatch({
@@ -1810,6 +2072,8 @@ describe('abDispatch interactive keyboard controls', () => {
         input,
       })
       await waitFor(() => /Harvest.*FAILED/.test(stripAnsi(term.all())))
+      input.press('down')
+      await waitFor(() => /^> .*Harvest.*FAILED/m.test(stripAnsi(term.all())))
 
       input.press('pause')
       await waitFor(async () =>
@@ -1818,7 +2082,9 @@ describe('abDispatch interactive keyboard controls', () => {
         ),
       )
       await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest: error resume requested'),
+        stripAnsi(term.all()).includes(
+          'harvest: exhausted recovery attention acknowledgement requested',
+        ),
       )
       let added = (await fx.store.getRepoEvents(fx.origin)).slice(before)
       expect(added.map((event) => event.type)).toEqual([
@@ -1826,8 +2092,9 @@ describe('abDispatch interactive keyboard controls', () => {
       ])
       expect(added[0]?.actor).toEqual({ kind: 'human', user: 'error-op' })
 
-      // Settle the recovery command, then stop the same run by deliberate
-      // escalation. On that state p controls only the repository pause gate.
+      // Settle the attention acknowledgement, then stop a later run by
+      // deliberate escalation. On that state p controls only the repository
+      // pause gate and never treats escalation as recoverable infrastructure.
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
         type: 'harvest.resumed',
@@ -1835,9 +2102,18 @@ describe('abDispatch interactive keyboard controls', () => {
       })
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
+        type: 'harvest.started',
+        payload: {
+          run: 'harvest_escalated',
+          observations: [{ build: 'observed-build', seq: 1 }],
+          scan: { kind: 'harvest-scan', rev: 1 },
+        },
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
         type: 'harvest.escalated',
         payload: {
-          run: 'harvest_errored',
+          run: 'harvest_escalated',
           source: 'agent',
           reason: 'operator judgment required',
           observations: [{ build: 'observed-build', seq: 1 }],
@@ -1914,6 +2190,8 @@ describe('abDispatch interactive keyboard controls', () => {
       await waitFor(() => stripAnsi(term.all()).includes('alpha-work'))
 
       input.press('down')
+      input.press('down')
+      await waitFor(() => /^> .*beta-work/m.test(stripAnsi(term.all())))
       input.press('pause')
       input.press('auto-merge')
       input.press('auto-merge')
@@ -2013,6 +2291,8 @@ describe('abDispatch interactive keyboard controls', () => {
         input,
       })
       await waitFor(() => stripAnsi(term.all()).includes('Should finalize use the manual merge path?'))
+      input.press('down')
+      await waitFor(() => /^> .*guidance-work/m.test(stripAnsi(term.all())))
 
       input.press('pause')
       await waitFor(() => stripAnsi(term.all()).includes('Resume feedback'))
@@ -2117,6 +2397,8 @@ describe('abDispatch interactive keyboard controls', () => {
       })
       await waitFor(() => input.starts === 1)
       await new Promise((resolve) => setTimeout(resolve, 20))
+      input.press('down')
+      await waitFor(() => /^> .*retry-work/m.test(stripAnsi(term.all())))
       input.press('pause')
       await waitFor(() => stripAnsi(term.all()).includes('Resume feedback'))
       input.text('   ')
@@ -2220,6 +2502,8 @@ describe('abDispatch interactive keyboard controls', () => {
         input,
       })
       await waitFor(() => stripAnsi(term.all()).includes('finalize-retry'))
+      input.press('down')
+      await waitFor(() => /^> .*finalize-retry/m.test(stripAnsi(term.all())))
 
       // Hold plan long enough to record durable pre-PR auto-merge intent.
       input.press('auto-merge')
@@ -2351,6 +2635,8 @@ describe('abDispatch interactive keyboard controls', () => {
         input,
       })
       await waitFor(() => stripAnsi(term.all()).includes('Cancellation must leave this blocker untouched'))
+      input.press('down')
+      await waitFor(() => /^> .*cancel-work/m.test(stripAnsi(term.all())))
       input.press('pause')
       await waitFor(() => stripAnsi(term.all()).includes('Resume feedback'))
       input.text('do not submit this')
@@ -2401,8 +2687,10 @@ describe('abDispatch interactive keyboard controls', () => {
         input,
       })
       await waitFor(() => input.starts === 1)
-      // Let the initial projection establish selection.
+      // Let the initial projection establish the global selection, then move
+      // to the build row before applying its contextual p action.
       await new Promise((resolve) => setTimeout(resolve, 20))
+      input.press('down')
       input.press('pause')
       await waitFor(async () =>
         (await fx.store.getEvents('paused-work')).some(
@@ -2421,13 +2709,14 @@ describe('abDispatch interactive keyboard controls', () => {
     }
   }, 30_000)
 
-  test('d gates only this invocation and a fresh invocation accepts work again', async () => {
+  test('launch intake is process-local, global p toggles it, and the removed d key is inert', async () => {
     const fx = await makeFixture(
-      readyTicket('T-drained', { body: 'not a conforming spec' }),
+      readyTicket('T-intake-off', { body: 'not a conforming spec' }),
       {},
     )
     try {
-      const input = fakeInput(['drain'])
+      const input = fakeInput()
+      const term = fakeTerminal()
       let sleeps = 0
       await abDispatch({
         targetRepo: fx.origin,
@@ -2435,25 +2724,32 @@ describe('abDispatch interactive keyboard controls', () => {
         exec: spawnExec,
         stdout: () => {},
         stderr: (line) => fx.err.push(line),
+        intake: false,
         intervalMs: 1,
         sleep: async () => {
           sleeps += 1
           if (sleeps === 1) {
             expect(fx.tickets.claims).toEqual([])
-            input.press('drain')
+            expect(stripAnsi(term.all())).toContain('intake OFF')
+            input.press('letter-d')
             await new Promise((resolve) => setTimeout(resolve, 0))
+            expect(stripAnsi(term.all())).toContain('intake OFF')
+            input.press('pause')
+            await waitFor(() =>
+              stripAnsi(term.all()).includes('dispatcher intake ON'),
+            )
           } else {
             input.press('interrupt')
           }
         },
         wire: fx.wire,
-        terminal: fakeTerminal(),
+        terminal: term,
         input,
       })
-      expect(fx.tickets.claims).toEqual(['T-drained'])
+      expect(fx.tickets.claims).toEqual(['T-intake-off'])
 
-      // A new DispatchLoop starts undrained. A newly ready ticket is claimed on
-      // its first tick without an operator toggling drain off again.
+      // A new DispatchLoop defaults intake back on. A newly ready ticket is
+      // claimed on its first tick without another operator toggle.
       fx.tickets.add(readyTicket('T-fresh', { body: 'still nonconforming' }))
       const freshInput = fakeInput()
       await abDispatch({
@@ -2468,7 +2764,7 @@ describe('abDispatch interactive keyboard controls', () => {
         terminal: fakeTerminal(),
         input: freshInput,
       })
-      expect(fx.tickets.claims).toEqual(['T-drained', 'T-fresh'])
+      expect(fx.tickets.claims).toEqual(['T-intake-off', 'T-fresh'])
     } finally {
       await fx.cleanup()
     }

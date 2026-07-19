@@ -66,22 +66,36 @@ loop starts it fire-and-forget, keeps one process-local in-flight handle, and
 drains that handle only for `--once`, so watch ticks and SIGINT remain
 responsive. `src/events/harvest.ts` and `src/kernel/harvest.ts` define and reduce
 a separate repository journal, including human pause/resume requests, kernel
-boundary acknowledgements, claims, UUID-v4 reservation facts written before
-external creates, per-proposal filing facts, and the committed dedup ledger.
-Build reducers therefore never interpret a non-build workflow. The dispatcher
-suppresses launch for either an acknowledged pause or a latest non-retrying
-`failed` run when no resume is pending. The runner settles commands under the
-repository lease and checks control between durable scan, synthesize, review,
-filing, and escalation units. `harvest.resumed` opens the gate and reopens only
-the latest failed run; completed and escalated runs remain terminal. Parking
-leaves the run id, claimed occurrence snapshot, artifacts, attempt history,
-reservations, and filing facts untouched, so resume skips every completed unit
-rather than rescanning or re-filing. A repeated problem writes another failed
-fact and parks again, preventing a watch-tick hot loop. Typed session deposits
-live under `ab harvest context|submit|verdict`; `ab harvest status` and the
-selectable `Harvest` dashboard row read the same facts. The row omits the
-internal run id; that remains available through status and the repository
-journal.
+boundary acknowledgements, automatic recovery request/ack history, claims,
+UUID-v4 reservation facts written before external creates, per-proposal filing
+facts, recovery exhaustion/attention, and the committed dedup ledger. Build
+reducers therefore never interpret a non-build workflow.
+
+The dispatcher asks the shared pure control decision what is due before any new
+scan. An ordinary failed run selects a kernel-only monotonic automatic request;
+the runner records it under the repository lease and settles it through the
+same `harvest.resumed` fact used by manual resume. Request and acknowledgement
+are distinct crash-safe boundaries, and the fixed outer budget of two reopen
+attempts is independent of within-step attempts. Parking and reopening preserve
+the run id, immutable claim, artifacts, attempt history, reservations, and
+filing facts, so recovery skips every completed unit rather than rescanning or
+re-filing.
+
+After the second automatic reopen fails, `src/processes/harvest.ts` derives a
+provider-free partition from frozen scan/proposal artifacts plus filing facts.
+It commits only classifiable filed creates, still-valid frozen joins, and
+suppressions; missing creates, tombstone/unknown joins, and malformed or
+otherwise unclassifiable content fail safe to pending release. Rejected store
+reads propagate as retryable infrastructure rather than being classified as
+content. `harvest.recovery-exhausted` records that exact partition and raises an
+attention barrier. Dispatcher launch is suppressed until a human resume
+acknowledgement clears that barrier;
+the acknowledgement does not reopen the exhausted run. Completed and deliberate
+escalated runs remain terminal, with escalation snapshots still claimed. Typed
+session deposits live under `ab harvest context|submit|verdict`; `ab harvest
+status` and the selectable `Harvest` dashboard row project recovery progress,
+stopped boundary, exhaustion, and pending work from the same journal. The row
+omits the internal run id; status retains it.
 
 ## Pre-build identity
 
@@ -132,10 +146,12 @@ deposits the transcript and `session.ended`, writes the provider message to
 `willRetry: false` before another session can start. A completed turn without a
 typed terminal remains the separate `no-terminal` case. `harvest-runner.ts`
 uses the same result contract; its reducer parks `harvest.failed
-{willRetry:false}` until a human resume acknowledgement clears the reduced
-error. Historical attempt counts remain monotonic, but that cleared boundary
+{willRetry:false}` at the stopped boundary. A human request or one of the two
+durable automatic recovery requests is acknowledged through `harvest.resumed`.
+Historical within-step attempts remain monotonic, while each acknowledgement
 permits one actual session re-entry even when the old occurrence exhausted its
-ordinary budget. A new failure consumes the grant and parks again.
+ordinary budget. Exhaustion is a separate atomic fact, not inferred from stdout
+or a mutable counter.
 
 ## Repository initialization
 
@@ -165,7 +181,7 @@ including under `--force`.
 | `src/kernel/` | Phase table/build reducer/engine plus the separate pure harvest reducer; converge, stall detection, server lifecycle | §5, §10, §12, §15.4–15.5, §16.2 |
 | `src/ports/` | TicketSource / Workspace / Forge / AgentRunner / Telemetry interfaces, adapters, fakes. Runtime/model/extension routing lives in `ports/runner/`: `runtime.ts` (the capability-carrying registry), `routing.ts` (the eager resolver), `one-shot.ts` (optional pre-build completion), `provider-error.ts` (shared permanent-failure classifier), and the `claude.ts` / `pi.ts` SDK error extractors/adapters | §3.2, §6.3, §9, §13 |
 | `src/cli/` | The `ab` CLI — the only agent↔store channel; `init.ts` owns first-config package-script detection and rendering | §8, §16.3 |
-| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame — pure reducer projection/rendering, discriminated harvest/build row selection, status overlay pixels, and in-place replacement | §14, §15.5 |
+| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame — pure reducer projection/rendering, discriminated global/harvest/build row selection, contextual controls, status overlay pixels, and in-place replacement | §14, §15.5 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty and harvest trigger), harvest deterministic core + runner | §3.3, §12, §15.7 |
 | `src/config/` | `autobuild.toml` parsing and validation | §16.1 |
 | `skills/` | Canonical defaults; `ab init` vendors them to `.agents/skills/ab-*` (Pi/Agent Skills) and links `.claude/skills/ab-*` | §16.3 |
@@ -173,22 +189,31 @@ including under `--force`.
 | `docs/spec-standard.md` | The definition of "buildable" every ticket surface cites | §6.1 |
 | `templates/` | Valid setup-only config baseline with comment anchors rendered by `ab init` | §16.3 |
 
-The renderer reserves one `Auto Build` title row, one always-present status
-row, and one blank separator before the legend/modal controls. It shares the
-selection marker and right-pinned status column across harvest and build rows;
-`Harvest` is operator-facing identity, while its run id stays in the journal.
+The renderer reserves one selectable `Auto Build` title row, one always-present
+status row, a blank separator before the harvest/build body, and another before
+the contextual legend/modal controls. It shares the selection marker and
+right-pinned status column across harvest and build rows; `Harvest` is
+operator-facing identity, while its run id stays in the journal. Auto-merge
+reduction retains four states, but rendering collapses the three active states
+to `auto merge` with cyan/green/yellow emphasis and omits the token for `off`.
 
 The dashboard is an operator command producer, not forge plumbing. Its model
-tracks selection as `{kind: 'harvest'} | {kind: 'build', slug}` over the same
-ordered rows the renderer paints, so insertion/removal never retargets by row
-index. `m` narrows that identity to a build and remains explanatory on harvest.
-`p` branches by identity: builds append human events to their stream, while
-harvest appends `harvest.resume-requested` when the reduced gate is paused or
-the latest run is failed, and otherwise appends `harvest.pause-requested`.
-`FAILED` stays distinct from `RUNNING`, marks the exact stopped step, and uses a
-distinct error-resume status message. An escalated run is never treated as this
-recoverable infrastructure state. Build-runner and harvest-runner acknowledge
-pause/resume at their respective safe boundaries;
+tracks selection as `{kind: 'global'} | {kind: 'harvest'} | {kind: 'build',
+slug}` over global first, optional harvest second, and slug-sorted builds. The
+always-present global identity and structural reconciliation prevent repaint,
+insertion, or removal from retargeting by row index. The legend derives from
+that identity. `m` narrows it to a build and remains explanatory on global and
+harvest. `p` branches by identity: global toggles process-local intake, builds
+append human events to their stream, while harvest appends
+`harvest.resume-requested` when the reduced gate is paused, an ordinary failed
+run is manually resumed, or exhausted attention needs acknowledgement;
+otherwise it appends `harvest.pause-requested`. `FAILED` stays distinct from
+`RUNNING`: an ordinary stop names its step and automatic progress, while
+exhaustion clearly names the attention barrier and pending count. The
+exhaustion acknowledgement does not reopen the old run. Error recovery uses a
+distinct status message, and an escalated run is never treated as recoverable
+infrastructure state. Build-runner and harvest-runner acknowledge pause/resume
+at their respective safe boundaries;
 dispatcher code reconciles auto-merge via the `Forge` port. On a blocked build,
 `p` instead opens slug/escalation-bound process state: Enter
 appends one human `escalation.answered` per captured id (`retry` for blank
@@ -205,11 +230,13 @@ requires positive mergeability, unchanged latest intent, and
 `decideNext(...)=awaiting-pr`; the normal non-admin merge is head-SHA guarded
 and completion remains an observed `pr.merged` fact on the next poll. The
 automatic startup path in `src/processes/dispatcher.ts` is unchanged and
-retries only an all-policy escalation set without input. `d` is the other
-process-local state: it gates only the current dispatcher's ticket-claim stage
-and resets on restart. Dispatcher notices are a process-local latest-status
-overlay reapplied after every asynchronous projection; dashboard mode never
-routes them to line sinks or scrollback, while plain mode keeps those sinks.
+retries only an all-policy escalation set without input. Intake is process-local
+state that gates only the current dispatcher's ticket-claim stage. CLI
+`--intake`/`--no-intake` seed it (default on), and global-row `p` toggles it
+after launch; it is never persisted. Dispatcher notices are a process-local
+latest-status overlay reapplied after every asynchronous projection; dashboard
+mode never routes them to line sinks or scrollback, while plain mode keeps those
+sinks.
 The live region therefore owns only in-place frame replacement and cursor
 restoration. Raw input and live output remain separate adapters so keypresses
 cannot write into or tear a rendered frame.
