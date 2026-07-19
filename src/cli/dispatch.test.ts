@@ -1125,6 +1125,32 @@ describe('abDispatch --once with an interactive terminal', () => {
     }
   }, 30_000)
 
+  test('startup Up/Down clamp on global, so a following p still toggles intake', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const input = fakeInput(['up', 'down', 'pause'])
+    try {
+      await abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      const painted = stripAnsi(term.all())
+      expect(painted).toContain('> Auto Build')
+      expect(painted).toContain('dispatcher intake OFF')
+      expect(painted).not.toContain('no active row is selected')
+      expect(fx.err).toEqual([])
+    } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
   test('a non-interactive terminal (a pipe or redirect) auto-selects plain', async () => {
     const fx = await makeFixture(readyTicket('T-pipe'), happyHandlers())
     const term = fakeTerminal(false)

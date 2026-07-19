@@ -439,7 +439,12 @@ class DispatchLoop {
   }
 
   private moveSelection(delta: number): void {
-    const rows = this.model === undefined ? [] : dashboardSelections(this.model)
+    // Input starts before the first asynchronous store projection. The global
+    // row exists independently of that projection, so startup navigation must
+    // clamp on it rather than letting the generic empty-list helper clear it.
+    const rows = this.model === undefined
+      ? [{ kind: 'global' } as const]
+      : dashboardSelections(this.model)
     this.selection = moveSelection(rows, this.selection, delta)
     this.syncModelControls()
     this.paint()
