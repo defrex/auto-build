@@ -30,6 +30,7 @@ import type { Config } from '../../config/schema'
 import type { Finding, Phase } from '../../ontology'
 import { verifyPhase } from '../../ontology'
 import { steppingClock } from '../../testing/fixed'
+import { MemoryBuildStore } from '../../store/memory'
 import type { BuildRecord } from '../../store/types'
 import { buildDashboard, projectBuild, type DashboardBuild, type PipelineStep } from './model'
 
@@ -393,6 +394,7 @@ describe('projectBuild: the active-build filter', () => {
       capacity: 2,
       drained: false,
       defaultAutoMerge: false,
+      harvestPaused: false,
       statusLine: '',
     })
     expect(
@@ -403,6 +405,64 @@ describe('projectBuild: the active-build filter', () => {
         defaultAutoMerge: true,
       }).defaultAutoMerge,
     ).toBe(true)
+  })
+
+  test('the header gate follows acknowledgements, not pending commands or a synthetic row', async () => {
+    const store = new MemoryBuildStore()
+    await store.ensureRepo('/repos/app')
+    await store.appendRepo('/repos/app', {
+      actor: humanActor('operator'),
+      type: 'harvest.pause-requested',
+      payload: {},
+    })
+    let model = buildDashboard(
+      [],
+      CONFIG,
+      { repo: '/repos/app', mode: 'watch', capacity: 2 },
+      await store.getRepoEvents('/repos/app'),
+    )
+    expect(model.harvestPaused).toBe(false)
+    expect(model.harvest).toBeUndefined()
+
+    await store.appendRepo('/repos/app', {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    model = buildDashboard(
+      [],
+      CONFIG,
+      { repo: '/repos/app', mode: 'watch', capacity: 2 },
+      await store.getRepoEvents('/repos/app'),
+    )
+    expect(model.harvestPaused).toBe(true)
+    expect(model.harvest).toBeUndefined()
+
+    await store.appendRepo('/repos/app', {
+      actor: humanActor('other-operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    model = buildDashboard(
+      [],
+      CONFIG,
+      { repo: '/repos/app', mode: 'watch', capacity: 2 },
+      await store.getRepoEvents('/repos/app'),
+    )
+    expect(model.harvestPaused).toBe(true)
+
+    await store.appendRepo('/repos/app', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    model = buildDashboard(
+      [],
+      CONFIG,
+      { repo: '/repos/app', mode: 'watch', capacity: 2 },
+      await store.getRepoEvents('/repos/app'),
+    )
+    expect(model.harvestPaused).toBe(false)
   })
 })
 

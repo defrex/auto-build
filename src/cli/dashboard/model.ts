@@ -29,11 +29,11 @@
  *   engine.ts:707-708 a spec restart re-runs finalize and its post-steps
  *   engine.ts:221-227 an unlanded revise-spec answer parks the whole pipeline
  *
- * Two display rules live here rather than in the kernel, because the spec asks
- * for them visually and "changing lifecycle semantics" is out of scope:
- * effective status (blocked overrides paused) and the pending-restart boundary.
- * Both are derivations over facts the reducer already retains; neither the
- * reducer nor the engine is touched.
+ * Display-only inferences live here rather than in the kernel when the spec
+ * asks for pixels without changing lifecycle semantics: build effective status
+ * (blocked overrides paused), the pending-restart boundary, and harvest-row
+ * attention visibility. All derive from retained facts; neither reducer nor
+ * engine is touched.
  */
 import type { AbEvent } from '../../events/catalog'
 import type { HarvestEvent } from '../../events/harvest'
@@ -44,6 +44,7 @@ import type { BuildRecord } from '../../store/types'
 import {
   DEFAULT_MAX_HARVEST_RECOVERY_ATTEMPTS,
   reduceHarvest,
+  type HarvestState,
 } from '../../kernel/harvest'
 
 /** The only statuses a listed build can have — queued/done/aborted are
@@ -88,15 +89,21 @@ export type DashboardSelection =
   | { kind: 'harvest' }
   | { kind: 'build'; slug: string }
 
+export type HarvestRunAction = 'resume' | 'acknowledge'
+
 export interface DashboardHarvest {
   kind: 'harvest'
-  /** Absent when the repository gate was paused before its first run. */
-  run?: string
-  status: 'running' | 'paused' | 'completed' | 'escalated' | 'failed'
+  /** A row always represents this concrete run; the repository gate lives in
+   * the header even when no run exists. */
+  run: string
+  status: 'running' | 'paused' | 'escalated' | 'failed'
   steps: PipelineStep[]
   observations: number
   rounds: number
   detail?: string
+  /** Display-only action currently safe for `p`. Absent for running rows,
+   * acknowledged pauses, and while a resume request awaits the kernel. */
+  action?: HarvestRunAction
 }
 
 export interface DashboardBuild {
@@ -131,6 +138,9 @@ export interface DashboardModel {
   drained: boolean
   /** Claim-time default for new builds, owned by this process only. */
   defaultAutoMerge: boolean
+  /** Durable repository gate reduced from acknowledged journal facts. Pending
+   * commands deliberately do not change this field optimistically. */
+  harvestPaused: boolean
   /** Stable row identity, never a row index. */
   selection?: DashboardSelection
   /** Latest process-local dispatcher notice. Always rendered on one reserved
@@ -140,8 +150,8 @@ export interface DashboardModel {
   /** Ephemeral blocked-resume field; never derived from or stored in events. */
   resumeInput?: ResumeInputView
   builds: DashboardBuild[]
-  /** Latest run remains visible after terminal completion until a newer run
-   * replaces it. It is selectable display state, never a synthetic build. */
+  /** Present only for an open run or unresolved run-level attention. It is
+   * selectable display state, never a synthetic build. */
   harvest?: DashboardHarvest
 }
 
@@ -639,17 +649,58 @@ function harvestStepTiming(
   }
 }
 
-/** Latest repository harvest as a step row. Stopped and terminal runs stay
- * visible until replaced, and a repository paused before its first run still
- * gets a queryable/selectable row. */
-export function projectHarvest(
+/** A deliberate escalation has no dedicated acknowledgement event. For display
+ * only, pair a post-terminal human resume request with the later kernel resume
+ * that consumed it. A countermanding pause invalidates the pending request,
+ * matching the repository reducer's command semantics. */
+function escalationAttentionDismissed(
   events: HarvestEvent[],
+  terminalSeq: number,
+): boolean {
+  let pendingHumanResume = false
+  for (const event of events) {
+    if (event.seq <= terminalSeq) continue
+    if (
+      event.type === 'harvest.resume-requested' &&
+      event.actor.kind === 'human'
+    ) {
+      pendingHumanResume = true
+      continue
+    }
+    if (event.type === 'harvest.pause-requested') {
+      pendingHumanResume = false
+      continue
+    }
+    if (event.type === 'harvest.resumed' && pendingHumanResume) return true
+  }
+  return false
+}
+
+/** Project only a concrete run that is open or still needs human attention.
+ * The repository gate is projected separately into the header. */
+function projectHarvestRun(
+  events: HarvestEvent[],
+  state: HarvestState,
 ): DashboardHarvest | undefined {
-  const state = reduceHarvest(events)
   const run = state.latest
-  if (run === undefined && !state.paused) return undefined
-  const occurrences = run?.steps ?? []
-  const stopped = run === undefined || run.status !== 'running'
+  if (run === undefined || run.status === 'completed') return undefined
+  const exhaustion = run.recoveryExhaustion
+  if (
+    run.status === 'failed' &&
+    exhaustion?.attentionAcknowledgedSeq !== undefined
+  ) {
+    return undefined
+  }
+  if (
+    run.status === 'escalated' &&
+    run.terminalSeq !== undefined &&
+    escalationAttentionDismissed(events, run.terminalSeq)
+  ) {
+    return undefined
+  }
+
+  const occurrences = run.steps
+  const stopped = run.status !== 'running'
   const current = (name: string): boolean => {
     if (stopped || state.paused) return false
     const latest = [...occurrences]
@@ -668,19 +719,19 @@ export function projectHarvest(
         occurrence.step === name && occurrence.outcome === outcome,
     )
   const failedAt = (name: string): boolean =>
-    run?.status === 'failed' && run.failure?.step === name
+    run.status === 'failed' && run.failure?.step === name
   const rounds = Math.max(
     0,
-    ...(run?.proposals.map((proposal) => proposal.round) ?? []),
-    ...(run?.reviews.map((review) => review.round) ?? []),
+    ...run.proposals.map((proposal) => proposal.round),
+    ...run.reviews.map((review) => review.round),
     ...occurrences.map((occurrence) => occurrence.round ?? 0),
   )
   const count = rounds > 1 ? rounds : undefined
-  const approved = run?.reviews.some((review) => review.verdict === 'approve') ?? false
-  const synthOutput = (run?.proposals.length ?? 0) > 0
-  const reviewOutput = (run?.reviews.length ?? 0) > 0
+  const approved = run.reviews.some((review) => review.verdict === 'approve')
+  const synthOutput = run.proposals.length > 0
+  const reviewOutput = run.reviews.length > 0
   const failedEvent =
-    run?.status === 'failed'
+    run.status === 'failed'
       ? [...events]
           .reverse()
           .find(
@@ -727,48 +778,81 @@ export function projectHarvest(
         timing: harvestStepTiming(occurrences, 'review', frozenAt),
       },
     ),
-    step('file', run?.status === 'completed', current('file'), {
+    step('file', false, current('file'), {
       producedOutput: hasCompleted('file'),
       qualifier: failedAt('file') ? 'failed' : undefined,
       timing: harvestStepTiming(occurrences, 'file', frozenAt),
     }),
   ]
-  const exhaustion = run?.recoveryExhaustion
-  const recoveryAttempts = run?.recoveryRequests.length ?? 0
+  const recoveryAttempts = run.recoveryRequests.length
   const recoveryLimit =
     exhaustion?.limit ??
-    run?.recoveryRequests.at(-1)?.limit ??
+    run.recoveryRequests.at(-1)?.limit ??
     DEFAULT_MAX_HARVEST_RECOVERY_ATTEMPTS
-  const stoppedAt = run?.failure
+  const stoppedAt = run.failure
     ? `${run.failure.step}${
         run.failure.round !== undefined ? ` r${run.failure.round}` : ''
       }`
     : undefined
   const detail =
-    run?.escalation !== undefined
+    run.escalation !== undefined
       ? run.escalation.reason
       : exhaustion !== undefined
-        ? `recovery exhausted — ${
-            exhaustion.attentionAcknowledgedSeq === undefined
-              ? 'human attention required'
-              : 'attention acknowledged'
-          }; stopped at ${exhaustion.step}${
+        ? `recovery exhausted — human attention required; stopped at ${exhaustion.step}${
             exhaustion.round !== undefined ? ` r${exhaustion.round}` : ''
           }; pending ${exhaustion.releasedObservations.length}`
-        : run?.failure !== undefined
+        : run.failure !== undefined
           ? `stopped at ${stoppedAt} — automatic recovery ${recoveryAttempts}/${recoveryLimit}; ${run.failure.error}`
           : recoveryAttempts > 0
             ? `automatic recovery ${recoveryAttempts}/${recoveryLimit} resumed`
             : undefined
+  const hasPendingResume = state.pendingCommands.some(
+    (command) => command.command === 'resume',
+  )
+  const action: HarvestRunAction | undefined =
+    state.paused || hasPendingResume
+      ? undefined
+      : run.status === 'failed'
+        ? exhaustion === undefined
+          ? 'resume'
+          : 'acknowledge'
+        : run.status === 'escalated'
+          ? 'acknowledge'
+          : undefined
   return {
     kind: 'harvest',
-    ...(run !== undefined ? { run: run.run } : {}),
-    status: state.paused ? 'paused' : run!.status,
+    run: run.run,
+    // A paused gate freezes an open run. Attention statuses remain visible as
+    // FAILED/ESCALATED because the header now carries the gate state.
+    status: state.paused && run.status === 'running' ? 'paused' : run.status,
     steps,
-    observations: run?.observations.length ?? 0,
+    observations: run.observations.length,
     rounds,
     ...(detail !== undefined ? { detail } : {}),
+    ...(action !== undefined ? { action } : {}),
   }
+}
+
+interface RepositoryHarvestProjection {
+  harvestPaused: boolean
+  harvest?: DashboardHarvest
+}
+
+function projectRepositoryHarvest(
+  events: HarvestEvent[],
+): RepositoryHarvestProjection {
+  const state = reduceHarvest(events)
+  const harvest = projectHarvestRun(events, state)
+  return {
+    harvestPaused: state.paused,
+    ...(harvest !== undefined ? { harvest } : {}),
+  }
+}
+
+export function projectHarvest(
+  events: HarvestEvent[],
+): DashboardHarvest | undefined {
+  return projectRepositoryHarvest(events).harvest
 }
 
 /** Every active build, sorted by slug — a stable frame, so a redraw never
@@ -792,17 +876,20 @@ export function buildDashboard(
     .map(({ record, state, events }) => projectBuild(record, state, config, events))
     .filter((build): build is DashboardBuild => build !== null)
     .sort((a, b) => a.slug.localeCompare(b.slug))
-  const harvest = projectHarvest(harvestEvents)
+  const harvestProjection = projectRepositoryHarvest(harvestEvents)
   return {
     repo: header.repo,
     mode: header.mode,
     capacity: header.capacity,
     drained: header.drained ?? false,
     defaultAutoMerge: header.defaultAutoMerge ?? false,
+    harvestPaused: harvestProjection.harvestPaused,
     statusLine: header.statusLine ?? '',
     ...(header.selection !== undefined ? { selection: header.selection } : {}),
     ...(header.resumeInput !== undefined ? { resumeInput: header.resumeInput } : {}),
     builds,
-    ...(harvest !== undefined ? { harvest } : {}),
+    ...(harvestProjection.harvest !== undefined
+      ? { harvest: harvestProjection.harvest }
+      : {}),
   }
 }

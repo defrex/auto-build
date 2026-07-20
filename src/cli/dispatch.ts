@@ -40,6 +40,7 @@ import {
 import { reduceBuild, type BuildState } from '../kernel/reducer'
 import {
   buildDashboard,
+  projectHarvest,
   type DashboardModel,
   type DashboardSelection,
 } from './dashboard/model'
@@ -127,7 +128,13 @@ const DASHBOARD_POLL_MS = 500
  * state (AC 8). */
 const DASHBOARD_TICK_MS = 250
 
-type DashboardAction = 'up' | 'down' | 'auto-merge' | 'pause'
+type DashboardAction =
+  | 'up'
+  | 'down'
+  | 'auto-merge'
+  | 'pause'
+  | 'harvest-gate'
+  | { kind: 'harvest-run'; run: string | undefined }
 
 interface ResumePrompt {
   slug: string
@@ -508,7 +515,7 @@ class DispatchLoop {
       return
     }
     if (this.selection?.kind === 'harvest') {
-      await this.toggleHarvestPause()
+      await this.controlHarvestRun(this.model?.harvest?.run)
       return
     }
     const slug = this.selectedBuildSlug('pause/resume')
@@ -548,31 +555,89 @@ class DispatchLoop {
     await this.renderOnce()
   }
 
-  private async toggleHarvestPause(): Promise<void> {
+  /** Toggle the durable repository gate from the always-present header. The
+   * latest pending command is the effective requested target, while rendering
+   * remains acknowledged-only. */
+  private async toggleHarvestGate(): Promise<void> {
+    if (this.selection?.kind !== 'global') {
+      const subject =
+        this.selection?.kind === 'harvest' ? 'Harvest' : 'Build'
+      this.say(`${subject} harvest gate unavailable: select Dispatcher`)
+      return
+    }
+
     const { store } = this.wiring
     const repo = this.opts.targetRepo
     await store.ensureRepo(repo)
     const state = reduceHarvest(await store.getRepoEvents(repo))
-    const exhaustion = state.latest?.recoveryExhaustion
-    const attentionResume =
-      exhaustion !== undefined &&
-      exhaustion.attentionAcknowledgedSeq === undefined
-    const errorResume =
-      state.latest?.status === 'failed' && exhaustion === undefined
-    const resume = state.paused || errorResume || attentionResume
+    const pending = state.pendingCommands.at(-1)
+    const requestedPaused =
+      pending === undefined ? state.paused : pending.command === 'pause'
+    const command = requestedPaused ? 'resume' : 'pause'
     await store.appendRepo(repo, {
       actor: humanActor(buildControlUser(this.opts.env)),
-      type: resume
+      type: command === 'resume'
         ? 'harvest.resume-requested'
         : 'harvest.pause-requested',
       payload: {},
     })
+    this.say(`harvest gate: ${command} requested`)
+    await this.renderOnce()
+  }
+
+  /** `p` on Harvest acts only on the concrete run captured at keypress time.
+   * It never toggles the repository gate and never retargets a replacement run
+   * that appeared while the action waited in the serialized queue. */
+  private async controlHarvestRun(
+    expectedRun: string | undefined,
+  ): Promise<void> {
+    const { store } = this.wiring
+    const repo = this.opts.targetRepo
+    await store.ensureRepo(repo)
+    const events = await store.getRepoEvents(repo)
+    const state = reduceHarvest(events)
+    const projected = projectHarvest(events)
+    if (
+      expectedRun === undefined ||
+      projected === undefined ||
+      projected.run !== expectedRun
+    ) {
+      this.say('harvest run action ignored: selected run is no longer active')
+      await this.renderOnce()
+      return
+    }
+
+    if (state.paused) {
+      this.say(
+        'harvest run action unavailable while harvest is OFF; select Dispatcher and press h',
+      )
+      await this.renderOnce()
+      return
+    }
+    if (
+      state.pendingCommands.some((command) => command.command === 'resume')
+    ) {
+      this.say('harvest run: resume acknowledgement pending')
+      await this.renderOnce()
+      return
+    }
+    if (projected.action === undefined) {
+      this.say('harvest run has no available action')
+      await this.renderOnce()
+      return
+    }
+
+    await store.appendRepo(repo, {
+      actor: humanActor(buildControlUser(this.opts.env)),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
     this.say(
-      attentionResume
-        ? 'harvest: exhausted recovery attention acknowledgement requested'
-        : errorResume
-          ? 'harvest: error resume requested'
-          : `harvest: ${resume ? 'resume' : 'pause'} requested`,
+      projected.action === 'resume'
+        ? 'harvest: error resume requested'
+        : state.latest?.recoveryExhaustion !== undefined
+          ? 'harvest: exhausted recovery attention acknowledgement requested'
+          : 'harvest: escalation acknowledgement requested',
     )
     await this.renderOnce()
   }
@@ -660,6 +725,10 @@ class DispatchLoop {
   }
 
   private async handleAction(action: DashboardAction): Promise<void> {
+    if (typeof action !== 'string') {
+      await this.controlHarvestRun(action.run)
+      return
+    }
     switch (action) {
       case 'up':
         this.moveSelection(-1)
@@ -673,13 +742,17 @@ class DispatchLoop {
       case 'auto-merge':
         await this.toggleAutoMerge()
         return
+      case 'harvest-gate':
+        await this.toggleHarvestGate()
+        return
     }
   }
 
   private queueAction(action: DashboardAction): void {
     void this.serialize(() => this.handleAction(action)).catch((error: unknown) => {
+      const name = typeof action === 'string' ? action : action.kind
       this.warn(
-        `dashboard ${action} action failed: ${error instanceof Error ? error.message : String(error)}`,
+        `dashboard ${name} action failed: ${error instanceof Error ? error.message : String(error)}`,
       )
     })
   }
@@ -752,7 +825,14 @@ class DispatchLoop {
         this.queueAction('auto-merge')
         return
       case 'p':
-        this.queueAction('pause')
+        this.queueAction(
+          this.selection?.kind === 'harvest'
+            ? { kind: 'harvest-run', run: this.model?.harvest?.run }
+            : 'pause',
+        )
+        return
+      case 'h':
+        this.queueAction('harvest-gate')
         return
       default:
         return
