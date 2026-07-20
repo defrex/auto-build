@@ -881,11 +881,30 @@ describe('reduceBuild: reconcile cycle (§15.7)', () => {
     const reconciled = stateAfter(log, 'reconcile.completed')
     expect(reconciled.prState).toBe('open')
     expect(reconciled.currentPhase).toBeUndefined()
-    expect(reconciled.lastCompletedPhase?.phase).toBe('reconcile')
+    expect(reconciled.lastCompletedPhase).toEqual({
+      phase: 'reconcile',
+      attempt: 1,
+      seq: 19,
+    })
   })
 
-  test('repeat conflicts count attempts; the cycle ends merged', () => {
+  test('repeat conflicts preserve occurrence identity and count attempts; the cycle ends merged', () => {
+    const secondStarted = stateAfter(log, 'reconcile.started', 2)
+    const occurrenceIdentity = {
+      phase: secondStarted.currentPhase?.phase,
+      attempt: secondStarted.currentPhase?.attempt,
+    }
+    expect(occurrenceIdentity).toEqual({ phase: 'reconcile', attempt: 2 })
+    expect(secondStarted.currentPhase?.seq).toBe(23)
+    expect(secondStarted.reconcileAttempts).toBe(2)
+
     const second = stateAfter(log, 'reconcile.completed', 2)
+    expect(second.currentPhase).toBeUndefined()
+    expect({
+      phase: second.lastCompletedPhase?.phase,
+      attempt: second.lastCompletedPhase?.attempt,
+    }).toEqual(occurrenceIdentity)
+    expect(second.lastCompletedPhase?.seq).toBe(24)
     expect(second.reconcileAttempts).toBe(2)
     expect(second.prState).toBe('open')
 

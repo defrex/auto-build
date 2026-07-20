@@ -532,15 +532,22 @@ export function reduceBuild(events: AbEvent[]): BuildState {
           seq: event.seq,
         })
         break
-      case 'reconcile.completed':
+      case 'reconcile.completed': {
+        // The terminal payload has no attempt, so preserve it from the
+        // matching in-flight occurrence before complete() clears that context.
+        // An unmatched completion remains a bare context rather than borrowing
+        // the aggregate reconcileAttempts high-water.
+        const attempt =
+          currentPhase?.phase === 'reconcile' ? currentPhase.attempt : undefined
         // §15.7: conflicted until a reconcile.completed appears after the
         // pr.conflicted — the PR is open again while verify:* re-runs.
         if (prState === 'conflicted') prState = 'open'
         // Reconciliation changed the code, so verify re-runs in full — a new
         // cycle (§15.7, engine.ts:275).
         verify.cycleSince = Math.max(verify.cycleSince, event.seq)
-        complete('reconcile', event.seq)
+        complete('reconcile', event.seq, attempt !== undefined ? { attempt } : undefined)
         break
+      }
 
       case 'observation.recorded':
         observations.push(event.payload)
