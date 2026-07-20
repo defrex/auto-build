@@ -15,7 +15,8 @@
  *   — upstream is adopted only where it doesn't collide with what the repo
  *   deliberately changed (`resolved`). The returned full file is untrusted:
  *   deterministic validation protects the installed skill identity, rejects
- *   marker/wrapper output, and preserves every already-clean merge region. A
+ *   agent-authored marker/wrapper output, and preserves every already-clean
+ *   merge region (including literal marker documentation). A
  *   missing, declined, failed, or invalid resolution escalates to a human: the
  *   LOCAL file is left byte-untouched and the report carries the merge-markered
  *   text (`conflicted`). Conflict markers are never written into the live skill.
@@ -29,6 +30,7 @@
  *
  * Like init, upgrade runs OUTSIDE build sessions — no AB_* environment.
  */
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -77,31 +79,66 @@ export type ResolveConflict = (input: {
   incoming: string
 }) => Promise<string | null>
 
+export interface MergeConflictLabels {
+  local: string
+  pristine: string
+  incoming: string
+}
+
+interface MergeFileResult {
+  clean: boolean
+  text: string
+  labels: MergeConflictLabels
+}
+
+function uniqueMergeLabels(): MergeConflictLabels {
+  const nonce = randomUUID()
+  return {
+    local: `ab-upgrade-local-${nonce}`,
+    pristine: `ab-upgrade-pristine-${nonce}`,
+    incoming: `ab-upgrade-incoming-${nonce}`,
+  }
+}
+
 /**
  * Three-way merge over `git merge-file -p` on temp copies. Exit code 0 is a
  * clean merge; a positive code is the number of conflicts (stdout then holds
- * the markered text); anything else is a real git error.
+ * the markered text); anything else is a real git error. Labels are
+ * unguessable per invocation so marker-looking skill content can never be
+ * mistaken for structure in this merge's output.
  */
 async function mergeFile(
   exec: Exec,
   input: { base: string; local: string; incoming: string },
-): Promise<{ clean: boolean; text: string }> {
+): Promise<MergeFileResult> {
   const dir = await mkdtemp(join(tmpdir(), 'ab-upgrade-'))
+  const labels = uniqueMergeLabels()
   try {
     await writeFile(join(dir, 'local'), input.local)
     await writeFile(join(dir, 'base'), input.base)
     await writeFile(join(dir, 'incoming'), input.incoming)
     const result = await exec(
       [
-        'git', 'merge-file', '-p',
-        '-L', 'local', '-L', 'pristine', '-L', 'upstream',
-        'local', 'base', 'incoming',
+        'git',
+        'merge-file',
+        '-p',
+        '-L',
+        labels.local,
+        '-L',
+        labels.pristine,
+        '-L',
+        labels.incoming,
+        'local',
+        'base',
+        'incoming',
       ],
       { cwd: dir },
     )
-    if (result.exitCode === 0) return { clean: true, text: result.stdout }
+    if (result.exitCode === 0) {
+      return { clean: true, text: result.stdout, labels }
+    }
     if (result.exitCode > 0 && result.exitCode < 127) {
-      return { clean: false, text: result.stdout }
+      return { clean: false, text: result.stdout, labels }
     }
     throw new Error(
       `git merge-file failed (exit ${result.exitCode}): ${
@@ -124,11 +161,17 @@ function linesWithEndings(text: string): string[] {
 
 /**
  * The failed merge already contains every non-colliding local and incoming
- * edit. Extract the exact regions outside its conflict hunks; a resolver may
- * replace the hunks, but it has no authority to rewrite these regions.
+ * edit. Extract the exact regions outside its uniquely labelled conflict
+ * hunks; a resolver may replace the hunks, but it has no authority to rewrite
+ * these regions.
  */
-function cleanMergeRegions(marked: string): string[] {
+function cleanMergeRegions(
+  marked: string,
+  labels: MergeConflictLabels,
+): string[] {
   const regions: string[] = []
+  const startMarker = `<<<<<<< ${labels.local}`
+  const endMarker = `>>>>>>> ${labels.incoming}`
   let current = ''
   let conflict = false
   let separator = false
@@ -136,7 +179,7 @@ function cleanMergeRegions(marked: string): string[] {
 
   for (const line of linesWithEndings(marked)) {
     const marker = line.replace(/\r?\n$/, '')
-    if (!conflict && marker === '<<<<<<< local') {
+    if (!conflict && marker === startMarker) {
       regions.push(current)
       current = ''
       conflict = true
@@ -148,7 +191,7 @@ function cleanMergeRegions(marked: string): string[] {
       separator = true
       continue
     }
-    if (conflict && marker === '>>>>>>> upstream') {
+    if (conflict && marker === endMarker) {
       if (!separator) {
         throw new Error('git merge-file produced a malformed conflict without a separator')
       }
@@ -162,10 +205,70 @@ function cleanMergeRegions(marked: string): string[] {
     throw new Error('git merge-file produced an unterminated conflict')
   }
   if (!sawConflict) {
-    throw new Error('git merge-file reported a conflict without conflict markers')
+    throw new Error('git merge-file reported a conflict without its labelled markers')
   }
   regions.push(current)
   return regions
+}
+
+interface ContentInterval {
+  start: number
+  end: number
+}
+
+/** Match each protected region to its exact occurrence in the proposal. */
+function locateCleanRegions(
+  candidate: string,
+  regions: string[],
+): { intervals: ContentInterval[] } | { error: string } {
+  const intervals: ContentInterval[] = []
+  let cursor = 0
+  for (let index = 0; index < regions.length; index += 1) {
+    const region = regions[index] ?? ''
+    if (region === '') continue
+
+    let start: number
+    if (index === 0) {
+      if (!candidate.startsWith(region)) {
+        return {
+          error:
+            'output changed or wrapped the already-clean merge region before the first conflict',
+        }
+      }
+      start = 0
+    } else if (index === regions.length - 1) {
+      start = candidate.length - region.length
+      if (start < cursor || !candidate.endsWith(region)) {
+        return {
+          error:
+            'output changed or wrapped the already-clean merge region after the last conflict',
+        }
+      }
+    } else {
+      start = candidate.indexOf(region, cursor)
+      if (start === -1) {
+        return { error: 'output omitted or changed an already-clean merge region' }
+      }
+    }
+    intervals.push({ start, end: start + region.length })
+    cursor = start + region.length
+  }
+  return { intervals }
+}
+
+/** Text outside protected clean intervals is the agent-authored hunk content. */
+function resolutionGaps(
+  candidate: string,
+  intervals: ContentInterval[],
+): string[] {
+  const gaps: string[] = []
+  let cursor = 0
+  for (const interval of intervals) {
+    gaps.push(candidate.slice(cursor, interval.start))
+    cursor = interval.end
+  }
+  gaps.push(candidate.slice(cursor))
+  return gaps
 }
 
 function frontmatterName(candidate: string): { name?: string; error?: string } {
@@ -207,11 +310,9 @@ export function validateConflictResolution(input: {
   skill: string
   candidate: string
   markedMerge: string
+  labels: MergeConflictLabels
 }): string | undefined {
   if (input.candidate.trim() === '') return 'output was empty'
-  if (CONFLICT_MARKER_LINE.test(input.candidate)) {
-    return 'output contains a Git conflict-marker line'
-  }
 
   const frontmatter = frontmatterName(input.candidate)
   if (frontmatter.error !== undefined) return frontmatter.error
@@ -221,27 +322,24 @@ export function validateConflictResolution(input: {
 
   let regions: string[]
   try {
-    regions = cleanMergeRegions(input.markedMerge)
+    regions = cleanMergeRegions(input.markedMerge, input.labels)
   } catch (error) {
     return error instanceof Error ? error.message : String(error)
   }
 
-  const first = regions[0] ?? ''
-  if (first !== '' && !input.candidate.startsWith(first)) {
-    return 'output changed or wrapped the clean region before the first conflict'
-  }
-  let cursor = first.length
-  for (const region of regions.slice(1)) {
-    if (region === '') continue
-    const index = input.candidate.indexOf(region, cursor)
-    if (index === -1) {
-      return 'output omitted or changed an already-clean merge region'
-    }
-    cursor = index + region.length
-  }
-  const last = regions.at(-1) ?? ''
-  if (last !== '' && !input.candidate.endsWith(last)) {
-    return 'output changed or wrapped the clean region after the last conflict'
+  const located = locateCleanRegions(input.candidate, regions)
+  if ('error' in located) return located.error
+
+  // Marker-looking lines already present in an exact clean region are skill
+  // content, not merge structure. Only agent-authored hunk gaps must be free
+  // of standard marker lines; this rejects unresolved output without making a
+  // skill that documents Git conflict syntax impossible to resolve.
+  if (
+    resolutionGaps(input.candidate, located.intervals).some((gap) =>
+      CONFLICT_MARKER_LINE.test(gap),
+    )
+  ) {
+    return 'output contains a Git conflict-marker line in a resolved hunk'
   }
   return undefined
 }
@@ -374,6 +472,7 @@ export async function abUpgrade(opts: {
       skill: name,
       candidate: resolved,
       markedMerge: merge.text,
+      labels: merge.labels,
     })
     if (invalid !== undefined) {
       keepConflict(`agent resolution was invalid: ${invalid}`)

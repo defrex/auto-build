@@ -92,7 +92,8 @@ describe('createUpgradeAgentResolver', () => {
     expect(call.cwd).toBe('/target/repo')
     expect(call.env).toEqual({ API_TOKEN: 'secret' })
     expect(call.model).toBe('alpha-upgrade')
-    expect(call.signal).toBeUndefined()
+    expect(call.signal).toBeInstanceOf(AbortSignal)
+    expect(call.signal?.aborted).toBe(false)
     expect(call.prompt).toContain('Standing bias: preserve the local customization')
     expect(call.prompt).toContain('incorporate every incoming change that does not collide')
     expect(call.prompt).toContain(`<pristine-base>\n${INPUT.base}\n</pristine-base>`)
@@ -157,6 +158,36 @@ describe('createUpgradeAgentResolver', () => {
 
     expect(await resolve(INPUT)).toBeNull()
     expect(await resolve(INPUT)).toBe(`${UPGRADE_CONFLICT_DECLINE} with prose`)
+  })
+
+  test('a stalled completion is aborted at the fixed caller-owned deadline', async () => {
+    let signal: AbortSignal | undefined
+    const stalled = createUpgradeAgentResolver({
+      targetRepo: '/repo',
+      env: {},
+      timeoutMs: 5,
+      load: async () => config('[roles.default]\nruntime = "alpha"\n'),
+      runtimeFactory: () => ({
+        runtimes: {
+          alpha: registration(
+            {
+              complete: (input) => {
+                signal = input.signal
+                return new Promise(() => {})
+              },
+            },
+            ['alpha-'],
+          ),
+        },
+        defaultRuntime: 'alpha',
+      }),
+    })
+
+    await expect(stalled(INPUT)).rejects.toThrow(
+      'upgrade conflict resolution deadline exceeded after 5ms',
+    )
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal?.aborted).toBe(true)
   })
 
   test('missing one-shot capability and completion failures surface to the upgrade engine', async () => {

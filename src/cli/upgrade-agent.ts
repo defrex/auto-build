@@ -14,6 +14,9 @@ import type { ResolveConflict } from './upgrade'
 /** The one output that means the model considers the conflict ambiguous. */
 export const UPGRADE_CONFLICT_DECLINE = 'AB_UPGRADE_CONFLICT_DECLINE'
 
+/** A provider stall must not hold the sessionless upgrade command forever. */
+export const DEFAULT_UPGRADE_RESOLUTION_TIMEOUT_MS = 60_000
+
 export interface UpgradeAgentResolverOpts {
   targetRepo: string
   env: Record<string, string | undefined>
@@ -21,6 +24,8 @@ export interface UpgradeAgentResolverOpts {
   runtimeFactory?: () => ProductionRuntimes
   /** Test seam; production loads <targetRepo>/autobuild.toml lazily. */
   load?: (path: string) => Promise<Config>
+  /** Fixed in production; injectable only for deterministic deadline tests. */
+  timeoutMs?: number
 }
 
 function definedEnv(
@@ -117,14 +122,39 @@ export function createUpgradeAgentResolver(
 
   return async (input) => {
     const selected = await completion()
-    const result = await selected.oneShot.complete({
-      prompt: upgradeConflictPrompt(input),
-      cwd: opts.targetRepo,
-      env: definedEnv(opts.env),
-      ...(selected.model !== undefined ? { model: selected.model } : {}),
+    const timeoutMs = Math.max(
+      0,
+      opts.timeoutMs ?? DEFAULT_UPGRADE_RESOLUTION_TIMEOUT_MS,
+    )
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort()
+        reject(
+          new Error(
+            `upgrade conflict resolution deadline exceeded after ${timeoutMs}ms`,
+          ),
+        )
+      }, timeoutMs)
     })
-    return result.text.trim() === UPGRADE_CONFLICT_DECLINE
-      ? null
-      : result.text
+
+    try {
+      const result = await Promise.race([
+        selected.oneShot.complete({
+          prompt: upgradeConflictPrompt(input),
+          cwd: opts.targetRepo,
+          env: definedEnv(opts.env),
+          signal: controller.signal,
+          ...(selected.model !== undefined ? { model: selected.model } : {}),
+        }),
+        deadline,
+      ])
+      return result.text.trim() === UPGRADE_CONFLICT_DECLINE
+        ? null
+        : result.text
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 }

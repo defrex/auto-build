@@ -293,6 +293,71 @@ describe('abUpgrade — the four pristine-based cases', () => {
     )
   })
 
+  test('marker-documentation lines are protected content, not merge structure', async () => {
+    const markerBody = [
+      '# alpha',
+      '',
+      'This skill documents a literal Git opener:',
+      '<<<<<<< local',
+      'protected marker documentation',
+      'ordinary content after the marker-looking line',
+      '',
+      ...Array.from({ length: 12 }, (_value, index) => `stable context ${index + 1}`),
+      'conflict target',
+      'tail remains clean',
+      '',
+    ].join('\n')
+    await writeDist(distV1, { alpha: markerBody })
+    await install()
+    const live = installedSkillPath(target, 'ab-alpha')
+    const pristinePath = pristineSkillPath(target, 'ab-alpha')
+    const local = installedForm(
+      'alpha',
+      markerBody.replace('conflict target', 'conflict target (local)'),
+    )
+    const incomingBody = markerBody.replace(
+      'conflict target',
+      'conflict target (incoming)',
+    )
+    const incoming = installedForm('alpha', incomingBody)
+    const resolved = installedForm(
+      'alpha',
+      markerBody.replace('conflict target', 'conflict target (local)'),
+    )
+    await writeFile(live, local)
+    await writeDist(distV2, { alpha: incomingBody })
+    const pristine = await readFile(pristinePath, 'utf8')
+
+    const rejected = await abUpgrade({
+      targetRepo: target,
+      distRoot: distV2,
+      resolveConflict: async () =>
+        resolved.replace(
+          '<<<<<<< local\nprotected marker documentation\nordinary content after the marker-looking line',
+          'agent deleted the marker-looking clean region',
+        ),
+    })
+
+    expect(rejected.skills[0]?.action).toBe('conflicted')
+    expect(rejected.skills[0]?.detail).toContain('already-clean merge region')
+    expect(await readFile(live, 'utf8')).toBe(local)
+    expect(await readFile(pristinePath, 'utf8')).toBe(pristine)
+
+    const accepted = await abUpgrade({
+      targetRepo: target,
+      distRoot: distV2,
+      resolveConflict: async () => resolved,
+    })
+
+    expect(accepted.skills).toEqual([{ skill: 'ab-alpha', action: 'resolved' }])
+    expect(await readFile(live, 'utf8')).toBe(resolved)
+    expect(resolved).toContain(
+      '<<<<<<< local\nprotected marker documentation\nordinary content after the marker-looking line',
+    )
+    expect(resolved).not.toContain('ab-upgrade-local-')
+    expect(await readFile(pristinePath, 'utf8')).toBe(incoming)
+  })
+
   test('resolver null → local file byte-untouched, conflicted report carries the markers', async () => {
     await install()
     const live = installedSkillPath(target, 'ab-alpha')
@@ -312,10 +377,10 @@ describe('abUpgrade — the four pristine-based cases', () => {
     expect(entry.skill).toBe('ab-alpha')
     expect(entry.action).toBe('conflicted')
     // The merge-markered text travels in the report — never the live file.
-    expect(entry.detail).toContain('<<<<<<< local')
+    expect(entry.detail).toMatch(/<<<<<<< ab-upgrade-local-[0-9a-f-]+/)
     expect(entry.detail).toContain('middle line two (local)')
     expect(entry.detail).toContain('middle line two (upstream)')
-    expect(entry.detail).toContain('>>>>>>> upstream')
+    expect(entry.detail).toMatch(/>>>>>>> ab-upgrade-incoming-[0-9a-f-]+/)
     expect(await readFile(live, 'utf8')).toBe(localText)
     expect(await readFile(pristineSkillPath(target, 'ab-alpha'), 'utf8')).toBe(pristineBefore)
   })
@@ -360,10 +425,15 @@ describe('abUpgrade — the four pristine-based cases', () => {
       {
         name: 'marked',
         resolve: async (local) =>
-          local.replace(
-            'middle line two (local conflict)',
-            '<<<<<<< local\nmiddle line two (local conflict)\n=======\nmiddle line two (upstream conflict)\n>>>>>>> upstream',
-          ),
+          local
+            .replace(
+              'middle line two (local conflict)',
+              '<<<<<<< local\nmiddle line two (local conflict)\n=======\nmiddle line two (upstream conflict)\n>>>>>>> upstream',
+            )
+            .replace(
+              'closing line three',
+              'closing line three (incoming clean edit)',
+            ),
         reason: 'contains a Git conflict-marker line',
       },
       {
@@ -406,7 +476,7 @@ describe('abUpgrade — the four pristine-based cases', () => {
 
       expect(report.skills[0]?.action).toBe('conflicted')
       expect(report.skills[0]?.detail).toContain(entry.reason)
-      expect(report.skills[0]?.detail).toContain('<<<<<<< local')
+      expect(report.skills[0]?.detail).toContain('<<<<<<< ab-upgrade-local-')
       expect(out.join('\n')).toContain(
         `merge by hand against .agents/skills/.ab-pristine/ab-alpha/SKILL.md`,
       )
