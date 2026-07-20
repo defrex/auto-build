@@ -1181,7 +1181,6 @@ class DispatchLoop {
       this.config,
       {
         repo: this.opts.targetRepo,
-        mode: this.opts.once === true ? 'once' : 'watch',
         capacity: this.config.dispatcher.capacity,
       },
       repositoryEvents,

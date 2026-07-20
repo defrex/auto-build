@@ -135,7 +135,6 @@ export interface ResumeInputView {
 
 export interface DashboardModel {
   repo: string
-  mode: 'watch' | 'once'
   capacity: number
   /** Durable repository intake state (`true` means claims are disabled). */
   drained: boolean
@@ -873,7 +872,6 @@ export function buildDashboard(
   config: Config,
   header: {
     repo: string
-    mode: 'watch' | 'once'
     capacity: number
     selection?: DashboardSelection
     statusLine?: string
@@ -889,7 +887,6 @@ export function buildDashboard(
   const settings = reduceDispatchSettings(repositoryEvents)
   return {
     repo: header.repo,
-    mode: header.mode,
     capacity: header.capacity,
     drained: !settings.intake,
     defaultAutoMerge: settings.defaultAutoMerge,
