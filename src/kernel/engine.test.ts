@@ -231,6 +231,13 @@ function verifyRun(
   ]
 }
 
+function verifySkip(step: string, attempt: number, reason: string): EventWrite[] {
+  return [
+    ev('verify.started', { step, attempt }),
+    ev('verify.completed', { step, attempt, outcome: 'skipped', reason }),
+  ]
+}
+
 function verifyAllPass(attempt: number): EventWrite[] {
   return [
     ...verifyRun('types', attempt, true),
@@ -1088,6 +1095,72 @@ describe('decideNext: rule 7 — verify (walkthrough A, §15.6-A)', () => {
     )
   })
 
+  test('a skip satisfies its step, advances later steps, and permits finalize', () => {
+    const approved = [
+      ...prelude(),
+      ...planApproved(),
+      ...implementRound(1, 'sha-r1'),
+      ...codeReview(1, 'approve'),
+    ]
+    const typesSkipped = [
+      ...approved,
+      ...verifySkip('types', 1, 'No TypeScript files changed'),
+    ]
+    expect(decide(typesSkipped)).toEqual({
+      kind: 'run-check',
+      step: 'unit',
+      command: 'bun test',
+      attempt: 1,
+    })
+
+    const throughUnit = [...typesSkipped, ...verifyRun('unit', 1, true)]
+    expect(decide(throughUnit)).toEqual({
+      kind: 'run-agent-verify',
+      step: 'e2e',
+      skill: 'ab-verify-e2e',
+      needsServer: true,
+      attempt: 1,
+    })
+    expect(
+      decide([...throughUnit, ...verifySkip('e2e', 1, 'No browser-facing behavior changed')]),
+    ).toEqual(runPhase('finalize', 1))
+  })
+
+  test('a failure elsewhere in a cycle still wins over a skipped step', () => {
+    expect(
+      decide([
+        ...prelude(),
+        ...planApproved(),
+        ...implementRound(1, 'sha-r1'),
+        ...codeReview(1, 'approve'),
+        ...verifySkip('types', 1, 'No TypeScript files changed'),
+        ...verifyRun('unit', 1, false, report0),
+      ]),
+    ).toEqual(runPhase('implement', 2, { verify: { step: 'unit', report: report0 } }))
+  })
+
+  test('skips carry attempt identity but do not consume the failure budget', () => {
+    const afterTwoFailures = [
+      ...failAtUnit,
+      ...implementRound(2, 'sha-r2', { verify: { step: 'unit', report: report0 } }),
+      ...codeReview(2, 'approve'),
+      ...verifyRun('types', 2, true),
+      ...verifyRun('unit', 2, false, report1),
+      ...implementRound(3, 'sha-r3', { verify: { step: 'unit', report: report1 } }),
+      ...codeReview(3, 'approve'),
+      ...verifySkip('types', 3, 'No TypeScript files changed'),
+    ]
+
+    // maxVerifyAttempts is 3. The skip is not a third failure and keeps the
+    // current cycle on attempt 3, so unit runs instead of policy escalation.
+    expect(decide(afterTwoFailures)).toEqual({
+      kind: 'run-check',
+      step: 'unit',
+      command: 'bun test',
+      attempt: 3,
+    })
+  })
+
   const exhausted: EventWrite[] = [
     ...failAtUnit, // fail 1 (seq 16)
     ...implementRound(2, 'sha-r2', { verify: { step: 'unit', report: report0 } }), // 17-18
@@ -1179,6 +1252,137 @@ describe('decideNext: rule 7 — verify (walkthrough A, §15.6-A)', () => {
         bare,
       ),
     ).toEqual(runPhase('finalize', 1))
+  })
+})
+
+describe('decideNext: conditional verify selection', () => {
+  const conditional = parseConfig(`
+[tickets]
+source = "file"
+readyState = "ready"
+[commands]
+dashboard = "bun test dashboard"
+[verify]
+steps = ["dashboard"]
+[verify.dashboard]
+kind = "check"
+command = "dashboard"
+paths = ["src/cli/dashboard/**", "src/cli/dispatch.ts"]
+`)
+  const approved = [
+    ...prelude(),
+    ...planApproved(),
+    ...implementRound(1, 'sha-r1'),
+    ...codeReview(1, 'approve'),
+  ]
+
+  const conditionalDecision: Decision = {
+    kind: 'evaluate-verify',
+    step: 'dashboard',
+    attempt: 1,
+    paths: ['src/cli/dashboard/**', 'src/cli/dispatch.ts'],
+    action: {
+      kind: 'run-check',
+      step: 'dashboard',
+      command: 'bun test dashboard',
+      attempt: 1,
+    },
+  }
+
+  test('wraps only the first unsatisfied conditional step with its resolved action', () => {
+    expect(decideNext(toLog(approved), conditional)).toEqual(conditionalDecision)
+    expect(
+      decideNext(
+        toLog([...approved, ev('verify.started', { step: 'dashboard', attempt: 1 })]),
+        conditional,
+      ),
+    ).toEqual(conditionalDecision)
+  })
+
+  test('an existing skip satisfies the current cycle without becoming a pass', () => {
+    expect(
+      decideNext(
+        toLog([
+          ...approved,
+          ...verifySkip(
+            'dashboard',
+            1,
+            'excluded by [verify.dashboard].paths: no changed path matched ["src/cli/dashboard/**","src/cli/dispatch.ts"]',
+          ),
+        ]),
+        conditional,
+      ),
+    ).toEqual(runPhase('finalize', 1))
+  })
+
+  test('always = true takes precedence over valid selectors and stays on the old action path', () => {
+    const mandatory = parseConfig(`
+[tickets]
+source = "file"
+readyState = "ready"
+[commands]
+dashboard = "bun test dashboard"
+[verify]
+steps = ["dashboard"]
+[verify.dashboard]
+kind = "check"
+command = "dashboard"
+paths = ["src/cli/dashboard/**"]
+always = true
+`)
+    expect(decideNext(toLog(approved), mandatory)).toEqual({
+      kind: 'run-check',
+      step: 'dashboard',
+      command: 'bun test dashboard',
+      attempt: 1,
+    })
+  })
+
+  test('agent verifiers carry their normal execution details inside the conditional decision', () => {
+    const agent = parseConfig(`
+[tickets]
+source = "file"
+readyState = "ready"
+[verify]
+steps = ["browser"]
+[verify.browser]
+kind = "agent"
+skill = "ab-verify-browser"
+paths = ["web/**"]
+`)
+    expect(decideNext(toLog(approved), agent)).toEqual({
+      kind: 'evaluate-verify',
+      step: 'browser',
+      attempt: 1,
+      paths: ['web/**'],
+      action: {
+        kind: 'run-agent-verify',
+        step: 'browser',
+        skill: 'ab-verify-browser',
+        needsServer: false,
+        attempt: 1,
+      },
+    })
+  })
+
+  test('reconcile starts a fresh cycle that evaluates a previously skipped rule again', () => {
+    const afterReconcile = [
+      ...approved,
+      ...verifySkip('dashboard', 1, 'excluded before reconcile'),
+      ev('finalize.started', {}),
+      ev('finalize.completed', { pr: PR }),
+      ev('pr.conflicted', { baseSha: 'sha-main-2' }),
+      ev('reconcile.started', { attempt: 1, baseSha: 'sha-main-2' }),
+      ev('reconcile.completed', {
+        mergeCommit: 'sha-merge-1',
+        artifact: { kind: 'reconcile-notes', rev: 0 },
+      }),
+    ]
+    expect(decideNext(toLog(afterReconcile), conditional)).toEqual({
+      ...conditionalDecision,
+      attempt: 2,
+      action: { ...conditionalDecision.action, attempt: 2 },
+    })
   })
 })
 

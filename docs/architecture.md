@@ -26,6 +26,53 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
 The grammar is fixed; `verify:*` and `finalize:*` are the only extension
 points, declared per-repo in `autobuild.toml`.
 
+## Verify outcome boundary
+
+`src/ontology.ts` owns the canonical `pass | fail | skipped` outcome.
+`src/events/payloads.ts` writes it as a strict `verify.completed` discriminated
+payload; `skipped` requires a trimmed non-empty reason. The same schema retains
+a separate strict legacy `{pass: boolean}` branch, and
+`normalizeVerifyCompletion` maps historical booleans to pass/fail at consumer
+boundaries without rewriting stored events. Mixed legacy/canonical shapes are
+invalid.
+
+`src/kernel/reducer.ts` projects outcome and skip reason as queryable state.
+`src/kernel/engine.ts` uses exact predicates: only `fail` routes to implement or
+consumes `maxVerifyAttempts`, while `pass` and `skipped` satisfy that one step.
+A failure anywhere in the cycle wins. Skips retain cycle attempt identity but
+are not passing evidence. `src/processes/build-runner.ts` still gives executed
+exit-code checks only pass/fail; an agent verifier may explicitly call
+`ab verdict skip --reason ...`, with no fail-report artifact. The kernel may
+also author a skip through the applicability seam below.
+
+## Verify applicability boundary
+
+`src/config/schema.ts` validates the shared `paths`/`always` fields on check and
+agent steps. The accepted selector language is deliberately smaller than a
+shell glob: positive repository-relative literals, `*`, `?`, and whole-segment
+`**`. `src/kernel/verify-applicability.ts` is the pure, case-sensitive OR
+matcher and owns the stable exclusion reason. `src/kernel/engine.ts` wraps only
+the first unsatisfied conditional step in an actionable `evaluate-verify`
+decision; omitted `paths` and `always = true` retain the original direct action.
+
+`src/processes/build-runner.ts` resolves that decision. It selects the initial
+`workspace.provisioned.base.sha`, promoted by the latest successfully completed
+reconcile's refreshed start SHA, then executes a NUL-delimited
+`git diff --no-renames --name-only -z <base> HEAD --`. A match delegates to the
+existing check/agent path. A miss appends kernel `verify.started` and
+`verify.completed {outcome:"skipped", reason}` without launching a command,
+agent, server, or session. Diff/base failure throws as infrastructure before a
+skip can be written. Because reconcile already resets the engine's verify-cycle
+boundary, the same rule is reached and the live diff is read again each cycle;
+the promoted base excludes upstream-only merged paths while retaining
+build-owned resolutions.
+
+`src/cli/status.ts` exposes canonical outcomes and skip reasons in the detailed
+text/JSON projection, `src/cli/terminals.ts` includes them in the PR audit
+summary, and `src/cli/dashboard/model.ts` treats skip as satisfied while
+attaching a literal `skipped` qualifier. The renderer therefore remains
+non-color-only without inventing a new pipeline lifecycle state.
+
 The reconcile boundary intentionally has two durable snapshots.
 `pr.conflicted.baseSha` is what the janitor observed at conflict detection;
 the pure engine uses it only as conflict sequence evidence. Immediately before

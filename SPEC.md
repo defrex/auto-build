@@ -121,7 +121,7 @@ One name, used everywhere. Every noun lives in exactly one layer.
 | **Phase** | A named stage of the build pipeline grammar (§5) |
 | **Round** | One iteration inside a review loop |
 | **Artifact** | A durable, versioned output: spec, plan, review, report, transcript |
-| **Verdict** | Structured outcome of a review/verification: `approve` \| `revise(findings)` \| `escalate(reason)` |
+| **Verdict** | Structured terminal outcome: reviews use `approve` \| `revise(findings)` \| `escalate(reason)`; agent verification uses `pass` \| `fail(report)` \| `skip(reason)` |
 | **Finding** | One structured item inside a `revise` verdict (file refs, description, severity) |
 | **Observation** | An out-of-scope discovery emitted mid-build: `followup` \| `refactor` \| `latent-bug` |
 | **Escalation** | A parked request for human input, answerable from any UI |
@@ -141,7 +141,7 @@ mechanically:
 | `plan-review` | `/plan-review <build>` | `plan-review.verdict` | `plan-review` (rev N) |
 | `implement` | `/implement <build>` | `implement.completed` | diff + `implement-notes` |
 | `code-review` | `/code-review <build>` | `code-review.verdict` | `code-review` (rev N) |
-| `verify:e2e` | `/verify-e2e <build>` | `verify.completed {step, pass}` | `verify-report:e2e` |
+| `verify:e2e` | `/verify-e2e <build>` | `verify.completed {step, outcome}` | `verify-report:e2e` on pass/fail when present |
 | `finalize` | `/finalize <build>` | `finalize.completed` | PR ref, summary |
 | `reconcile` | `/reconcile <build>` | `reconcile.started`, `reconcile.completed` | `reconcile-notes` + merge commit |
 
@@ -162,11 +162,17 @@ The grammar is fixed — an opinionated skeleton, not a generic workflow
 engine. Exactly two extension points:
 
 - **`verify:*`** — an ordered, configurable list of verifiers, declared in
-  per-repo config. One interface: `verify(ctx) → pass | fail(report)`. Two
-  subtypes: *check* (deterministic command + parser: typecheck, lint, unit
-  tests) and *agent-verify* (an agent run with a pass/fail schema: e2e
-  browser-driving, evals). A failure routes back to `implement` with the
-  report, re-entering the code loop.
+  per-repo config. The durable outcomes are `pass`, `fail(report)`, and
+  `skipped(reason)`. Two subtypes: *check* (deterministic command + parser:
+  typecheck, lint, unit tests) and *agent-verify* (an agent run with a
+  `pass|fail|skip` schema: e2e browser-driving, evals). A failure routes back
+  to `implement` with the report, re-entering the code loop. A skip requires a
+  non-blank human-readable reason and satisfies only that step in the current
+  cycle; it is neither passing evidence nor a failure and consumes no
+  `maxVerifyAttempts` budget. Another step's failure still wins. Either an agent
+  may explicitly declare `skip`, or the kernel may produce it when a configured
+  path-applicability rule excludes the build's live diff. Steps without a rule
+  remain unconditional.
 - **`finalize:*`** — optional post-steps (release notes, changelog,
   screenshots, ticket linking). Independent and failure-tolerant: a failed
   post-step files an observation; it never kills a green build.
@@ -401,13 +407,14 @@ which commands the phase is authorized to execute.
 | `ab observe --kind <followup\|refactor\|latent-bug> [--files …] <summary>` | structured observation, any phase, any time | no |
 | `ab server <start\|stop\|restart\|status\|logs>` | dev-server lifecycle, config-driven (§16.2); `implement` and `verify` phases only | no |
 | `ab done [--notes <file>]` | complete a producer phase (validates, then runs phase plumbing) | **yes** |
-| `ab verdict <approve\|revise\|escalate\|pass\|fail> [--findings <json>] [--notes <file>] [--reason …]` | complete a review/verify phase | **yes** |
+| `ab verdict <approve\|revise\|escalate\|pass\|fail\|skip> [--findings <json>] [--notes <file>] [--reason …] [--report <file>]` | complete a review/verify phase | **yes** |
 | `ab escalate <question> [--refs …]` | park the build for human input | **yes** |
 
 The verdict vocabulary is phase-dependent and the CLI enforces it:
 review phases accept `approve|revise|escalate`; agent-verify steps accept
-`pass|fail`. Deterministic checks never touch the CLI — the kernel runs
-them directly.
+`pass|fail|skip`. `fail` requires `--report`; `skip` requires a non-blank
+`--reason` and needs no report artifact. Deterministic checks never touch the
+CLI — the kernel runs them directly and emits only pass or fail.
 
 ### 8.3 What `ab context` materializes
 
@@ -434,7 +441,7 @@ CLI validates with. Per-phase inputs and terminals:
 | `plan-review` | spec, plan@latest, all prior rounds' findings (for `persists` marking) | `verdict` (requires notes artifact) |
 | `implement` | spec, approved plan, feedback (findings **or** verify report), own prior notes | `done` (requires clean worktree + notes) |
 | `code-review` | spec, plan, commit range `{base, head}`, prior findings, implement-notes | `verdict` |
-| `verify:<step>` (agent) | spec (acceptance criteria), step config, commit range | `verdict pass\|fail --report` |
+| `verify:<step>` (agent) | spec (acceptance criteria), step config, commit range | `verdict pass` \| `verdict fail --report` \| `verdict skip --reason` |
 | `finalize` | spec, plan, verify reports, PR template config | `done` (requires `pr-description` artifact) |
 | `reconcile` | spec, plan, implement-notes, conflict `{baseSha}` from this attempt's `reconcile.started` | `done` (requires merge commit present) |
 
@@ -931,6 +938,12 @@ or repository log (§15.2.7): `escalation.answered`,
   run remains terminal, an ordinary failure reopens, and an escalation remains
   terminal but its display attention is dismissed. `m` remains the build-only
   explanatory no-op.
+- Verify progress is never color-only. A passed step uses the ordinary done
+  rendering; a skipped step is also satisfied but carries the literal
+  `skipped` qualifier (for example `[x] verify:e2e(skipped)`), while a failed
+  cycle retains `failed` and provisional semantics. `ab build status` likewise
+  exposes the canonical outcome in JSON and renders `SKIP` plus the reason in
+  text.
 - A build with auto-merge intent off has no auto-merge token. Requested,
   natively enabled, and cancelling intent all render the literal `auto merge`;
   teal/cyan means requested locally but not yet applied, green means native
@@ -1060,10 +1073,16 @@ what guarantees the analysis corpus)
 | Type | Actor | Payload |
 |---|---|---|
 | `verify.started` | kernel | `{step, attempt}` |
-| `verify.completed` | kernel, agent | `{step, attempt, pass, report?: {kind, rev}}` |
+| `verify.completed` | kernel, agent | pass/fail: `{step, attempt, outcome: "pass" \| "fail", report?: {kind, rev}}`; skip: `{step, attempt, outcome: "skipped", reason}` |
 | `finalize.started` | kernel | `{}` |
 | `finalize.completed` | kernel | `{pr: {number, url, headSha}}` (kernel opens the PR after the agent's `ab done` — [D7], §8.6) |
 | `finalize.step-completed` | agent | `{step, ok, note?}` |
+
+The skipped reason is trimmed and must remain non-empty. For stored-log
+compatibility, readers also accept the historical strict payload
+`{step, attempt, pass: boolean, report?}` and normalize `true → pass`,
+`false → fail` without rewriting or reclassifying any event. Current writers
+always emit `outcome`; mixed boolean/outcome shapes are rejected.
 
 **Post-PR [D1]** (see §15.7; `pr.*` emitted by the dispatcher acting as
 janitor, `reconcile.*` by a re-attached build-runner)
@@ -1177,17 +1196,33 @@ plan.started{r1} → plan.completed{plan@1}
 plan-review.started{r1} → plan-review.verdict{approve}
 implement.started{r1} → implement.completed{commits, notes@1}
 code-review.started{r1} → code-review.verdict{approve}
-verify.started{types} → verify.completed{pass} → …unit → …e2e → …evals
+verify.started{types} → verify.completed{outcome:pass} → …unit → …e2e → …evals
 finalize.started → finalize.completed{pr} → finalize.step-completed{release-notes}
 (later, janitor:) pr.merged → workspace.released → build.completed{merged}
 ```
 
-**A — verify failure:** `verify.completed {step: e2e, pass: false, report}` →
+**A — verify failure:** `verify.completed {step: e2e, outcome: fail, report}` →
 kernel routes back into the code loop: `implement.started {round: 2,
 feedback: {verify: {step, report}}}` → fix → `code-review` round 2 →
 approve → verify re-runs **from the first step** (implement changed the
 code; cheap checks first), `attempt: 2`. `policy.maxVerifyAttempts`
 exhausted → `escalation.raised {source: "policy"}`.
+
+**A2 — verify skip:** `verify.completed {step: e2e, outcome: skipped,
+reason}` leaves the reason queryable and advances to the next configured step
+(or finalize) in that cycle. It retains the cycle's `attempt` identity but does
+not increment the failure budget, count as a pass, or hide a failure from any
+other step.
+
+**A3 — path applicability:** for a step with `paths`, the kernel diffs current
+`HEAD` against the durable branch-cut base immediately before that step. No
+match produces `verify.started` then a kernel-authored skipped completion whose
+reason names `[verify.<step>].paths`; neither command nor agent/server/session
+starts. A reconcile promotes its successfully refreshed base SHA and begins a
+new verify cycle, so rules are evaluated again: upstream-only merged paths are
+subtracted while build-owned conflict resolutions can bring a previously
+skipped step into scope. Diff/base infrastructure failure produces no skip and
+fails closed for retry.
 
 **B — review stall:** round 1 `code-review.verdict {revise, [f1]}` → round 2
 verdict's finding marks `persists: [f1]` → round 3 again → kernel:
@@ -1359,9 +1394,11 @@ command = "typecheck"           # ref into [commands]
 kind = "check"
 command = "test"
 [verify.e2e]
-kind = "agent"                  # agent-verify: skill + verdict schema
+kind = "agent"                  # agent-verify: skill + pass|fail|skip verdict
 skill = "ab-verify-e2e"
 needsServer = true
+paths = ["web/**", "src/routes/**"] # optional positive any-match selectors
+# always = true                 # mandatory-gate guard; overrides paths
 
 [finalize]
 steps = ["release-notes"]       # optional post-steps, failure-tolerant (§5)
@@ -1417,6 +1454,25 @@ any future tooling parse it without evaluating anything; commands are plain
 shell strings. The removed legacy `[agent]` table is rejected with an error
 that directs its fields to `[roles.default]`; it is not a parsing alias or an
 automatic migration.
+
+Both verify kinds accept optional `paths` and `always`. `paths` is a non-empty
+list of positive repository-relative globs with OR semantics across both rules
+and changed paths. Matching is case-sensitive over Git `/` paths. The grammar
+supports literals, segment-local `*`/`?`, and `**` only as a whole segment;
+absolute/traversing/empty segments, negation, escapes, character classes, brace
+expansion, extglobs, and malformed `**` fail strict config validation at the
+named step. No `paths` is unconditional. `always = true` overrides a present
+list (which is still validated); false is equivalent to omission.
+
+The runner evaluates a conditional step from current `HEAD` using
+`git diff --no-renames --name-only -z`. The base is the initial
+`workspace.provisioned.base.sha`, promoted only by a `reconcile.started.baseSha`
+whose reconcile successfully completed. Thus both rename sides are visible,
+filenames are NUL-safe, and newly merged upstream-only work is not attributed
+to the build. Evaluation repeats in each cycle. No match records the canonical
+skipped outcome with
+`excluded by [verify.<step>].paths: no changed path matched <JSON paths>` and
+launches nothing; Git/base failure is infrastructure, never a synthetic skip.
 
 ### 16.2 Server lifecycle [D10]
 

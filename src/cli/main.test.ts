@@ -58,19 +58,30 @@ describe('runCli — routing and exit codes', () => {
     }
   })
 
-  test('help documents ticket grooming, status, and every sessionless build-control command', async () => {
+  test('help documents every source-agnostic ticket operation', async () => {
     const d = deps()
     expect(await runCli(['help'], d)).toBe(0)
     const help = d.out.join('\n')
-    for (const command of [
-      'ab ticket create <title>',
-      'ab ticket update <id>',
+    for (const form of [
+      'ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
+      'ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]',
       'ab ticket block <id> <blocker-id>',
       'ab ticket unblock <id> <blocker-id>',
+      'ab ticket list [--state <state>] [--labels a,b] [--json]',
+      'ab ticket show <id> [--json]',
+      'ab ticket move <id> <state> [--json]',
     ]) {
-      expect(help).toContain(command)
+      expect(help).toContain(form)
     }
+    expect(help).toContain('same ready criteria as dispatch')
+    expect(help).toContain('show one ticket, including its body/spec')
     expect(help).toContain('the first id is always the ticket being changed')
+  })
+
+  test('help documents status and every sessionless build-control command', async () => {
+    const d = deps()
+    expect(await runCli(['help'], d)).toBe(0)
+    const help = d.out.join('\n')
     expect(help).toContain('ab builds [--queued] [--all] [--json] [--store <ref>]')
     expect(help).toContain('ab build status <slug> [--events <n>] [--json] [--store <ref>]')
     expect(help).toContain('running, paused, blocked')
@@ -107,7 +118,7 @@ describe('runCli — routing and exit codes', () => {
   test('verdict without a kind prints usage and exits 1', async () => {
     const d = makeDeps({ store, env: makeEnv({ phase: 'code-review' }) })
     expect(await runCli(['verdict'], d)).toBe(1)
-    expect(d.err.join('\n')).toContain('usage: ab verdict <approve|revise|escalate|pass|fail>')
+    expect(d.err.join('\n')).toContain('usage: ab verdict <approve|revise|escalate|pass|fail|skip>')
   })
 })
 
@@ -267,14 +278,22 @@ describe('runCli — builds / build status routing', () => {
   // The flag-set leakage guard: --store/--events are parsed locally by these
   // commands, so they must NOT have become legal on session commands via
   // main's module-global VALUE_FLAGS.
-  test('the new flags did not leak into the session commands\' flag sets', async () => {
-    const d1 = deps()
-    expect(await runCli(['done', '--store', '/tmp/x'], d1)).toBe(1)
-    expect(d1.err.join('\n')).toContain('unknown flag --store')
-
-    const d2 = deps()
-    expect(await runCli(['observe', '--kind', 'followup', '--events', '3', 'x'], d2)).toBe(1)
-    expect(d2.err.join('\n')).toContain('unknown flag --events')
+  test('sessionless and ticket-only flags did not leak into phase commands', async () => {
+    const cases: Array<{ argv: string[]; flag: string }> = [
+      { argv: ['done', '--store', '/tmp/x'], flag: '--store' },
+      {
+        argv: ['observe', '--kind', 'followup', '--events', '3', 'x'],
+        flag: '--events',
+      },
+      { argv: ['done', '--state', 'Ready'], flag: '--state' },
+      { argv: ['done', '--labels', 'api'], flag: '--labels' },
+      { argv: ['done', '--body', 'spec.md'], flag: '--body' },
+    ]
+    for (const { argv, flag } of cases) {
+      const d = deps()
+      expect(await runCli(argv, d)).toBe(1)
+      expect(d.err.join('\n')).toContain(`unknown flag ${flag}`)
+    }
   })
 })
 

@@ -61,7 +61,8 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
   committing locally; a fresh reviewer reads the diff against spec and plan.
   Same loop shape.
 - **`verify:*`** — each step in `[verify].steps` runs as its own phase, in
-  order. A failing step sends the build back to `implement` with the report.
+  order. A failing step sends the build back to `implement` with the report;
+  an explicit skip records why the step did not apply and advances.
 - **`finalize`** — the agent writes the PR description; the kernel opens the
   PR. `[finalize].steps` run afterward and are failure-tolerant.
 - **Epilogue.** If main moves and the PR conflicts, `pr.conflicted` sends the
@@ -195,10 +196,12 @@ subtables are part of this section — their fields are listed here.
 | Field | Default | Allowed / constraints | Effect |
 |---|---|---|---|
 | `steps` | `[]` | array of nonempty strings | Ordered list of verify phases. Each name must have a matching `[verify.<step>]` table. |
-| `kind` | — | **required**, `"check"` \| `"agent"` | Discriminator. `check` is deterministic (command + pass/fail, never an agent); `agent` runs a skill that returns a `pass`/`fail` verdict. |
+| `kind` | — | **required**, `"check"` \| `"agent"` | Discriminator. `check` is deterministic (command + pass/fail, never an agent); `agent` runs a skill that returns `pass`, `fail`, or `skip`. |
 | `command` | — | **required when `kind = "check"`**, nonempty string | Ref into `[commands]` — the key, not a shell string. Pass/fail is the command's exit status. |
 | `skill` | — | **required when `kind = "agent"`**, nonempty string | Installed skill name to run (e.g. `"ab-verify-e2e"`). |
 | `needsServer` | `false` | boolean, `kind = "agent"` only | `true` ⇒ the kernel starts `[server]` and waits for readiness before the session. |
+| `paths` | — | optional nonempty array of positive repository-relative globs | Makes either step kind apply when any changed path matches any selector. Omitted means unconditional. |
+| `always` | — | optional boolean | `true` explicitly makes the step unconditional even when `paths` is present; `false` is equivalent to omission. |
 
 Cross-field rules the validator actually enforces — each is an **error**:
 
@@ -208,9 +211,30 @@ Cross-field rules the validator actually enforces — each is an **error**:
   is never silently tolerated).
 - `command` naming a key that does not exist in `[commands]`.
 - `needsServer = true` with no `[server]` table.
+- An empty or malformed `paths` list. Matching is case-sensitive over Git's
+  `/`-separated paths; supported syntax is literals, `*`, `?`, and `**` only as
+  a whole segment. Absolute/traversing/empty segments, negation, escapes,
+  character classes, brace expansion, extglobs, and malformed `**` are errors.
+  `always = true` does not hide selector errors.
 
-A failed verify step returns the build to `implement` with the step's report,
-and repeats up to `[policy].maxVerifyAttempts`.
+The kernel evaluates `paths` immediately before the step against current
+`HEAD`, relative to the initial branch-cut SHA or the refreshed base from the
+latest completed reconcile. It uses a NUL-delimited, no-rename Git diff, so
+adds/modifications/deletions and both rename sides participate. A reconcile
+starts a fresh cycle and evaluation repeats; upstream-only merged paths are
+excluded while build-owned resolutions remain visible. A miss starts no
+command, agent, server, or session and records `skipped` with
+`excluded by [verify.<step>].paths: no changed path matched <JSON paths>`.
+Git/base failures fail closed as infrastructure rather than becoming skips.
+
+Agent verifiers may also use `ab verdict pass`,
+`ab verdict fail --report <file>`, or `ab verdict skip --reason <text>`. The
+skip reason is required and
+must be non-blank; no failure report is required. Either kind of skip satisfies
+that step for the current cycle and advances, but it is not a pass and never
+masks another step's failure. Only failures return the build to `implement` and
+consume `[policy].maxVerifyAttempts`; skips retain the cycle's attempt number
+without consuming that budget.
 
 ### `[finalize]`
 
@@ -319,8 +343,9 @@ claim is a rename — frontmatter carries no `state`/`claimedBy`, and a ticket
 body survives byte-exactly because a move never rewrites the file. The same id
 in two state dirs is a loud error naming both paths. When `dir` is defaulted,
 the backlog writes its own `.gitignore` of `*`, so git never sees it; an
-explicit `dir` is the user's and is left alone. Agents drive this tracker
-through `ab-tickets` rather than running `mv` by hand.
+explicit `dir` is the user's and is left alone. Agents and operators drive it
+through the source-agnostic `ab ticket` commands rather than running `mv` by
+hand.
 
 **Secrets never live in this file.** `LINEAR_API_KEY` is an environment
 variable (a local `.env` works). If a user asks you to put an API key in
@@ -427,33 +452,51 @@ while worktrees and default file tickets remain under the repository-default
 `.autobuild/` directory. The dispatcher passes its normalized selection to
 every agent session as `AB_STORE`.
 
-## Ticket grooming commands
+## Source-agnostic ticket operations
 
-The sessionless `ab ticket` namespace always constructs the TicketSource named
-by this repository's `[tickets]` table. The same forms therefore target Linear
-or the file tracker without provider-specific API/MCP calls:
+The sessionless `ab ticket` namespace constructs whichever TicketSource the
+repository's `[tickets]` table selects. These forms therefore work unchanged
+with Linear and the file tracker, without provider-specific API/MCP calls:
 
-```text
-ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]
-ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]
-ab ticket block <id> <blocker-id>
-ab ticket unblock <id> <blocker-id>
-```
+- `ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]`
+  files a ticket. Blocker ids belong to the same source and are checked before
+  creation.
+- `ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]`
+  partially replaces editable fields. At least one flag is required.
+- `ab ticket block <id> <blocker-id>` adds one blocking relationship.
+- `ab ticket unblock <id> <blocker-id>` removes one blocking relationship.
+- `ab ticket list [--state <state>] [--labels a,b] [--json]` lists tickets. With
+  no filters it uses exactly dispatch's configured ready state and source-aware
+  default labels. If either filter is present, only explicitly supplied
+  criteria apply; every requested label must match.
+- `ab ticket show <id> [--json]` reads one complete ticket. Human output includes
+  labeled metadata and the body verbatim, so it can read a stored spec back.
+- `ab ticket move <id> <state> [--json]` transitions one ticket and reports its
+  post-transition value.
 
-Ids are source-local (`AUT-8` for Linear, `file-1` for file). For block and
-unblock, the first id is the ticket being changed and the second is its
-blocker. Create validates every `--blocked-by` id before filing. A later block
-requires both tickets to exist and rejects a direct self-block; unblock only
-requires the target. Adding an existing relationship and removing an absent
-one both succeed as no-ops, so either command is safe to retry.
+State names and ids are source-local. For block and unblock, the first id is the ticket being changed
+and the second is its blocker. Create validates every
+`--blocked-by` id before filing. A later block requires both tickets to exist
+and rejects a direct self-block; unblock only requires the target. Adding an
+existing relationship and removing an absent one both succeed as no-ops, so
+either command is safe to retry.
 
-Update requires at least one flag and is partial: omitted fields remain
-untouched, including labels, assignee, and provider metadata. `--labels` is a
-complete replacement and an explicitly empty value (`--labels ''`) clears the
-list. Supplied title/body values must be nonblank. State is intentionally not
-an update field — `transition()` remains its sole owner — and every validation
-or unknown-ticket error occurs before mutation and names the offending field
-or id. `--body` always names a file; a missing file fails before a source write.
+Update is partial: omitted fields remain untouched, including labels, assignee,
+and provider metadata. `--labels` is a complete replacement and an explicitly
+empty value (`--labels ''`) clears the list. Supplied title/body values must be
+nonblank. State is intentionally not an update field — `transition()` remains its sole owner —
+and every validation or unknown-ticket error occurs before
+mutation and names the offending field or id. `--body` always names a file; a
+missing file fails before a source write.
+
+Quote multiword Linear states, for example `"In Progress"`; file states are
+case-insensitive on input and canonical on output. The adapters validate
+transitions, so an invalid state fails with the
+source's known states. A missing id fails nonzero with an error naming both the
+id and configured source.
+
+Human-readable output is the default. `--json` emits one bare JSON value and no
+prose: a `Ticket[]` for `list`, and the complete `Ticket` for `show` or `move`.
 
 ## Dispatch dashboard
 
@@ -467,7 +510,8 @@ harvest outcomes, action confirmations, and warnings replace that slot instead
 of scrolling above the frame. A blank line separates the global section from
 the first body row, and another separates the body from the legend or feedback
 controls. The duplicate startup banner is suppressed; `--plain` and non-TTY
-output remain line-oriented and unchanged.
+output remain line-oriented and unchanged. A satisfied verify skip carries the
+literal `skipped` qualifier, so it remains distinct from a pass without color.
 
 Up/Down moves without wrapping through global first, optional `Harvest` second,
 then slug-sorted builds. Stable discriminated identity preserves selection
@@ -608,7 +652,8 @@ Verify progress covers the **current cycle** — the results since the latest
 code-review approve or reconcile. Implement and reconcile change the code, so a
 new cycle re-runs from the first step and earlier results describe code that no
 longer exists. An empty step list next to `attempt 1` therefore means the cycle
-restarted, not that verify never ran.
+restarted, not that verify never ran. A skip renders as `SKIP` with its reason;
+JSON exposes `outcome: "skipped"` and `reason`, never a synthetic pass.
 `--json` and `--store <ref>` work the same here.
 
 Use `ab builds` to find the build; use `ab build status` to understand it.

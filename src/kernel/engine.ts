@@ -23,7 +23,7 @@
  */
 import type { Config } from '../config/schema'
 import type { AbEvent } from '../events/catalog'
-import type { EventPayload } from '../events/payloads'
+import { normalizeVerifyCompletion, type EventPayload } from '../events/payloads'
 import {
   isVerifyPhase,
   verifyPhase,
@@ -34,6 +34,7 @@ import {
   type Finding,
   type Phase,
   type ReviewVerdictKind,
+  type VerifyOutcome,
 } from '../ontology'
 import { reduceBuild, type AnsweredEscalation } from './reducer'
 import { stalledChains, type FindingChain } from './stall'
@@ -41,6 +42,16 @@ import { stalledChains, type FindingChain } from './stall'
 // ── The decision contract ────────────────────────────────────────────────────
 
 export type WaitReason = 'blocked' | 'paused' | 'awaiting-spec' | 'awaiting-pr' | 'done' | 'aborted'
+
+export type VerifyAction =
+  | { kind: 'run-check'; step: string; command: string; attempt: number }
+  | {
+      kind: 'run-agent-verify'
+      step: string
+      skill: string
+      needsServer: boolean
+      attempt: number
+    }
 
 export type Decision =
   | { kind: 'wait'; reason: WaitReason }
@@ -53,8 +64,15 @@ export type Decision =
       /** Present iff phase === 'reconcile'; execution resolves its base (§15.7). */
       reconcile?: { attempt: number }
     }
-  | { kind: 'run-check'; step: string; command: string; attempt: number }
-  | { kind: 'run-agent-verify'; step: string; skill: string; needsServer: boolean; attempt: number }
+  | VerifyAction
+  | {
+      /** Kernel-side path gating to resolve against the live Git diff. */
+      kind: 'evaluate-verify'
+      step: string
+      attempt: number
+      paths: string[]
+      action: VerifyAction
+    }
   | { kind: 'run-finalize-step'; step: string }
   | {
       kind: 'raise-escalation'
@@ -113,8 +131,9 @@ interface VerifyRecord {
   seq: number
   step: string
   attempt: number
-  pass: boolean
+  outcome: VerifyOutcome
   report?: ArtifactRef
+  reason?: string
 }
 
 interface GuidanceStart {
@@ -275,7 +294,7 @@ export function decideNext(events: AbEvent[], config: Config): Decision {
   // and the cycle re-runs from the FIRST step, cheap checks first.
   const cycleBoundary = Math.max(log.code.latestApproveSeq, log.lastReconcileCompletedSeq)
   const cycleResults = log.verifyCompleted.filter((v) => v.seq > cycleBoundary)
-  const cycleFails = cycleResults.filter((v) => !v.pass)
+  const cycleFails = cycleResults.filter((v) => v.outcome === 'fail')
   const lastCycleFail = cycleFails.at(-1)
   // "Without a subsequent implement round": an implement.completed after the
   // failure means the code loop already picked it up. implement.*started* is
@@ -329,7 +348,7 @@ export function decideNext(events: AbEvent[], config: Config): Decision {
   // (including failures) do not carry across a spec revision (§6.3). Attempt
   // NUMBERS, by contrast, continue monotonically over the full log — see the
   // attempt computation below and LogIndex.maxVerifyAttemptEver.
-  const fails = log.verifyCompleted.filter((v) => !v.pass)
+  const fails = log.verifyCompleted.filter((v) => v.outcome === 'fail')
   const lastFail = fails.at(-1)
   if (
     lastFail !== undefined &&
@@ -365,31 +384,50 @@ export function decideNext(events: AbEvent[], config: Config): Decision {
   const attempt =
     cycleAttempts.length > 0 ? Math.max(...cycleAttempts) : log.maxVerifyAttemptEver + 1
   for (const step of config.verify.steps) {
-    // First step without a pass in the current cycle runs next — order is the
-    // config's, cheap deterministic checks before agent verifiers (§16.1).
-    if (cycleResults.some((v) => v.step === step && v.pass)) continue
+    // First unsatisfied step in the current cycle runs next — only an explicit
+    // pass or skip satisfies that step. A failure anywhere was handled above
+    // and therefore can never be hidden by another step's skip.
+    if (
+      cycleResults.some(
+        (v) => v.step === step && (v.outcome === 'pass' || v.outcome === 'skipped'),
+      )
+    ) {
+      continue
+    }
     const stepConfig = config.verify.stepConfigs[step]
     if (stepConfig === undefined) continue // unreachable: configSchema cross-validates (§16.1)
-    if (stepConfig.kind === 'check') {
-      // Resolve the [commands] ref (§16.1) — config validation guarantees it
-      // exists; the raw-ref fallback only keeps decideNext total.
-      return {
-        kind: 'run-check',
-        step,
-        command: config.commands[stepConfig.command] ?? stepConfig.command,
-        attempt,
-      }
-    }
+    const action: VerifyAction =
+      stepConfig.kind === 'check'
+        ? {
+            // Resolve the [commands] ref (§16.1) — config validation guarantees
+            // it exists; the raw-ref fallback only keeps decideNext total.
+            kind: 'run-check',
+            step,
+            command: config.commands[stepConfig.command] ?? stepConfig.command,
+            attempt,
+          }
+        : {
+            kind: 'run-agent-verify',
+            step,
+            skill: stepConfig.skill,
+            needsServer: stepConfig.needsServer,
+            attempt,
+          }
+
+    // Omitted paths preserve the historical unconditional behavior. Explicit
+    // `always = true` wins even when selectors are present, making the
+    // mandatory-gate guard structural rather than dependent on truthiness.
+    if (stepConfig.paths === undefined || stepConfig.always === true) return action
     return {
-      kind: 'run-agent-verify',
+      kind: 'evaluate-verify',
       step,
-      skill: stepConfig.skill,
-      needsServer: stepConfig.needsServer,
       attempt,
+      paths: stepConfig.paths,
+      action,
     }
   }
 
-  // ── 8. Finalize (§5): all verify steps passed in the current cycle ─────────
+  // ── 8. Finalize (§5): all verify steps satisfied in the current cycle ─────
   if (!log.finalizeCompleted) return { kind: 'run-phase', phase: 'finalize', round: 1 }
   for (const step of config.finalize.steps) {
     // Post-steps are independent and failure-tolerant (§5): a completion with
@@ -691,18 +729,21 @@ function indexLog(events: AbEvent[]): LogIndex {
         maxVerifyAttemptEver = Math.max(maxVerifyAttemptEver, event.payload.attempt)
         if (post) verifyStarted.push({ seq: event.seq, attempt: event.payload.attempt })
         break
-      case 'verify.completed':
-        maxVerifyAttemptEver = Math.max(maxVerifyAttemptEver, event.payload.attempt)
+      case 'verify.completed': {
+        const result = normalizeVerifyCompletion(event.payload)
+        maxVerifyAttemptEver = Math.max(maxVerifyAttemptEver, result.attempt)
         if (post) {
           verifyCompleted.push({
             seq: event.seq,
-            step: event.payload.step,
-            attempt: event.payload.attempt,
-            pass: event.payload.pass,
-            report: event.payload.report,
+            step: result.step,
+            attempt: result.attempt,
+            outcome: result.outcome,
+            ...(result.report !== undefined ? { report: result.report } : {}),
+            ...(result.reason !== undefined ? { reason: result.reason } : {}),
           })
         }
         break
+      }
 
       case 'finalize.completed':
         if (post) finalizeCompleted = true

@@ -167,7 +167,7 @@ const HELP = [
   '  ab server <start|stop|restart|status|logs> [n]',
   '                                         dev-server lifecycle, config-driven (§16.2); implement/verify only',
   '  ab done [--notes <file>]               complete a producer phase (TERMINAL: validates, then runs plumbing)',
-  '  ab verdict <approve|revise|escalate|pass|fail> [--findings <json>] [--notes <file>] [--reason <text>] [--report <file>]',
+  '  ab verdict <approve|revise|escalate|pass|fail|skip> [--findings <json>] [--notes <file>] [--reason <text>] [--report <file>]',
   '                                         complete a review/verify phase (TERMINAL; vocabulary is phase-dependent)',
   '  ab escalate <question> [--refs a,b]    park the build for human input (TERMINAL)',
   '',
@@ -179,8 +179,13 @@ const HELP = [
   '                                         partially update editable fields; omitted fields survive and --labels "" clears labels.',
   '  ab ticket block <id> <blocker-id>      add a blocker to an existing ticket (idempotent).',
   '  ab ticket unblock <id> <blocker-id>    remove a blocker from an existing ticket (idempotent).',
-  '                                         Ticket ids are source-local (e.g. AUT-8 or file-1); the first id is always the ticket being changed.',
-  '                                         State remains a separate transition operation; ticket update never changes it.',
+  '  ab ticket list [--state <state>] [--labels a,b] [--json]',
+  '                                         list tickets; with no filters, use the same ready criteria as dispatch.',
+  '  ab ticket show <id> [--json]           show one ticket, including its body/spec.',
+  '  ab ticket move <id> <state> [--json]   move one ticket to a source-local state.',
+  '                                         Ticket reads/moves use human output by default; --json emits the complete Ticket value.',
+  '                                         Ticket ids are source-local (e.g. AUT-8 or file-1); for block/unblock, the first id is always the ticket being changed.',
+  '                                         State names and unknown-id errors come from the configured source; ticket update never changes state.',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>] [--plain] [--intake | --no-intake] [--auto-merge | --no-auto-merge]',
   '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
   '                                         --auto-merge seeds durable intent on newly claimed builds only (default off); opposite flag forms cannot be combined',
@@ -453,8 +458,8 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
       return 0
     }
 
-    // Ticket grooming runs OUTSIDE build sessions (§8.8): one parser and one
-    // configured-source seam own create/update/block/unblock.
+    // Ticket grooming runs OUTSIDE build sessions (§8.8): one namespace-local
+    // parser and one configured-source seam own every pre-build operation.
     case 'ticket': {
       if (deps.exec === undefined) {
         throw new Error(
@@ -943,7 +948,7 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
       const [kind] = parsed.positionals
       if (kind === undefined) {
         throw new Error(
-          'usage: ab verdict <approve|revise|escalate|pass|fail> ' +
+          'usage: ab verdict <approve|revise|escalate|pass|fail|skip> ' +
             '[--findings <json>] [--notes <file>] [--reason <text>] [--report <file>] (§8.2)',
         )
       }

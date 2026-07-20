@@ -16,6 +16,7 @@ import { delimiter, join } from 'node:path'
 import { resolveHarvestCliEnv } from '../cli/env'
 import { runCli } from '../cli/main'
 import { DISPATCHER, KERNEL, agentActor, humanActor } from '../events/envelope'
+import { normalizeVerifyCompletion } from '../events/payloads'
 import { randomUuids } from '../ids'
 import { decideNext } from '../kernel/engine'
 import { reduceHarvest } from '../kernel/harvest'
@@ -166,7 +167,7 @@ test('a. happy path: ready ticket → dispatch → pipeline → PR → janitor m
   expect(ofType(events, 'verify.started')[0]!.payload).toEqual({ step: 'unit', attempt: 1 })
   const verified = ofType(events, 'verify.completed')[0]!
   expect(verified.actor).toEqual({ kind: 'kernel' }) // deterministic check, no session (§8.2)
-  expect(verified.payload).toEqual({ step: 'unit', attempt: 1, pass: true })
+  expect(verified.payload).toEqual({ step: 'unit', attempt: 1, outcome: 'pass' })
   expect(ofType(events, 'finalize.completed')[0]!.actor).toEqual({ kind: 'kernel' }) // D7
 
   // FakeForge journal: the push (real branch) and the PR (title = the
@@ -522,8 +523,8 @@ test('a2. reconcile merges the current base when main advances after conflict de
   })
   expect(ofType(events, 'escalation.raised')).toEqual([])
   expect(ofType(events, 'verify.completed').map((event) => event.payload)).toEqual([
-    { step: 'unit', attempt: 1, pass: true },
-    { step: 'unit', attempt: 2, pass: true },
+    { step: 'unit', attempt: 1, outcome: 'pass' },
+    { step: 'unit', attempt: 2, outcome: 'pass' },
   ])
 
   if (mergeCommit === undefined) {
@@ -544,6 +545,110 @@ test('a2. reconcile merges the current base when main advances after conflict de
   const final = await h.events(SLUG)
   expect(reduceBuild(final).outcome).toBe('merged')
   expect(ofType(final, 'escalation.raised')).toEqual([])
+}, 30_000)
+
+// ── a3. Conditional verify uses each cycle's live tree diff ──────────────────
+
+test('a3. conditional verify skips initially, then re-evaluates after reconcile against the refreshed base', async () => {
+  const conditionalConfig = `
+[project]
+baseBranch = "main"
+[commands]
+conditional = "true"
+[verify]
+steps = ["dashboard", "base-only"]
+[verify.dashboard]
+kind = "check"
+command = "conditional"
+paths = ["src/cli/dashboard/**"]
+[verify.base-only]
+kind = "check"
+command = "conditional"
+paths = ["base-only/**"]
+[tickets]
+source = "file"
+readyLabels = ["autobuild"]
+readyState = "Ready"
+`
+
+  const handlers = happyHandlers()
+  handlers['reconcile'] = async (cli) => {
+    await cli.run(['context'])
+    const context = JSON.parse(
+      await readFile(join(cli.ws, '.ab', 'context.json'), 'utf8'),
+    ) as { conflict?: { baseSha: string } }
+    const baseSha = context.conflict?.baseSha
+    if (baseSha === undefined) throw new Error('reconcile context omitted baseSha')
+
+    const merge = await spawnExec(
+      ['git', ...GIT_ID, 'merge', '--no-ff', '--no-commit', baseSha],
+      { cwd: cli.ws },
+    )
+    expect(merge.exitCode).toBe(0)
+    // This build-owned reconciliation change brings dashboard verification
+    // into scope. The upstream-only base-only/ file must remain excluded.
+    await writeFileIn(
+      cli.ws,
+      'src/cli/dashboard/reconciled.ts',
+      'export const reconciled = true\n',
+    )
+    await commitAll(cli.ws, 'reconcile: add dashboard resolution')
+    const notes = await writeFileIn(
+      cli.ws,
+      '.ab/reconcile-notes.md',
+      'Merged the refreshed base and added the dashboard-side resolution.\n',
+    )
+    await cli.run(['done', '--notes', notes])
+  }
+
+  const h = await track(
+    makeHarness({
+      handlers,
+      tickets: [readyTicket('T-1')],
+      configToml: conditionalConfig,
+    }),
+  )
+  await h.dispatcher.tick()
+  expect((await h.runLatest()).prState).toBe('open')
+
+  let results = ofType(await h.events(SLUG), 'verify.completed').map((event) =>
+    normalizeVerifyCompletion(event.payload),
+  )
+  expect(results.map(({ step, attempt, outcome }) => ({ step, attempt, outcome }))).toEqual([
+    { step: 'dashboard', attempt: 1, outcome: 'skipped' },
+    { step: 'base-only', attempt: 1, outcome: 'skipped' },
+  ])
+
+  // Advance only the remote base with a path covered by base-only's selector.
+  // The post-reconcile anchor must subtract it from the build-owned diff.
+  await h.advanceRemote(
+    { 'base-only/upstream.ts': 'export const upstream = true\n' },
+    'base: add upstream-only file',
+  )
+  h.clock.advance(3_600_001)
+  h.forge.setPrState(1, { state: 'open', mergeable: false })
+  await h.dispatcher.tick()
+  expect(h.launched).toHaveLength(2)
+  expect((await h.runLatest()).prState).toBe('open')
+
+  const events = await h.events(SLUG)
+  results = ofType(events, 'verify.completed').map((event) =>
+    normalizeVerifyCompletion(event.payload),
+  )
+  expect(results.map(({ step, attempt, outcome }) => ({ step, attempt, outcome }))).toEqual([
+    { step: 'dashboard', attempt: 1, outcome: 'skipped' },
+    { step: 'base-only', attempt: 1, outcome: 'skipped' },
+    { step: 'dashboard', attempt: 2, outcome: 'pass' },
+    { step: 'base-only', attempt: 2, outcome: 'skipped' },
+  ])
+  expect(results[2]?.outcome).toBe('pass')
+  expect(results[3]).toMatchObject({
+    outcome: 'skipped',
+    reason: expect.stringContaining('[verify.base-only].paths'),
+  })
+  expect(ofType(events, 'reconcile.completed')).toHaveLength(1)
+  expect(ofType(events, 'finalize.completed')).toHaveLength(1)
+  expect(h.cliErrors).toEqual([])
 }, 30_000)
 
 // ── b. Verify failure round-trip (§15.6-A) ───────────────────────────────────
@@ -617,12 +722,12 @@ test('b. verify failure routes back to implement with the report, then re-verifi
     'session.ended',
   ])
 
-  // The failed check: verify.completed{pass:false} with the report artifact.
+  // The failed check: verify.completed{outcome:fail} with the report artifact.
   const [fail, pass] = ofType(events, 'verify.completed')
   expect(fail!.payload).toEqual({
     step: 'unit',
     attempt: 1,
-    pass: false,
+    outcome: 'fail',
     report: { kind: 'verify-report:unit', rev: 0 },
   })
   expect(fail!.actor).toEqual({ kind: 'kernel' })
@@ -650,7 +755,7 @@ test('b. verify failure routes back to implement with the report, then re-verifi
     { step: 'unit', attempt: 1 },
     { step: 'unit', attempt: 2 },
   ])
-  expect(pass!.payload).toEqual({ step: 'unit', attempt: 2, pass: true })
+  expect(pass!.payload).toEqual({ step: 'unit', attempt: 2, outcome: 'pass' })
 
   // One more code-review round; the reviewer is a FRESH session each round.
   const verdicts = ofType(events, 'code-review.verdict')
@@ -869,7 +974,7 @@ test('c. persists chain stalls, human guidance unblocks, loop converges (§15.6-
   expect(ofType(events, 'verify.completed')[0]!.payload).toEqual({
     step: 'unit',
     attempt: 1,
-    pass: true,
+    outcome: 'pass',
   })
   expect(decideNext(events, h.config)).toEqual({ kind: 'wait', reason: 'awaiting-pr' })
 }, 30_000)

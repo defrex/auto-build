@@ -12,6 +12,16 @@ evidence). This skill runs *before* a build exists, so it takes a ticket, not
 a build slug — and unlike the phase skills, it is a conversation with a
 human, not an autonomous session.
 
+## Ticket operations
+
+Reach for `ab` first and use it whenever its CLI supports the requested ticket
+operation. That preference is about portability: `ab` is ticket-source
+agnostic, so it works across whatever `[tickets]` source the repository
+configures, while source-specific tooling is not portable across sources.
+Depart from `ab` only when the user asks for an operation outside its CLI
+surface. In that case, use the ticket tooling available in the current
+environment and tell the user what you changed.
+
 ## No argument: design spec-first
 
 Interview the user toward a conforming spec. Work the standard's four parts
@@ -29,8 +39,12 @@ in order, but as a conversation, not a form:
    prior discussion.
 
 Draft the spec in full, show it, iterate until the user accepts. Then create
-the ticket with the spec as its body via `ab ticket create`. The ticket lands
-in Triage — a human grooms it to Ready; creation is not dispatch.
+the ticket with the spec as its body using `ab ticket create`. The ticket lands
+in `[tickets].createState`, or the ticket source's default creation state when
+that setting is absent. If that state is also `[tickets].readyState`, creation
+can make the ticket immediately dispatchable once every other configured
+readiness and dependency gate is satisfied; otherwise it still needs the
+repository's normal route to the ready state before dispatch.
 
 If grooming established that this work is blocked by other tickets, pass them
 at creation:
@@ -40,10 +54,8 @@ ab ticket create "…" --body spec.md --blocked-by AUT-8,AUT-9
 ```
 
 The ids are source-local — whatever the repo's `[tickets]` source uses (e.g.
-`AUT-8` for linear, `file-1` for file). Never reach for a provider API or MCP
-call to wire the relationship: the dispatcher only honors dependencies
-recorded through this command, and it will hold the ticket unclaimed until
-every blocker completes.
+`AUT-8` for linear, `file-1` for file). The dispatcher will hold the ticket
+unclaimed until every blocker completes.
 
 ## With a ticket argument: flesh out
 

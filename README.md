@@ -72,7 +72,14 @@ separate repository-scoped outer workflow owned by dispatch, not a build phase:
 `scan → synthesize ⇄ review → file`. Verify steps come in two kinds:
 
 - **`check`** — a deterministic shell command; pass/fail is its exit code.
-- **`agent`** — a skill that runs and returns a `pass` or `fail` verdict.
+- **`agent`** — a skill that returns `pass`, `fail`, or an explicit
+  `skip --reason` verdict.
+
+A skipped verification is recorded separately from a pass, satisfies that step
+for the current cycle, and consumes no verify-failure attempt. It requires a
+human-readable reason and never hides another step's failure. Agent verifiers
+may explicitly skip; the kernel also skips a step when its configured `paths`
+do not match the build's live diff.
 
 ---
 
@@ -200,7 +207,7 @@ is an error, so a typo cannot silently disable a verifier.
 | `[project]` | `baseBranch` — what PRs target | `"main"` |
 | `[commands]` | Free-form map of verb → shell string. `setup` runs after provision and after a rehydrate; others are referenced by name from verify steps. | — |
 | `[verify]` | `steps = [...]` — the ordered verify phases | `[]` |
-| `[verify.<step>]` | `kind = "check"` needs `command` (a key in `[commands]`); `kind = "agent"` needs `skill`, optionally `needsServer` | `needsServer = false` |
+| `[verify.<step>]` | `kind = "check"` needs `command` (a key in `[commands]`); `kind = "agent"` needs `skill`, optionally `needsServer`; both kinds accept `paths` and `always` | `needsServer = false`; no `paths` ⇒ unconditional |
 | `[finalize]` | `steps = [...]` — optional post-PR steps, failure-tolerant | `[]` |
 | `[roles]` | Role → `{ runtime?, model?, extensions? }`. Reserved `default` is the optional inheritance base; concrete entries include pipeline roles and optional pre-build `slug` naming. | absent `default` ⇒ the wiring-fallback runtime + its own default model; extensions hermetic |
 | `[policy]` | `stallRounds`, `maxVerifyAttempts`, `maxReconcileAttempts`, `maxReviewRounds` | `3`, `3`, `3`, `4` |
@@ -209,6 +216,45 @@ is an error, so a typo cannot silently disable a verifier.
 | `[tickets]` | Required. Ticket source and lifecycle/readiness fields, including **required `readyState`** and optional `readyLabels` — see below | `readyState` has no default; file `dir` defaults to `.autobuild/tickets` |
 | `[harvest]` | Observation-count back-pressure for the staged harvester: positive `threshold` | `threshold = 10` |
 | `[outer]` | Map of other scheduled ingesters → `{ cron = "…" }`; the exact `harvest` key is rejected | — |
+
+**Path-conditional verify steps.** Both verifier kinds may narrow themselves to
+actual changed paths:
+
+```toml
+[verify.dashboard]
+kind = "agent"
+skill = "ab-verify-dashboard"
+paths = ["src/cli/dashboard/**", "src/cli/dispatch.ts"]
+# always = true
+```
+
+`paths` must be a non-empty array of positive repository-relative globs. A step
+applies when **any** changed path matches **any** selector. Matching is
+case-sensitive against Git's `/`-separated paths. The supported grammar is
+literal path characters, `*` and `?` within a segment, and `**` only as a whole
+segment. Absolute paths, `.`/`..` or empty segments, negation, escapes,
+character classes, brace expansion, extglobs, and malformed `**` are config
+errors naming the step. `paths` omitted means unconditional; `always = false`
+does not change that. `always = true` takes precedence even when `paths` is
+present (the selectors are still validated), so a mandatory gate cannot be
+accidentally narrowed later.
+
+The kernel evaluates this rule immediately before the step. It diffs current
+`HEAD` against the build's durable branch-cut tree, or against the refreshed
+base recorded by the latest completed reconcile. It uses a NUL-delimited
+`git diff --no-renames --name-only`, so additions, modifications, deletions,
+and both sides of renames participate without filename parsing bugs. An
+upstream-only path merged during reconcile is excluded by the refreshed base;
+a build-owned conflict resolution remains included. Every verify cycle repeats
+the evaluation. A miss launches no command, agent, server, or session and
+records:
+
+```text
+excluded by [verify.dashboard].paths: no changed path matched ["src/cli/dashboard/**","src/cli/dispatch.ts"]
+```
+
+The outcome is the ordinary queryable `skipped` result. A Git/base lookup
+failure fails closed as infrastructure; it is never turned into a skip.
 
 A fresh config always includes `setup = "bun install"`. During that first
 init only, Autobuild recognizes these exact root-package script names:
@@ -297,9 +343,11 @@ it sits in**:
   triage/   ready/   doing/   done/
 ```
 
-`ls ready/` answers "what's dispatchable", and `mv triage/x.md ready/`
-dispatches it. The defaulted directory writes a self-excluding `.gitignore`, so
-it stays out of git on its own.
+`ab ticket list` answers "what's dispatchable" using the configured ready
+criteria, and `ab ticket move <id> Ready` moves a groomed ticket into the ready
+state. For the file source that move is a rename from `triage/` to `ready/`;
+the CLI avoids coupling operators to that layout. The defaulted directory
+writes a self-excluding `.gitignore`, so it stays out of git on its own.
 
 Tickets are `<id>.md` files with `+++`-fenced TOML frontmatter — `id`,
 `title`, optional `labels`/`blockedBy`, and an internal harvest idempotency key
@@ -406,16 +454,33 @@ system). Every other `ab-*` skill is a phase skill, installed with
 `disable-model-invocation: true` and invoked by the runner or by you — a model
 must never start a pipeline phase by pattern-matching a description.
 
-To file a groomed ticket by hand:
+To file and work a groomed ticket by hand:
 
 ```sh
 ab ticket create "Throttle repeated failed logins" --body spec.md --labels autobuild
 # → ticket created: file:file-1 (Triage)
+
+ab ticket list
+ab ticket list --state Triage --labels security,api
+ab ticket show file-1
+ab ticket move file-1 Ready
 ```
 
-The output is `ticket created: <source>:<id> (<state>)`, plus the ticket URL
-when the source provides one. Existing tickets can be groomed without opening
-the provider UI:
+Create prints `ticket created: <source>:<id> (<state>)`, plus the ticket URL
+when the source provides one. `list` with no filters uses exactly the configured
+ready state and source-aware label defaults that dispatch uses. If `--state`
+and/or `--labels` is supplied, only those explicit filters apply; every listed
+label must match. State names belong to the configured source, so quote names
+with spaces (for example `"In Progress"`). A move to an invalid state is
+rejected with the source's known states.
+
+`list` prints compact ticket summaries, while `show` includes the complete body
+so the spec can be read back. Add `--json` to `list`, `show`, or `move` for a
+bare `Ticket[]` or complete `Ticket` value with no surrounding prose. Moves
+render the post-transition ticket, including a canonicalized file state such as
+`Ready`. Unknown ids fail nonzero and name both the id and configured source.
+
+Existing tickets can also be groomed without opening the provider UI:
 
 ```sh
 ab ticket update file-1 --body spec.md
@@ -426,12 +491,12 @@ ab ticket unblock file-1 file-8
 ```
 
 The ids are local to the configured source (`AUT-8` for Linear, `file-8` for
-the file tracker), and the first id is always the ticket being changed. Update
-is partial: fields whose flags are omitted survive, including assignee and
-other provider metadata. `--labels` is a complete replacement, with an empty
-value meaning clear. State is deliberately not editable here; lifecycle moves
-remain the source's transition operation. Block/unblock are idempotent, reject
-a direct self-block, and validate a newly added blocker exists. The dispatcher
+the file tracker), and for block/unblock the first id is always the ticket being
+changed. Update is partial: fields whose flags are omitted survive, including
+assignee and other provider metadata. `--labels` is a complete replacement,
+with an empty value meaning clear. State changes remain the separate `move`
+operation; `update` never changes state. Block/unblock are idempotent, reject a
+direct self-block, and validate a newly added blocker exists. The dispatcher
 honors relationships added after creation exactly like `create --blocked-by`.
 
 ### The dispatcher
@@ -459,7 +524,9 @@ warning replaces that slot instead of
 scrolling above the frame. A blank line separates this section from `Harvest`
 or the first build, matching the blank lines between body rows and before the
 bottom legend (or active feedback field). `--plain` and non-TTY output remain
-line-oriented and unchanged.
+line-oriented and unchanged. Verify skips remain visible without color as a
+literal qualifier such as `[x] verify:e2e(skipped)`; `ab build status` renders
+`SKIP` with the reason and exposes `{outcome: "skipped", reason}` in JSON.
 
 The legend changes with the selected row and lists only meaningful actions:
 
@@ -655,6 +722,9 @@ Run these yourself, from the repo root. They need no `AB_*` environment.
 | `ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]` | Partially update editable ticket fields; at least one flag is required and state is excluded. |
 | `ab ticket block <id> <blocker-id>` | Idempotently add a same-source blocker to an existing ticket. |
 | `ab ticket unblock <id> <blocker-id>` | Idempotently remove a same-source blocker from an existing ticket. |
+| `ab ticket list [--state <state>] [--labels a,b] [--json]` | List tickets; no filters uses dispatch's ready criteria. Explicit labels all must match. |
+| `ab ticket show <id> [--json]` | Show one ticket, including its complete body/spec. |
+| `ab ticket move <id> <state> [--json]` | Move a ticket to a source-local state; invalid states list the source's known states. |
 | `ab dispatch [--once] [--interval <s>] [--store <ref>] [--plain] [--intake \| --no-intake] [--auto-merge \| --no-auto-merge]` | Run the outer loop; a TTY gets the interactive selection/action dashboard. Intake defaults on; the claim-time auto-merge default starts off. |
 | `ab builds [--queued] [--all] [--json] [--store <ref>]` | List builds for this repository. Read-only. |
 | `ab build status <slug> [--events <n>] [--json] [--store <ref>]` | Project one build's durable state. Read-only. |
@@ -683,7 +753,7 @@ ambient auth for every session (D8, SPEC §8.1).
 | `ab observe --kind <followup\|refactor\|latent-bug> [--files a,b] [--refs x,y] <summary>` | Record a structured observation. Not a terminal. |
 | `ab server <start\|stop\|restart\|status\|logs> [n]` | Dev-server lifecycle, driven by `[server]`. |
 | `ab done [--notes <file>]` | **Terminal.** Complete a producer phase. |
-| `ab verdict <approve\|revise\|escalate\|pass\|fail> [--findings <json>] [--notes <file>] [--reason <text>] [--report <file>]` | **Terminal.** Complete a review or verify phase; the vocabulary is phase-dependent. |
+| `ab verdict <approve\|revise\|escalate\|pass\|fail\|skip> [--findings <json>] [--notes <file>] [--reason <text>] [--report <file>]` | **Terminal.** Complete a review or verify phase; `fail` requires a report and `skip` requires a reason. |
 | `ab escalate <question> [--refs a,b]` | **Terminal.** Park the build for human input. |
 
 ---
@@ -831,6 +901,9 @@ Each line is `  <path>: <message>`. Common causes:
   not a shell string.
 - **`needsServer` with no server** — `[verify.<s>].needsServer = true requires a
   [server] table (start, url)…`. Add `[server]` or set `needsServer = false`.
+- **A malformed path condition** — errors under `verify.<s>.paths[...]` name the
+  unsupported or unsafe glob form. Use positive repository-relative selectors
+  with only literals, `*`, `?`, and whole-segment `**`.
 
 ### I omitted `[tickets]` — why does config validation fail?
 

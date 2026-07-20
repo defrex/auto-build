@@ -1,13 +1,15 @@
 /**
- * `ab ticket create` (SPEC §8.8): files the body through the configured
- * TicketSource — config selects the adapter, secrets come from the process
- * env, and errors are agent feedback (D6) naming what would be accepted.
+ * Source-agnostic `ab ticket` operations (SPEC §8.8): config selects the
+ * adapter, secrets come from the process env, and errors are agent feedback
+ * (D6) naming what would be accepted.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { TicketsConfig } from '../config/schema'
+import { FakeTicketSource } from '../ports/tickets/fake'
 import type {
   Ticket,
   TicketDraft,
@@ -18,6 +20,9 @@ import { runCli } from './main'
 import {
   abTicketBlock,
   abTicketCreate,
+  abTicketList,
+  abTicketMove,
+  abTicketShow,
   abTicketUnblock,
   abTicketUpdate,
 } from './ticket'
@@ -462,6 +467,266 @@ describe('abTicket update/block/unblock', () => {
   })
 })
 
+class CapturingTicketSource extends FakeTicketSource {
+  readonly listCriteria: Array<{ labels?: string[]; state?: string }> = []
+
+  override async listReady(criteria: {
+    labels?: string[]
+    state?: string
+  }): Promise<Ticket[]> {
+    this.listCriteria.push({
+      ...(criteria.labels !== undefined ? { labels: [...criteria.labels] } : {}),
+      ...(criteria.state !== undefined ? { state: criteria.state } : {}),
+    })
+    return super.listReady(criteria)
+  }
+}
+
+function seededTicket(overrides: Partial<Ticket> = {}): Ticket {
+  return {
+    ref: { source: 'fake', id: 'AUT-1', url: 'https://example.test/AUT-1' },
+    title: 'Throttle repeated logins',
+    body: '## What and why\n\nProtect accounts.\n',
+    state: 'Ready',
+    labels: ['security', 'api'],
+    blockedBy: ['AUT-0'],
+    ...overrides,
+  }
+}
+
+describe('abTicketList', () => {
+  test('an unfiltered list uses the dispatcher defaults for file and Linear', async () => {
+    const cases = [
+      {
+        config: '[tickets]\nsource = "file"\nreadyState = "ready"\n',
+        expected: { labels: [], state: 'ready' },
+      },
+      {
+        config:
+          '[tickets]\nsource = "linear"\nteamKey = "AUT"\nreadyState = "Todo"\n',
+        expected: { labels: ['autobuild'], state: 'Todo' },
+      },
+    ]
+
+    for (const { config, expected } of cases) {
+      await writeRepo(config)
+      const source = new CapturingTicketSource()
+      await abTicketList({
+        targetRepo: tmp,
+        env: {},
+        stdout: () => {},
+        sourceFactory: () => source,
+      })
+      expect(source.listCriteria).toEqual([expected])
+    }
+  })
+
+  test('explicit filters forward only the criteria the caller supplied', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+
+    const labelsOnly = new CapturingTicketSource()
+    await abTicketList({
+      targetRepo: tmp,
+      labels: ['security', 'api'],
+      env: {},
+      stdout: () => {},
+      sourceFactory: () => labelsOnly,
+    })
+    expect(labelsOnly.listCriteria).toEqual([{ labels: ['security', 'api'] }])
+
+    const stateOnly = new CapturingTicketSource()
+    await abTicketList({
+      targetRepo: tmp,
+      state: 'Triage',
+      env: {},
+      stdout: () => {},
+      sourceFactory: () => stateOnly,
+    })
+    expect(stateOnly.listCriteria).toEqual([{ state: 'Triage' }])
+  })
+
+  test('labels retain the port all-match semantics and JSON is a bare Ticket array', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const source = new CapturingTicketSource([
+      seededTicket(),
+      seededTicket({
+        ref: { source: 'fake', id: 'AUT-2' },
+        title: 'Only security',
+        labels: ['security'],
+      }),
+    ])
+    const out: string[] = []
+
+    await abTicketList({
+      targetRepo: tmp,
+      labels: ['security', 'api'],
+      json: true,
+      env: {},
+      stdout: (line) => out.push(line),
+      sourceFactory: () => source,
+    })
+
+    const parsed = JSON.parse(out.join('\n')) as Ticket[]
+    expect(parsed.map((ticket) => ticket.ref.id)).toEqual(['AUT-1'])
+    expect(source.listCriteria).toEqual([{ labels: ['security', 'api'] }])
+  })
+
+  test('human output is compact and an empty result is explicit', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const out: string[] = []
+    await abTicketList({
+      targetRepo: tmp,
+      state: 'Ready',
+      env: {},
+      stdout: (line) => out.push(line),
+      sourceFactory: () => new FakeTicketSource([seededTicket()]),
+    })
+    expect(out).toHaveLength(1)
+    expect(out[0]).toContain('fake:AUT-1 (Ready) — Throttle repeated logins')
+    expect(out[0]).toContain('labels: security, api')
+    expect(out[0]).toContain('blocked by: AUT-0')
+    expect(out[0]).toContain('https://example.test/AUT-1')
+
+    const empty: string[] = []
+    await abTicketList({
+      targetRepo: tmp,
+      env: {},
+      stdout: (line) => empty.push(line),
+      sourceFactory: () => new FakeTicketSource(),
+    })
+    expect(empty).toEqual([
+      'no tickets matched in the configured fake ticket source',
+    ])
+  })
+})
+
+describe('abTicketShow', () => {
+  test('human output includes metadata and preserves the multiline body exactly', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const body = 'first line\n\nlast line\n'
+    const out: string[] = []
+    await abTicketShow({
+      targetRepo: tmp,
+      id: 'AUT-1',
+      env: {},
+      stdout: (line) => out.push(line),
+      sourceFactory: () =>
+        new FakeTicketSource([seededTicket({ body })]),
+    })
+
+    expect(out.slice(0, -1).join('\n')).toContain('ticket fake:AUT-1')
+    expect(out.slice(0, -1).join('\n')).toContain('blocked by: AUT-0')
+    expect(out.slice(0, -1).join('\n')).toContain('url:     https://example.test/AUT-1')
+    expect(out.at(-1)).toBe(body)
+  })
+
+  test('JSON is the complete Ticket and an unknown id names the source and id', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const ticket = seededTicket()
+    const out: string[] = []
+    await abTicketShow({
+      targetRepo: tmp,
+      id: ticket.ref.id,
+      json: true,
+      env: {},
+      stdout: (line) => out.push(line),
+      sourceFactory: () => new FakeTicketSource([ticket]),
+    })
+    expect(JSON.parse(out.join('\n'))).toEqual(ticket)
+
+    await expect(
+      abTicketShow({
+        targetRepo: tmp,
+        id: 'AUT-404',
+        env: {},
+        stdout: () => {},
+        sourceFactory: () => new FakeTicketSource(),
+      }),
+    ).rejects.toThrow('no ticket "AUT-404" in the configured fake ticket source')
+  })
+})
+
+describe('abTicketMove', () => {
+  test('the real file source moves without rewriting, canonicalizes state, and emits post-move JSON', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'line one\n\nline two\n')
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Move without rewriting',
+      bodyFile,
+      labels: ['api'],
+      env: {},
+      stdout: () => {},
+    })
+    const triagePath = join(tmp, 'tickets', 'triage', 'file-1.md')
+    const readyPath = join(tmp, 'tickets', 'ready', 'file-1.md')
+    const rawBefore = await readFile(triagePath, 'utf8')
+    const human: string[] = []
+
+    await abTicketMove({
+      targetRepo: tmp,
+      id: 'file-1',
+      state: 'ready',
+      env: {},
+      stdout: (line) => human.push(line),
+    })
+
+    expect(existsSync(triagePath)).toBe(false)
+    expect(await readFile(readyPath, 'utf8')).toBe(rawBefore)
+    expect(human).toEqual([
+      'ticket moved: file:file-1 (Ready) — Move without rewriting — labels: api',
+    ])
+
+    const json: string[] = []
+    await abTicketMove({
+      targetRepo: tmp,
+      id: 'file-1',
+      state: 'doing',
+      json: true,
+      env: {},
+      stdout: (line) => json.push(line),
+    })
+    const moved = JSON.parse(json.join('\n')) as Ticket
+    expect(moved.state).toBe('Doing')
+    expect(moved.body).toBe('line one\n\nline two\n')
+  })
+
+  test('unknown ids and invalid states fail with adapter-aware messages', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    await expect(
+      abTicketMove({
+        targetRepo: tmp,
+        id: 'file-404',
+        state: 'Ready',
+        env: {},
+        stdout: () => {},
+      }),
+    ).rejects.toThrow('no ticket "file-404" in the configured file ticket source')
+
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'body\n')
+    await abTicketCreate({
+      targetRepo: tmp,
+      title: 'Known ticket',
+      bodyFile,
+      env: {},
+      stdout: () => {},
+    })
+    await expect(
+      abTicketMove({
+        targetRepo: tmp,
+        id: 'file-1',
+        state: 'Review',
+        env: {},
+        stdout: () => {},
+      }),
+    ).rejects.toThrow(
+      'unknown state "Review" — this tracker\'s states are the directories: Triage, Ready, Doing, Done',
+    )
+  })
+})
+
 describe('runCli — ticket routing', () => {
   function sessionlessDeps() {
     const out: string[] = []
@@ -482,10 +747,21 @@ describe('runCli — ticket routing', () => {
     }
   }
 
-  test('ab ticket without create prints usage and exits 1', async () => {
+  test('ab ticket without a subcommand prints the complete usage and exits 1', async () => {
     const { deps, err } = sessionlessDeps()
     expect(await runCli(['ticket'], deps)).toBe(1)
-    expect(err.join('\n')).toContain('usage: ab ticket create')
+    const usage = err.join('\n')
+    for (const form of [
+      'ab ticket create',
+      'ab ticket update',
+      'ab ticket block',
+      'ab ticket unblock',
+      'ab ticket list',
+      'ab ticket show',
+      'ab ticket move',
+    ]) {
+      expect(usage).toContain(form)
+    }
   })
 
   test('ab ticket create without --body prints usage and exits 1', async () => {
@@ -530,6 +806,34 @@ describe('runCli — ticket routing', () => {
       ),
     ).toBe(1)
     expect(err.join('\n')).toContain('--blocked-by: no ticket "file-404"')
+  })
+
+  test('routes list, show, and move with human and JSON output', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    const bodyFile = join(tmp, 'spec.md')
+    await writeFile(bodyFile, 'the exact body\n')
+    const { deps, out } = sessionlessDeps()
+    expect(
+      await runCli(
+        ['ticket', 'create', 'Portable', 'operations', '--body', bodyFile, '--labels', 'api,cli'],
+        deps,
+      ),
+    ).toBe(0)
+
+    expect(await runCli(['ticket', 'list', '--json'], deps)).toBe(0)
+    expect(JSON.parse(out.at(-1)!)).toEqual([])
+
+    expect(await runCli(['ticket', 'move', 'file-1', 'ready'], deps)).toBe(0)
+    expect(out.at(-1)).toContain('file:file-1 (Ready)')
+
+    expect(await runCli(['ticket', 'list', '--labels', 'api,cli', '--json'], deps)).toBe(0)
+    expect((JSON.parse(out.at(-1)!) as Ticket[])[0]?.ref.id).toBe('file-1')
+
+    expect(await runCli(['ticket', 'show', 'file-1', '--json'], deps)).toBe(0)
+    expect((JSON.parse(out.at(-1)!) as Ticket).body).toBe('the exact body\n')
+
+    expect(await runCli(['ticket', 'move', 'file-1', 'done', '--json'], deps)).toBe(0)
+    expect((JSON.parse(out.at(-1)!) as Ticket).state).toBe('Done')
   })
 
   test('update partially replaces a real file ticket and explicit empty labels clear', async () => {
@@ -578,10 +882,7 @@ describe('runCli — ticket routing', () => {
     expect(written).not.toContain('state =')
 
     expect(
-      await runCli(
-        ['ticket', 'update', 'file-1', '--labels', ''],
-        deps,
-      ),
+      await runCli(['ticket', 'update', 'file-1', '--labels', ''], deps),
     ).toBe(0)
     written = await readFile(path, 'utf8')
     expect(written).not.toContain('labels =')
@@ -645,25 +946,9 @@ describe('runCli — ticket routing', () => {
       await runCli(['ticket', 'update', 'file-1', '--title', '   '], deps),
     ).toBe(1)
     expect(err.at(-1)).toContain('title')
-    expect((await readFile(join(tmp, 'tickets', 'triage', 'file-1.md'), 'utf8'))).not.toContain(
-      'blockedBy',
-    )
-  })
-
-  test('ticket grammars reject missing fields, extra ids, and unknown flags', async () => {
-    const cases = [
-      ['ticket', 'update', 'file-1'],
-      ['ticket', 'update', 'file-1', '--title', 'x', 'extra'],
-      ['ticket', 'update', 'file-1', '--state', 'Done'],
-      ['ticket', 'block', 'file-1'],
-      ['ticket', 'block', 'file-1', 'file-2', 'extra'],
-      ['ticket', 'unblock', 'file-1', 'file-2', '--force'],
-    ]
-    for (const argv of cases) {
-      const { deps, err } = sessionlessDeps()
-      expect(await runCli(argv, deps)).toBe(1)
-      expect(err.join('\n')).toContain('usage: ab ticket')
-    }
+    expect(
+      await readFile(join(tmp, 'tickets', 'triage', 'file-1.md'), 'utf8'),
+    ).not.toContain('blockedBy')
   })
 
   test('update resolves an autobuild worktree cwd back to the main tracker', async () => {
@@ -686,5 +971,56 @@ describe('runCli — ticket routing', () => {
         'utf8',
       ),
     ).toContain('title = "From worktree"')
+  })
+
+  test('unknown ticket ids exit nonzero and name the id', async () => {
+    await writeRepo(FILE_TICKETS_TOML)
+    for (const argv of [
+      ['ticket', 'show', 'file-404'],
+      ['ticket', 'move', 'file-404', 'Ready'],
+    ]) {
+      const { deps, err } = sessionlessDeps()
+      expect(await runCli(argv, deps)).toBe(1)
+      expect(err.join('\n')).toContain('file-404')
+      expect(err.join('\n')).toContain('configured file ticket source')
+    }
+  })
+
+  test('malformed argv and unknown subcommands print every ticket form', async () => {
+    const cases = [
+      ['ticket', 'frobnicate'],
+      ['ticket', 'list', 'extra'],
+      ['ticket', 'list', '--state'],
+      ['ticket', 'list', '--state', '--json'],
+      ['ticket', 'list', '--json', '--json'],
+      ['ticket', 'show'],
+      ['ticket', 'show', 'one', 'two'],
+      ['ticket', 'move', 'file-1'],
+      ['ticket', 'move', 'file-1', 'Ready', 'extra'],
+      ['ticket', 'show', 'file-1', '--state', 'Ready'],
+      ['ticket', 'update', 'file-1'],
+      ['ticket', 'update', 'file-1', '--title', 'x', 'extra'],
+      ['ticket', 'update', 'file-1', '--state', 'Done'],
+      ['ticket', 'block', 'file-1'],
+      ['ticket', 'block', 'file-1', 'file-2', 'extra'],
+      ['ticket', 'unblock', 'file-1', 'file-2', '--force'],
+    ]
+    for (const argv of cases) {
+      const { deps, err, out } = sessionlessDeps()
+      expect(await runCli(argv, deps)).toBe(1)
+      const usage = err.join('\n')
+      for (const form of [
+        'ab ticket create',
+        'ab ticket update',
+        'ab ticket block',
+        'ab ticket unblock',
+        'ab ticket list',
+        'ab ticket show',
+        'ab ticket move',
+      ]) {
+        expect(usage).toContain(form)
+      }
+      expect(out).toEqual([])
+    }
   })
 })
