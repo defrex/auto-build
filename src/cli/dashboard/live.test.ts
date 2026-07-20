@@ -6,7 +6,12 @@ import { describe, expect, test } from 'bun:test'
 import { LiveRegion, paintableRows } from './live'
 import type { TerminalOut } from '../terminal'
 
-function fakeTerm(): TerminalOut & { writes: string[]; all: () => string } {
+interface FakeTerm extends TerminalOut {
+  writes: string[]
+  all(): string
+}
+
+function fakeTerm(rows = 24): FakeTerm {
   const writes: string[] = []
   return {
     writes,
@@ -15,27 +20,29 @@ function fakeTerm(): TerminalOut & { writes: string[]; all: () => string } {
       writes.push(chunk)
     },
     columns: 80,
-    rows: 24,
+    rows,
     interactive: true,
   }
 }
 
-const CURSOR_UP = (n: number): string => `\x1b[${n}A`
-const CLEAR_TO_END = '\x1b[0J'
+const ENTER_ALTERNATE_SCREEN = '\x1b[?1049h'
+const LEAVE_ALTERNATE_SCREEN = '\x1b[?1049l'
+const CLEAR_DISPLAY = '\x1b[2J'
+const CURSOR_POSITION = (row: number): string => `\x1b[${row};1H`
+const HIDE_CURSOR = '\x1b[?25l'
+const SHOW_CURSOR = '\x1b[?25h'
+const frame = (lines: string[]): string => lines.map((line) => `${line}\n`).join('')
 
 describe('paintableRows: the frame needs one row fewer than the screen', () => {
-  // f_c9449563 — `update` terminates EVERY line with `\n`, the last one
-  // included, so after painting N lines the cursor rests on a fresh row BELOW
-  // the frame, and that row has to exist. At N === rows the final newline
-  // scrolls the frame's top line away before erase() ever runs, and CURSOR_UP
-  // then clamps at the top margin: the header is gone and a copy lands in
-  // scrollback on every repaint.
+  // `update` terminates EVERY line with `\n`, the last one included, so after
+  // painting N lines the cursor rests on a fresh row BELOW the frame, and that
+  // row has to exist. At N === rows the final newline scrolls the frame's top
+  // line away even on a freshly cleared alternate display.
   //
   // This file's fake CANNOT observe that — it appends to an array, so nothing
   // ever scrolls. Neither can render.test.ts, which counts lines and knows
-  // nothing of the trailing newline. So the rule is asserted as a rule here,
-  // next to the newline that causes it, and the end-to-end consequence is
-  // asserted at the dispatch seam that owns both (dispatch.test.ts).
+  // nothing of the trailing newline. The rule is therefore asserted here,
+  // next to the newline that causes it.
 
   test('one fewer than the screen', () => {
     expect(paintableRows(24)).toBe(23)
@@ -44,7 +51,6 @@ describe('paintableRows: the frame needs one row fewer than the screen', () => {
   })
 
   test('a 1-row screen has NO paintable height — the honest answer is nothing', () => {
-    // A single line there would scroll itself off behind its own newline.
     expect(paintableRows(1)).toBe(0)
   })
 
@@ -54,49 +60,102 @@ describe('paintableRows: the frame needs one row fewer than the screen', () => {
   })
 
   test('update() really does terminate every line — the reason for the -1', () => {
-    // Pin the convention the rule depends on: if this ever stops being true,
-    // `paintableRows` is wrong and this test says so.
     const term = fakeTerm()
     new LiveRegion(term).update(['a', 'b', 'c'])
-    const painted = term.writes.find((w) => w.includes('a'))
-    expect(painted).toBe('a\nb\nc\n') // trailing newline on the LAST line too
+    expect(term.writes.at(-1)).toBe('a\nb\nc\n')
   })
 })
 
-describe('LiveRegion: the region does not accumulate', () => {
-  test('a changed frame erases the previous one before repainting', () => {
-    const term = fakeTerm()
-    const region = new LiveRegion(term)
-    region.update(['one', 'two'])
-    const before = term.all()
-    expect(before).toContain('one\ntwo\n')
+describe('LiveRegion: alternate-screen replacement', () => {
+  test('the first frame enters before clearing and anchors from the bottom', () => {
+    const term = fakeTerm(24)
+    new LiveRegion(term).update(['one', 'two'])
 
-    region.update(['one', 'three'])
-    const added = term.all().slice(before.length)
-    // Two lines painted ⇒ cursor up two, clear to end, then repaint.
-    expect(added).toContain(CURSOR_UP(2) + CLEAR_TO_END)
-    expect(added).toContain('one\nthree\n')
+    expect(term.writes).toEqual([
+      ENTER_ALTERNATE_SCREEN,
+      HIDE_CURSOR,
+      CLEAR_DISPLAY + CURSOR_POSITION(22),
+      'one\ntwo\n',
+    ])
   })
 
-  test('the erase counts the LINES ACTUALLY PAINTED, not the new frame', () => {
-    const term = fakeTerm()
+  test('a changed frame clears the whole display and ignores the old line count', () => {
+    const term = fakeTerm(24)
     const region = new LiveRegion(term)
     region.update(['a', 'b', 'c'])
-    const before = term.all().length
+    const before = term.writes.length
+
     region.update(['x'])
-    expect(term.all().slice(before)).toContain(CURSOR_UP(3))
+
+    expect(term.writes.slice(before)).toEqual([
+      CLEAR_DISPLAY + CURSOR_POSITION(23),
+      'x\n',
+    ])
   })
 
-  test('the first frame has nothing to erase', () => {
-    const term = fakeTerm()
-    new LiveRegion(term).update(['one'])
-    expect(term.all()).not.toContain('\x1b[0A')
-    expect(term.all()).not.toContain(CLEAR_TO_END)
+  test('an initial empty frame is inert', () => {
+    const term = fakeTerm(1)
+    const region = new LiveRegion(term)
+    region.update([])
+    term.rows = 2
+    region.update([])
+    expect(term.writes).toEqual([])
+  })
+})
+
+describe('LiveRegion: terminal resize', () => {
+  test('shrink and grow both clear and re-anchor using the current rows', () => {
+    const term = fakeTerm(8)
+    const region = new LiveRegion(term)
+    const tall = ['header', 'status', '', 'row', '', 'controls']
+    region.update(tall)
+
+    // Shrink below the six-line frame that was actually painted. The next
+    // render is already capped for the new screen, and its repaint must not
+    // depend on how much of the old frame survived the resize.
+    term.rows = 4
+    const shrunk = ['header', 'status', 'controls']
+    let before = term.writes.length
+    region.update(shrunk)
+    expect(term.writes.slice(before)).toEqual([
+      CLEAR_DISPLAY + CURSOR_POSITION(1),
+      frame(shrunk),
+    ])
+
+    // An ordinary changed repaint is likewise a whole-display replacement.
+    const changed = ['header', 'changed']
+    before = term.writes.length
+    region.update(changed)
+    expect(term.writes.slice(before)).toEqual([
+      CLEAR_DISPLAY + CURSOR_POSITION(2),
+      frame(changed),
+    ])
+
+    // Equal frame and equal height remains the zero-write fast path, including
+    // after the shrink.
+    before = term.writes.length
+    region.update(changed)
+    region.update(changed)
+    expect(term.writes.length).toBe(before)
+
+    // Height is part of paint identity: the same frame after a grow is cleared
+    // and moved to its new bottom anchor on the very next update.
+    term.rows = 9
+    before = term.writes.length
+    region.update(changed)
+    expect(term.writes.slice(before)).toEqual([
+      CLEAR_DISPLAY + CURSOR_POSITION(7),
+      frame(changed),
+    ])
+
+    before = term.writes.length
+    region.update(changed)
+    expect(term.writes.length).toBe(before)
   })
 })
 
 describe('LiveRegion: an identical frame writes nothing', () => {
-  test('a repeat update is a no-op — the frame is a pure function of state', () => {
+  test('a repeat update at the same height is a no-op', () => {
     const term = fakeTerm()
     const region = new LiveRegion(term)
     region.update(['one', 'two'])
@@ -107,14 +166,22 @@ describe('LiveRegion: an identical frame writes nothing', () => {
   })
 })
 
-describe('LiveRegion: the cursor', () => {
-  test('hidden on the first paint, restored by finish()', () => {
+describe('LiveRegion: finish() leaves the last frame on the normal screen', () => {
+  test('leaves alternate screen before copying the frame and restoring the cursor', () => {
     const term = fakeTerm()
     const region = new LiveRegion(term)
-    region.update(['frame'])
-    expect(term.all()).toContain('\x1b[?25l')
+    region.update(['final-frame'])
+    const before = term.writes.length
+
     region.finish()
-    expect(term.all()).toContain('\x1b[?25h')
+
+    const teardown = term.writes.slice(before)
+    expect(teardown).toEqual([
+      LEAVE_ALTERNATE_SCREEN,
+      'final-frame\n',
+      SHOW_CURSOR,
+    ])
+    expect(teardown.join('')).not.toContain(CLEAR_DISPLAY)
   })
 
   test('finish() on an unpainted region leaves no escapes at all', () => {
@@ -122,36 +189,16 @@ describe('LiveRegion: the cursor', () => {
     new LiveRegion(term).finish()
     expect(term.all()).toBe('')
   })
-})
 
-describe('LiveRegion: finish() leaves the last frame on screen', () => {
-  test('the final frame stays painted, with no erase after it', () => {
-    // The last frame is the answer the operator ran the command for — `git log`
-    // and a finished progress bar both leave their output up. Erasing it would
-    // make the exit render pointless work.
-    const term = fakeTerm()
-    const region = new LiveRegion(term)
-    region.update(['final-frame'])
-    const beforeFinish = term.all().length
-
-    region.finish()
-
-    const after = term.all().slice(beforeFinish)
-    expect(after).not.toContain(CLEAR_TO_END)
-    expect(after).not.toContain('\x1b[1A')
-    expect(term.all()).toContain('final-frame\n')
-  })
-
-  test('finish() is idempotent and stops tracking — nothing cursors up afterwards', () => {
+  test('finish() is idempotent and ignores late updates', () => {
     const term = fakeTerm()
     const region = new LiveRegion(term)
     region.update(['final-frame'])
     region.finish()
     region.finish()
-    const before = term.all().length
+    const before = term.writes.length
 
-    // A late update must not cursor-up over lines the region no longer owns.
     region.update(['late'])
-    expect(term.all().length).toBe(before)
+    expect(term.writes.length).toBe(before)
   })
 })

@@ -14,9 +14,11 @@
  */
 import type { TerminalOut } from '../terminal'
 
-const CURSOR_UP = (n: number): string => `\x1b[${n}A`
-/** Clear from the cursor to the end of the screen. */
-const CLEAR_TO_END = '\x1b[0J'
+const ENTER_ALTERNATE_SCREEN = '\x1b[?1049h'
+const LEAVE_ALTERNATE_SCREEN = '\x1b[?1049l'
+/** Clear the entire active display. */
+const CLEAR_DISPLAY = '\x1b[2J'
+const CURSOR_POSITION = (row: number): string => `\x1b[${row};1H`
 const HIDE_CURSOR = '\x1b[?25l'
 const SHOW_CURSOR = '\x1b[?25h'
 
@@ -27,9 +29,8 @@ const SHOW_CURSOR = '\x1b[?25h'
  * `update` terminates EVERY line with `\n`, the last one included, so after
  * painting N lines the cursor rests on a fresh row BELOW the frame — and that
  * row has to exist. At N === rows the final newline scrolls the frame's top
- * line away before `erase()` ever runs; `CURSOR_UP(N)` then clamps at the top
- * margin, so the header is gone and a copy lands in scrollback on every
- * repaint. N === rows is the one height that cannot be painted.
+ * line away even when painting a freshly cleared alternate screen. N === rows
+ * is therefore the one height that cannot be painted.
  *
  * This lives here, next to the newline that causes it, because no other seam
  * can see it: `render.ts` counts lines and knows nothing of the trailing
@@ -48,6 +49,9 @@ export class LiveRegion {
   /** The frame currently painted — `[]` when the region is empty. Also the
    * identical-frame check's comparand. */
   private painted: string[] = []
+  /** Terminal height used to anchor `painted`; a resize invalidates equality. */
+  private paintedRows: number | undefined
+  private alternate = false
   private hidden = false
   private finished = false
 
@@ -56,48 +60,60 @@ export class LiveRegion {
   /**
    * Repaint the region in place.
    *
-   * Skipped entirely when the lines are identical to the last frame: the frame
-   * is a pure function of build state, so "refreshes as displayed build state
-   * changes" falls out of this check — and a poll that finds nothing new costs
-   * zero writes and zero flicker.
+   * Each effective paint replaces the whole alternate display and anchors the
+   * frame from the terminal's current bottom, so it never depends on how many
+   * rows survived a resize. Equal lines at equal height cost zero writes and
+   * zero flicker; equal lines after a resize must be re-anchored.
    */
   update(lines: string[]): void {
     if (this.finished) return
-    if (sameFrame(this.painted, lines)) return
-    if (!this.hidden) {
+
+    const rows = this.term.rows
+    // An empty initial render (for example, a one-row terminal) is not a real
+    // paint and must not switch screens merely to display nothing.
+    if (!this.alternate && lines.length === 0) return
+    if (this.paintedRows === rows && sameFrame(this.painted, lines)) return
+
+    if (!this.alternate) {
+      this.term.write(ENTER_ALTERNATE_SCREEN)
+      this.alternate = true
       this.term.write(HIDE_CURSOR)
       this.hidden = true
     }
-    this.erase()
-    this.term.write(lines.map((line) => `${line}\n`).join(''))
+
+    const top = Math.max(1, rows - lines.length)
+    this.term.write(CLEAR_DISPLAY + CURSOR_POSITION(top))
+    const frame = lines.map((line) => `${line}\n`).join('')
+    if (frame.length > 0) this.term.write(frame)
     this.painted = [...lines]
+    this.paintedRows = rows
   }
 
   /**
-   * Release the region: LEAVE the last frame painted, restore the cursor, stop
-   * tracking. Idempotent.
+   * Release the region: restore the normal screen, copy the last frame there,
+   * restore the cursor, and stop tracking. Idempotent.
    *
-   * It deliberately does not erase. The final frame is the answer the operator
-   * ran the command for — `git log` and a finished progress bar both leave
-   * their output on screen, and erasing it would make the exit render pointless
-   * work. Dropping the tracking state is what makes that safe: nothing will
-   * later cursor-up over lines the region no longer owns.
+   * The copy preserves the existing external contract: the final frame is the
+   * answer the operator ran the command for, just as `git log` and a finished
+   * progress bar leave their output on screen. The normal display is never
+   * erased during teardown.
    */
   finish(): void {
     if (this.finished) return
     this.finished = true
+
+    if (this.alternate) {
+      this.term.write(LEAVE_ALTERNATE_SCREEN)
+      this.alternate = false
+      const frame = this.painted.map((line) => `${line}\n`).join('')
+      if (frame.length > 0) this.term.write(frame)
+    }
     if (this.hidden) {
       this.term.write(SHOW_CURSOR)
       this.hidden = false
     }
     this.painted = []
-  }
-
-  /** Cursor-up over the painted rows and clear to the end of the screen. Used
-   * by `update` and nothing else — the region's only erasure. */
-  private erase(): void {
-    if (this.painted.length === 0) return
-    this.term.write(CURSOR_UP(this.painted.length) + CLEAR_TO_END)
+    this.paintedRows = undefined
   }
 }
 

@@ -35,9 +35,9 @@ export interface TerminalOut {
   /** Terminal width in columns; a sane fallback when unknown. */
   columns: number
   /** Terminal height in rows; a sane fallback when unknown. The live region
-   * repaints by cursoring UP over the rows it painted, which only works while
-   * those rows are still on screen — so a frame taller than this is not a
-   * cosmetic problem, it is an unpaintable one. */
+   * snapshots this on every update so its alternate-screen repaint can clear
+   * and re-anchor from the current bottom after a resize. The frame still has
+   * to leave one spare row for its trailing newline. */
   rows: number
   /** True only for a real TTY — false for pipes and redirects. */
   interactive: boolean

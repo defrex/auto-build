@@ -497,9 +497,9 @@ describe('renderDashboard: harvest uses the selectable build-row grammar', () =>
 })
 
 describe('renderDashboard: truncation (one rendered line = one physical row)', () => {
-  // If a line exceeds the width the terminal wraps it, the painted-line count
-  // under-counts, and the redraw's cursor-up clears too little — leaving
-  // accumulating fragments, the exact thing the no-accumulation AC forbids.
+  // If a line exceeds the width, terminal wrapping consumes unbudgeted rows and
+  // can scroll the bottom-anchored frame's header away despite its logical
+  // line count fitting the screen.
 
   test('no line exceeds the width, in plain or color', () => {
     const long = build({
@@ -570,11 +570,10 @@ describe('renderDashboard: truncation (one rendered line = one physical row)', (
 })
 
 describe('renderDashboard: `height` caps the LINE count', () => {
-  // f_d2e4b3ee — the width invariant's twin, on the other axis. `erase()`
-  // cursors UP over the lines it painted, which only works while they are
-  // still on screen; a taller frame scrolls its own top away, CUU clamps at
-  // the top margin, and the header — the line AC 19 names — is the first thing
-  // lost, while each repaint pushes snapshots into scrollback (AC 18).
+  // f_d2e4b3ee — the width invariant's twin, on the other axis. The live region
+  // clears its alternate display and anchors from the current bottom, but a
+  // frame taller than the paintable rows still scrolls its own top away. The
+  // header — the line AC 19 names — is the first thing lost.
   //
   // What this file can and cannot prove (f_c9449563): `height` here is a cap
   // on LINES, and these tests only pin `lines.length <= height`. They say
@@ -710,8 +709,8 @@ describe('renderDashboard: `height` caps the LINE count', () => {
 
   test('a cap of 0 paints NOTHING — not a header that would scroll itself off', () => {
     // What `paintableRows(1)` hands us on a 1-row screen. A single line there
-    // would scroll away behind its own trailing newline and land in scrollback
-    // on every repaint, which is worse than an empty region.
+    // would scroll away behind its own trailing newline even after a full
+    // alternate-display clear, which is worse than an empty region.
     expect(rd(model([]), { color: false, width: 80, height: 0 })).toEqual([])
     expect(rd(model(many(3)), { color: false, width: 80, height: 0 })).toEqual([])
   })
