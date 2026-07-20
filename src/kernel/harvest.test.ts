@@ -623,6 +623,15 @@ describe('reduceHarvest', () => {
       })
       await fail('h_exhausted', 'exhausted stopped', attempt + 1)
     }
+    const afterAutomaticResumes = reduceHarvest(
+      await store.getRepoEvents('/repo'),
+    )
+    expect(
+      afterAutomaticResumes.runs.find(
+        (run) => run.run === 'h_first_failed',
+      ),
+    ).toMatchObject({ status: 'failed', recoveryRequests: [] })
+
     await store.appendRepo('/repo', {
       actor: KERNEL,
       type: 'harvest.recovery-exhausted',

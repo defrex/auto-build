@@ -207,8 +207,10 @@ suppressions; missing creates, tombstone/unknown joins, and malformed or
 otherwise unclassifiable content fail safe to pending release. Rejected store
 reads propagate as retryable infrastructure rather than being classified as
 content. `harvest.recovery-exhausted` records that exact partition and raises an
-attention barrier. Dispatcher launch is suppressed while any such barrier or
-ordinary parked failure remains unresolved; the human acknowledgement does not
+attention barrier. New scanning is suppressed while any barrier or ordinary
+parked failure remains unresolved. Dispatcher launches still occur to settle
+ordinary recovery; an exhaustion barrier suppresses launch until a human resume
+request makes its acknowledgement actionable. That acknowledgement does not
 reopen exhausted runs. Completed and deliberate escalated runs remain terminal,
 with escalation snapshots still claimed. Typed session deposits live under `ab
 harvest context|submit|verdict`; `ab harvest status` projects an ordered section
