@@ -64,6 +64,9 @@ describe('runCli — routing and exit codes', () => {
     const help = d.out.join('\n')
     for (const form of [
       'ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
+      'ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]',
+      'ab ticket block <id> <blocker-id>',
+      'ab ticket unblock <id> <blocker-id>',
       'ab ticket list [--state <state>] [--labels a,b] [--json]',
       'ab ticket show <id> [--json]',
       'ab ticket move <id> <state> [--json]',
@@ -72,6 +75,7 @@ describe('runCli — routing and exit codes', () => {
     }
     expect(help).toContain('same ready criteria as dispatch')
     expect(help).toContain('show one ticket, including its body/spec')
+    expect(help).toContain('the first id is always the ticket being changed')
   })
 
   test('help documents status and every sessionless build-control command', async () => {
@@ -746,7 +750,75 @@ describe('runCli — ab dispatch flag parsing (§3.3)', () => {
     }
   })
 
-  test('both forms of each process-local launch setting parse', async () => {
+  test('omitted flags write nothing while explicit forms persist repository facts', async () => {
+    await writeDispatchConfig()
+    const storeRef = join(tmp, 'durable-flags')
+    const d = deps()
+    const commandDeps = {
+      ...d,
+      workspacePath: tmp,
+      processEnv: { USER: 'launch-user' },
+    }
+
+    expect(
+      await runCli(
+        ['dispatch', '--once', '--plain', '--store', storeRef],
+        commandDeps,
+      ),
+    ).toBe(0)
+    let persisted = openLocalStore(storeRef)
+    expect(await persisted.getRepoEvents(tmp)).toEqual([])
+    await persisted.close()
+
+    expect(
+      await runCli(
+        [
+          'dispatch',
+          '--once',
+          '--plain',
+          '--store',
+          storeRef,
+          '--no-intake',
+          '--auto-merge',
+        ],
+        commandDeps,
+      ),
+    ).toBe(0)
+    persisted = openLocalStore(storeRef)
+    expect(
+      (await persisted.getRepoEvents(tmp)).map((event) => ({
+        actor: event.actor,
+        type: event.type,
+        payload: event.payload,
+      })),
+    ).toEqual([
+      {
+        actor: { kind: 'human', user: 'launch-user' },
+        type: 'dispatcher.intake-set',
+        payload: { enabled: false },
+      },
+      {
+        actor: { kind: 'human', user: 'launch-user' },
+        type: 'dispatcher.auto-merge-default-set',
+        payload: { enabled: true },
+      },
+    ])
+    await persisted.close()
+
+    // A no-flag restart reuses the stored projection rather than appending
+    // inferred defaults over the operator's explicit choices.
+    expect(
+      await runCli(
+        ['dispatch', '--once', '--plain', '--store', storeRef],
+        commandDeps,
+      ),
+    ).toBe(0)
+    persisted = openLocalStore(storeRef)
+    expect((await persisted.getRepoEvents(tmp)).length).toBe(2)
+    await persisted.close()
+  })
+
+  test('both forms of each durable repository setting parse', async () => {
     for (const flag of [
       '--intake',
       '--no-intake',
@@ -816,13 +888,16 @@ describe('runCli — ab dispatch flag parsing (§3.3)', () => {
     expect(err).toContain('[--auto-merge | --no-auto-merge]')
   })
 
-  test('the help advertises both process-local launch settings', async () => {
+  test('the help advertises both durable repository settings and stored fallback', async () => {
     const d = deps()
     await runCli(['help'], d)
     const help = d.out.join('\n')
     expect(help).toContain(
       'ab dispatch [--once] [--interval <s>] [--store <ref>] [--plain] [--intake | --no-intake] [--auto-merge | --no-auto-merge]',
     )
-    expect(help).toContain('newly claimed builds only (default off)')
+    expect(help).toContain('durably set repository defaults')
+    expect(help).toContain(
+      'omission reuses stored state (fresh repo: intake on, auto-merge off)',
+    )
   })
 })

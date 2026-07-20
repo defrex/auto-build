@@ -116,9 +116,10 @@ The distinctions that change an administrator's answer:
   convergence and stall detection. Outcomes come from the typed `ab` CLI, never
   from parsing an agent's stdout.
 - **The BuildStore is append-only event logs.** Build status is reduced from
-  each build stream (`src/kernel/reducer.ts`); harvest state and its dedup ledger
-  are reduced from the repository journal (`src/kernel/harvest.ts`). Snapshots
-  are never authoritative. Events record facts, never derived state.
+  each build stream (`src/kernel/reducer.ts`); dispatcher settings and harvest
+  state are independently reduced from the repository journal
+  (`src/kernel/dispatch-settings.ts`, `src/kernel/harvest.ts`). Snapshots are
+  never authoritative. Events record facts, never derived state.
 - **Workspaces** are provisioned per build. Config is read from **the build's
   branch** at provision — so a config change flows through the pipeline like
   any other change, and every phase of one build sees one consistent config.
@@ -159,6 +160,16 @@ likes.
 `setup` is special by convention: it runs after workspace provision and after a
 sandbox rehydrate. Values are never evaluated as config — they are handed to a
 shell as written.
+
+For first config creation, `ab init` starts with `setup = "bun install"` and
+recognizes only exact own keys in the root `package.json` scripts map: `lint`
+adds `lint = "bun run lint"`; `type-check` adds
+`typecheck = "bun run type-check"` and the `types` verify check; `test` adds
+`test = "bun run test"` and the `unit` check. Lint remains command-only.
+Missing scripts add nothing (`typecheck` is not an alias for `type-check`), so
+every generated package command names a script that exists and every generated
+check has a backing command. This detection does not restrict later manual
+configuration: commands remain an open map.
 
 ### `[server]`
 
@@ -333,8 +344,9 @@ claim is a rename — frontmatter carries no `state`/`claimedBy`, and a ticket
 body survives byte-exactly because a move never rewrites the file. The same id
 in two state dirs is a loud error naming both paths. When `dir` is defaulted,
 the backlog writes its own `.gitignore` of `*`, so git never sees it; an
-explicit `dir` is the user's and is left alone. Agents drive this tracker
-through `ab-tickets` rather than running `mv` by hand.
+explicit `dir` is the user's and is left alone. Agents and operators drive it
+through the source-agnostic `ab ticket` commands rather than running `mv` by
+hand.
 
 **Secrets never live in this file.** `LINEAR_API_KEY` is an environment
 variable (a local `.env` works). If a user asks you to put an API key in
@@ -344,7 +356,7 @@ variable (a local `.env` works). If a user asks you to put an API key in
 
 Observation harvest is driven by back-pressure inside `ab dispatch`, not by a
 wall clock. The table is prefaulted, so omitting it enables the sensible
-default. Harvest remains independent of build capacity and of process-local
+default. Harvest remains independent of build capacity and of repository
 intake. Dispatch tracks the workflow in-flight without awaiting it on
 watch ticks, so janitor/dispatch/input/SIGINT stay responsive; `--once` drains
 it before exit. The repository lease remains the cross-process single-flight
@@ -371,8 +383,13 @@ the user to `[harvest].threshold`; other scheduled ingesters are unaffected.
 **`ab init <target> [--force]`** runs *outside* build sessions — it takes a
 repo path, needs no `AB_*` environment, and is safe to re-run. It:
 
-- Writes `autobuild.toml` from the template, and **never overwrites an existing
-  one**. The repo's config is the repo's from the first re-run onward.
+- If `autobuild.toml` is absent, renders the valid setup-only template using
+  the target's root `package.json`: exact `lint`, `type-check`, and `test`
+  scripts add the command/check fragments described above. Missing package
+  metadata means no package-backed commands or checks; malformed JSON or an
+  invalid recognized declaration fails with the manifest path. It **never
+  inspects package scripts or overwrites config once the file exists**, even
+  with `--force`; the repo's config is the repo's from the first re-run onward.
 - Idempotently adds the exact `.autobuild/` rule to the target's `.gitignore`,
   preserving every existing byte/rule and handling a missing trailing newline.
 - **Copies** each canonical skill to `.agents/skills/ab-<name>/SKILL.md` —
@@ -436,14 +453,62 @@ while worktrees and default file tickets remain under the repository-default
 `.autobuild/` directory. The dispatcher passes its normalized selection to
 every agent session as `AB_STORE`.
 
+## Source-agnostic ticket operations
+
+The sessionless `ab ticket` namespace constructs whichever TicketSource the
+repository's `[tickets]` table selects. These forms therefore work unchanged
+with Linear and the file tracker, without provider-specific API/MCP calls:
+
+- `ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]`
+  files a ticket. Blocker ids belong to the same source and are checked before
+  creation.
+- `ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]`
+  partially replaces editable fields. At least one flag is required.
+- `ab ticket block <id> <blocker-id>` adds one blocking relationship.
+- `ab ticket unblock <id> <blocker-id>` removes one blocking relationship.
+- `ab ticket list [--state <state>] [--labels a,b] [--json]` lists tickets. With
+  no filters it uses exactly dispatch's configured ready state and source-aware
+  default labels. If either filter is present, only explicitly supplied
+  criteria apply; every requested label must match.
+- `ab ticket show <id> [--json]` reads one complete ticket. Human output includes
+  labeled metadata and the body verbatim, so it can read a stored spec back.
+- `ab ticket move <id> <state> [--json]` transitions one ticket and reports its
+  post-transition value.
+
+State names and ids are source-local. For block and unblock, the first id is the ticket being changed
+and the second is its blocker. Create validates every
+`--blocked-by` id before filing. A later block requires both tickets to exist
+and rejects a direct self-block; unblock only requires the target. Adding an
+existing relationship and removing an absent one both succeed as no-ops, so
+either command is safe to retry.
+
+Update is partial: omitted fields remain untouched, including labels, assignee,
+and provider metadata. `--labels` is a complete replacement and an explicitly
+empty value (`--labels ''`) clears the list. Supplied title/body values must be
+nonblank. State is intentionally not an update field — `transition()` remains its sole owner —
+and every validation or unknown-ticket error occurs before
+mutation and names the offending field or id. `--body` always names a file; a
+missing file fails before a source write.
+
+Quote multiword Linear states, for example `"In Progress"`; file states are
+case-insensitive on input and canonical on output. The adapters validate
+transitions, so an invalid state fails with the
+source's known states. A missing id fails nonzero with an error naming both the
+id and configured source.
+
+Human-readable output is the default. `--json` emits one bare JSON value and no
+prose: a `Ticket[]` for `list`, and the complete `Ticket` for `show` or `move`.
+
 ## Dispatch dashboard
 
 On a TTY, `ab dispatch` renders one fixed interactive frame. Its first two
 lines are the always-present process-global section: a selectable `Auto Build`
 title with the repository basename, capacity, active-build count,
 `intake ON`/`intake OFF`, `auto merge default ON`/`auto merge default OFF`, and
-`harvest ON`/`harvest OFF`, then one status slot. Harvest reflects the
-acknowledged durable repository gate, not a process-local or pending value. Tick counts, dependency diagnostics, parked-build notices,
+`harvest ON`/`harvest OFF`, then one status slot. All three controls are durable
+repository projections and converge across dispatchers on the existing poll;
+harvest specifically reflects its acknowledged gate, not pending intent. Tick
+counts, dependency diagnostics, parked-build notices,
 harvest outcomes, action confirmations, and warnings replace that slot instead
 of scrolling above the frame. A blank line separates the global section from
 the first body row, and another separates the body from the legend or feedback
@@ -460,24 +525,26 @@ on/off`, `m auto-merge default`, and `p intake on/off`; `Harvest` offers
 only when that action is available; builds offer `m auto-merge` and `p
 pause/resume`. `m` on `Harvest` is an explanatory build-only no-op.
 
-`--intake` starts process-local intake on, `--no-intake` starts it off, and
-omitting both defaults on; combining them is an argument error. Global-row `p`
-can toggle either way afterward. Intake off skips only new ticket claims while
-janitor, stale-runner, harvest, and in-flight work continue, and a fresh run
-defaults on again.
+`--intake` and `--no-intake` are mutually exclusive durable repository setters.
+Omitting both reuses stored state, falling back to ON only when no intake fact
+exists. Global-row `p` re-reads current state and appends the opposite value.
+Intake off skips only new ticket claims while janitor, stale-runner, harvest,
+and in-flight work continue. Every dispatcher samples the current value on each
+tick, so a change in one process gates all dispatchers for that repository.
 
-`--auto-merge` starts the process-local claim default on,
-`--no-auto-merge` starts it off, and omission defaults off; combining the two
-forms is an argument error independent of the intake pair. Global-row `m`
-toggles it in either direction and posts the new state as a dispatcher notice.
-When on, each fresh dispatcher claim records the existing human-authored
-`build.auto-merge-requested` fact immediately after `build.created` and before
-runner launch. The first visible build frame therefore carries `auto merge`,
-and the intent survives restart through the ordinary reducer/native/cancel
-machinery. This is a creation-time seed, not policy: toggles never touch
-existing builds, resumed/adopted logs or other creation paths never sample it,
-and build-row `m` remains independent (a seeded build can be cancelled while
-the global default stays on). It is not stored in `autobuild.toml` or any store.
+`--auto-merge` and `--no-auto-merge` similarly set the durable repository
+claim-time default; omission reuses stored state, falling back to OFF only when
+no fact exists. The forms are mutually exclusive independently of the intake
+pair. Global-row `m` re-reads current state, appends the opposite value, and
+posts a dispatcher notice. When on, each fresh dispatcher claim records the
+existing human-authored `build.auto-merge-requested` fact immediately after
+`build.created` and before runner launch. The first visible build frame therefore
+carries `auto merge`. This is a creation-time seed, not policy: changes never
+touch existing builds, resumed/adopted logs or other creation paths never sample
+it, and build-row `m` remains independent (a seeded build can be cancelled while
+the global default stays on). Both repository settings are independently
+last-write-wins by event sequence. They are stored in the BuildStore, not in
+`autobuild.toml`; propagation uses polling, not a push channel.
 
 Header `h` re-reads the repository journal and appends the existing human
 pause/resume request. The newest pending command determines the next target, so
@@ -551,11 +618,10 @@ guarantee: if the condition still fails, a phase may raise a new escalation and
 block again. A fresh `ab dispatch` still auto-retries only an all-policy
 escalation set and never invents guidance.
 
-Two asymmetries are intentional and explicit. Dashboard intake and the
-claim-time auto-merge default remain process-local state inside that running
-`ab dispatch`, so their launch flags and global-row toggles have no durable CLI
-commands of their own. Conversely, abort has a CLI command
-but gains no TUI key in this release. Global-row `h` owns the durable harvest
+Two asymmetries are intentional and explicit. Durable repository intake and the
+claim-time auto-merge default have launch-flag setters and global-row toggles,
+but no standalone sessionless control commands. Conversely, abort has a CLI
+command but gains no TUI key in this release. Global-row `h` owns the durable harvest
 gate. On the optional repository-scoped `Harvest` run row, `p` only resumes or
 acknowledges the represented run; `m` remains an explanatory build-only no-op.
 

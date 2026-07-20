@@ -32,12 +32,7 @@ import { observe } from './observe'
 import { ServerControl } from './server-control'
 import { abBuilds, abBuildStatus } from './status'
 import { done, escalate, verdict } from './terminals'
-import {
-  abTicketCreate,
-  abTicketList,
-  abTicketMove,
-  abTicketShow,
-} from './ticket'
+import { abTicket } from './ticket'
 import { abUpgrade } from './upgrade'
 import {
   abHarvestStatus,
@@ -180,18 +175,22 @@ const HELP = [
   '  ab upgrade [target]                    three-way merge vendored ab-* skills with the new defaults (§16.3; runs outside sessions)',
   '  ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
   '                                         file a ticket to the configured [tickets] source (§8.8; runs outside sessions).',
+  '  ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]',
+  '                                         partially update editable fields; omitted fields survive and --labels "" clears labels.',
+  '  ab ticket block <id> <blocker-id>      add a blocker to an existing ticket (idempotent).',
+  '  ab ticket unblock <id> <blocker-id>    remove a blocker from an existing ticket (idempotent).',
   '  ab ticket list [--state <state>] [--labels a,b] [--json]',
   '                                         list tickets; with no filters, use the same ready criteria as dispatch.',
   '  ab ticket show <id> [--json]           show one ticket, including its body/spec.',
   '  ab ticket move <id> <state> [--json]   move one ticket to a source-local state.',
   '                                         Ticket reads/moves use human output by default; --json emits the complete Ticket value.',
-  '                                         --blocked-by takes comma-separated ticket ids from that same source',
-  '                                         (e.g. AUT-8 for linear, file-1 for file); dispatch waits for all of them.',
-  '                                         State names and unknown-id errors come from the configured source.',
+  '                                         Ticket ids are source-local (e.g. AUT-8 or file-1); for block/unblock, the first id is always the ticket being changed.',
+  '                                         State names and unknown-id errors come from the configured source; ticket update never changes state.',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>] [--plain] [--intake | --no-intake] [--auto-merge | --no-auto-merge]',
   '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
-  '                                         --auto-merge seeds durable intent on newly claimed builds only (default off); opposite flag forms cannot be combined',
-  '                                         an interactive terminal gets a fixed global/harvest/build dashboard; TTY controls: Up/Down select, p toggles intake on the global row',
+  '                                         intake/auto-merge flags durably set repository defaults; omission reuses stored state (fresh repo: intake on, auto-merge off);',
+  '                                         --auto-merge seeds durable intent on newly claimed builds only; opposite flag forms cannot be combined',
+  '                                         an interactive terminal gets a fixed global/harvest/build dashboard; TTY controls: Up/Down select, p durably toggles intake on the global row',
   '                                         or pauses/resumes the selected Harvest/build; m toggles the claim-time default on global or durable intent on a build; Ctrl-C stops;',
   '                                         blocked feedback: Enter submits (empty = retry), Esc cancels; the bottom controls list only keys active for the selection; --plain forces line-oriented output',
   '                                         (also automatic when stdout is not a TTY)',
@@ -275,46 +274,6 @@ function flagValue(value: string | undefined, name: string, usage: string): stri
     )
   }
   return value
-}
-
-const TICKET_USAGE = [
-  'usage: ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
-  '       ab ticket list [--state <state>] [--labels a,b] [--json]',
-  '       ab ticket show <id> [--json]',
-  '       ab ticket move <id> <state> [--json]',
-].join('\n')
-
-type TicketFlagKind = 'value' | 'boolean'
-
-/** Ticket flags are local to the namespace: strict, duplicate-free, and never
- * admitted into the phase-command parser's global flag vocabulary. */
-function parseTicketArgs(
-  args: string[],
-  allowed: Readonly<Record<string, TicketFlagKind>>,
-): ParsedArgs {
-  const positionals: string[] = []
-  const flags = new Map<string, string | true>()
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i]!
-    if (!arg.startsWith('--')) {
-      positionals.push(arg)
-      continue
-    }
-    const name = arg.slice(2)
-    const kind = allowed[name]
-    if (kind === undefined) {
-      throw new Error(`unknown argument "${arg}" — ${TICKET_USAGE}`)
-    }
-    if (flags.has(name)) {
-      throw new Error(`--${name} may be supplied only once — ${TICKET_USAGE}`)
-    }
-    if (kind === 'boolean') {
-      flags.set(name, true)
-      continue
-    }
-    flags.set(name, flagValue(args[(i += 1)], name, TICKET_USAGE))
-  }
-  return { positionals, flags }
 }
 
 interface ParsedBuildControlArgs {
@@ -500,108 +459,21 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
       return 0
     }
 
-    // Ticket operations run OUTSIDE build sessions (§8.8): they resolve the
-    // configured source for this repo before any build exists.
+    // Ticket grooming runs OUTSIDE build sessions (§8.8): one namespace-local
+    // parser and one configured-source seam own every pre-build operation.
     case 'ticket': {
-      const [sub, ...more] = rest
-      if (sub === undefined) throw new Error(TICKET_USAGE)
-      const needExec = (): Exec => {
-        if (deps.exec === undefined) {
-          throw new Error(
-            `'ab ticket ${sub}' needs an exec seam — this is a wiring bug in the ab binary`,
-          )
-        }
-        return deps.exec
+      if (deps.exec === undefined) {
+        throw new Error(
+          "'ab ticket' needs an exec seam — this is a wiring bug in the ab binary",
+        )
       }
-      const base = {
+      await abTicket(rest, {
         targetRepo: deps.workspacePath,
         env: deps.processEnv ?? {},
+        exec: deps.exec,
         stdout,
-      }
-
-      switch (sub) {
-        case 'create': {
-          const parsed = parseTicketArgs(more, {
-            body: 'value',
-            labels: 'value',
-            'blocked-by': 'value',
-          })
-          const title = parsed.positionals.join(' ')
-          const bodyFile = stringFlag(parsed, 'body')
-          if (title.trim() === '' || bodyFile === undefined || bodyFile.trim() === '') {
-            throw new Error(TICKET_USAGE)
-          }
-          const labels = listFlag(parsed, 'labels')
-          const blockedBy = listFlag(parsed, 'blocked-by')
-          await abTicketCreate({
-            ...base,
-            title,
-            bodyFile,
-            ...(labels !== undefined ? { labels } : {}),
-            ...(blockedBy !== undefined ? { blockedBy } : {}),
-            exec: needExec(),
-          })
-          return 0
-        }
-
-        case 'list': {
-          const parsed = parseTicketArgs(more, {
-            state: 'value',
-            labels: 'value',
-            json: 'boolean',
-          })
-          if (parsed.positionals.length !== 0) throw new Error(TICKET_USAGE)
-          const state = stringFlag(parsed, 'state')
-          if (state !== undefined && state.trim() === '') throw new Error(TICKET_USAGE)
-          const labels = listFlag(parsed, 'labels')
-          await abTicketList({
-            ...base,
-            ...(state !== undefined ? { state } : {}),
-            ...(labels !== undefined ? { labels } : {}),
-            json: parsed.flags.has('json'),
-            exec: needExec(),
-          })
-          return 0
-        }
-
-        case 'show': {
-          const parsed = parseTicketArgs(more, { json: 'boolean' })
-          if (
-            parsed.positionals.length !== 1 ||
-            parsed.positionals[0]!.trim() === ''
-          ) {
-            throw new Error(TICKET_USAGE)
-          }
-          await abTicketShow({
-            ...base,
-            id: parsed.positionals[0]!,
-            json: parsed.flags.has('json'),
-            exec: needExec(),
-          })
-          return 0
-        }
-
-        case 'move': {
-          const parsed = parseTicketArgs(more, { json: 'boolean' })
-          if (
-            parsed.positionals.length !== 2 ||
-            parsed.positionals.some((value) => value.trim() === '')
-          ) {
-            throw new Error(TICKET_USAGE)
-          }
-          await abTicketMove({
-            ...base,
-            id: parsed.positionals[0]!,
-            state: parsed.positionals[1]!,
-            json: parsed.flags.has('json'),
-            exec: needExec(),
-          })
-          return 0
-        }
-
-        default:
-          throw new Error(TICKET_USAGE)
-      }
+      })
+      return 0
     }
 
     // dispatch runs OUTSIDE build sessions (§3.3, §12): it serves a repo, not
@@ -612,8 +484,8 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         'usage: ab dispatch [--once] [--interval <seconds>] [--store <ref>] [--plain] [--intake | --no-intake] [--auto-merge | --no-auto-merge] (§3.3)'
       let once = false
       let plain = false
-      let intake = true
-      let defaultAutoMerge = false
+      let intake: boolean | undefined
+      let defaultAutoMerge: boolean | undefined
       let sawIntake = false
       let sawNoIntake = false
       let sawAutoMerge = false
@@ -670,8 +542,8 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
         stderr,
         once,
         plain,
-        intake,
-        defaultAutoMerge,
+        ...(intake !== undefined ? { intake } : {}),
+        ...(defaultAutoMerge !== undefined ? { defaultAutoMerge } : {}),
         ...(intervalMs !== undefined ? { intervalMs } : {}),
         ...(storeRef !== undefined ? { storeRef } : {}),
         ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
