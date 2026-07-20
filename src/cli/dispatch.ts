@@ -345,6 +345,12 @@ class DispatchLoop {
   private readonly region: LiveRegion | undefined
   /** Guard against overlapping polls, exactly as pollingSubscribe does. */
   private rendering = false
+  /** The full, warning-handled timer poll. Teardown joins this exact promise
+   * before selecting the final frame. */
+  private renderInFlight: Promise<void> | undefined
+  /** Cleared at the rendering stop boundary so an already-queued timer callback
+   * cannot open a new store read after teardown begins. */
+  private acceptingRenderPolls = false
   private timer: ReturnType<typeof setInterval> | undefined
   /** Watch-mode paint timer (AC 8): repaints the CACHED model against a fresh
    * clock so running elapsed ticks between store reads. Absent in `--once`. */
@@ -1225,10 +1231,12 @@ class DispatchLoop {
 
   private startRendering(): void {
     if (!this.dashboard || this.timer !== undefined) return
+    this.acceptingRenderPolls = true
     const tick = (): void => {
-      if (this.rendering) return // no overlapping polls
+      if (!this.acceptingRenderPolls || this.rendering) return // fenced, no overlap
       this.rendering = true
-      void this.renderOnce()
+      let handled!: Promise<void>
+      handled = this.renderOnce()
         .catch((error: unknown) => {
           // A transient store error must never kill dispatch — the dashboard
           // is a view, and a view that throws is a bug in the view.
@@ -1237,8 +1245,13 @@ class DispatchLoop {
           )
         })
         .finally(() => {
+          // Identity matters if lifecycle code ever stops and restarts polling:
+          // an older completion must not clear a replacement poll's guard.
+          if (this.renderInFlight !== handled) return
+          this.renderInFlight = undefined
           this.rendering = false
         })
+      this.renderInFlight = handled
     }
     this.timer = setInterval(tick, DASHBOARD_POLL_MS)
     // Never hold the process open for a redraw.
@@ -1253,11 +1266,27 @@ class DispatchLoop {
     tick()
   }
 
-  private stopRendering(): void {
+  private async stopRendering(): Promise<void> {
+    // Clear both timer sources before yielding. The boolean also fences a timer
+    // callback that was already queued when clearInterval ran.
     if (this.timer !== undefined) clearInterval(this.timer)
     this.timer = undefined
     if (this.tickTimer !== undefined) clearInterval(this.tickTimer)
     this.tickTimer = undefined
+    this.acceptingRenderPolls = false
+
+    // The poll owns model/controller mutation as well as terminal painting, so
+    // join it rather than merely suppressing a late LiveRegion.update(). Its
+    // normal rejection is warning-handled above; the catch keeps teardown safe
+    // even if reporting that warning itself throws.
+    const inFlight = this.renderInFlight
+    if (inFlight !== undefined) {
+      try {
+        await inFlight
+      } catch {
+        // Dashboard rendering remains best-effort during teardown.
+      }
+    }
   }
 
   /** Stop polling, paint the truth one last time, release the region. Every
@@ -1269,21 +1298,30 @@ class DispatchLoop {
     // actions finish before the final truth is painted and raw mode/cursor are
     // considered released.
     try {
-      this.stopInput()
-    } catch (error) {
-      // Cursor restoration must not be skipped just because stdin restoration
-      // itself failed. Keep the failure visible in the final status row.
-      this.warn(
-        `dashboard input cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-    this.stopRendering()
-    await this.operationTail
-    try {
-      await this.renderOnce()
-    } catch {
-      // Best-effort: a failed final frame must not mask the run's outcome.
+      try {
+        this.stopInput()
+      } catch (error) {
+        // Cursor restoration must not be skipped just because stdin restoration
+        // itself failed. Keep the failure visible in the final status row when
+        // the presentation seam is still usable.
+        try {
+          this.warn(
+            `dashboard input cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        } catch {
+          // Rendering that warning is best-effort too.
+        }
+      }
+      await this.stopRendering()
+      await this.operationTail
+      try {
+        await this.renderOnce()
+      } catch {
+        // Best-effort: a failed final frame must not mask the run's outcome.
+      }
     } finally {
+      // Cursor/normal-screen restoration is unconditional once dashboard
+      // teardown begins, including poll and final-read failures.
       this.region?.finish()
     }
   }
