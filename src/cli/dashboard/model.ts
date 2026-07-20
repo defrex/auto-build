@@ -385,9 +385,12 @@ export function projectBuild(
   )
   const restartSince = pendingRestart ? state.lastSeq : state.restartSince
   const cycleSince = Math.max(state.verify.cycleSince, restartSince)
-  // Post-steps re-run after a restart too (engine.ts:710-712); the reducer
-  // already drops them at `spec.revised`, so only the pending case is left.
-  const finalizeSteps = pendingRestart ? [] : state.finalizeSteps
+  // Post-steps re-run after a restart too (engine.ts:710-712). Their reducer
+  // projection is full-log history, so the same effective boundary handles
+  // both a landed revision and the pending human-paced restart window.
+  const finalizeSteps = state.finalizeSteps.filter(
+    (completion) => completion.seq > restartSince,
+  )
 
   /**
    * The current phase, scoped to the current spec.
@@ -396,9 +399,9 @@ export function projectBuild(
    * `plan.approved` and `prState`, and stale for the same reason. `start()`
    * sets `currentPhase` and only that phase's OWN terminal event clears it
    * (`reducer.ts`); `escalation.raised` deliberately does not
-   * (the phase still needs re-running), and `spec.revised` resets
-   * `restartSince`, `cycleSince` and `finalizeSteps` but not these. So a phase
-   * that was in flight when a restart landed still reads as running.
+   * (the phase still needs re-running), and `spec.revised` advances
+   * `restartSince` and `cycleSince` but does not clear these. So a phase that
+   * was in flight when a restart landed still reads as running.
    *
    * That is the plan's own defect class in the one predicate its rule never
    * quantified over — `current`, not `done` — so it gets the same treatment:

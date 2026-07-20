@@ -1113,12 +1113,12 @@ describe('reduceBuild: finalize projections', () => {
       ev('finalize.step-completed', { step: 'notify', ok: false, note: 'slack down' }),
     ])
     expect(reduceBuild(log).finalizeSteps).toEqual([
-      { step: 'changelog', ok: true },
-      { step: 'notify', ok: false },
+      { step: 'changelog', ok: true, seq: 7 },
+      { step: 'notify', ok: false, seq: 8 },
     ])
   })
 
-  test('a completion before spec.revised is excluded — a restart re-runs the post-steps', () => {
+  test('spec.revised retains post-step history while its boundary selects current progress', () => {
     const log = toLog([
       ...prelude(),
       ...finalize(),
@@ -1131,8 +1131,17 @@ describe('reduceBuild: finalize projections', () => {
       }),
       ev('escalation.answered', { id: 'e_1', answer: 'respec', resolution: 'revise-spec' }),
       ev('spec.revised', { artifact: { kind: 'spec', rev: 1 }, escalation: 8 }),
+      ev('finalize.step-completed', { step: 'changelog', ok: false }),
     ])
-    expect(reduceBuild(log).finalizeSteps).toEqual([])
+    const state = reduceBuild(log)
+    expect(state.restartSince).toBe(10)
+    expect(state.finalizeSteps).toEqual([
+      { step: 'changelog', ok: true, seq: 7 },
+      { step: 'changelog', ok: false, seq: 11 },
+    ])
+    expect(state.finalizeSteps.filter((completion) => completion.seq > state.restartSince)).toEqual([
+      { step: 'changelog', ok: false, seq: 11 },
+    ])
   })
 })
 

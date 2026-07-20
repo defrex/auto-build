@@ -976,6 +976,25 @@ describe('f_03d0f6d4: finalize across a spec restart', () => {
     expect(stateOf(build, 'finalize')).toBe('pending')
   })
 
+  test('a pre-revision post-step remains historical but is pending in the restarted scope', () => {
+    const log = toLog([
+      ...throughCodeReview(),
+      ...verifyRun('lint', 1, true),
+      ...verifyRun('test', 1, true),
+      ...finalized(),
+      ev('finalize.step-completed', { step: 'changelog', ok: false }),
+      ...reviseSpec(20, 'finalize'),
+    ])
+    const state = reduceBuild(log)
+    expect(state.finalizeSteps).toEqual([{ step: 'changelog', ok: false, seq: 19 }])
+    expect(state.finalizeSteps[0]!.seq).toBeLessThan(state.restartSince)
+
+    const build = project(log, CONFIG_POST_STEPS)
+    expect(stateOf(build, 'changelog')).toBe('pending')
+    expect(stateOf(build, 'merge')).toBe('pending')
+    expect(decideNext(log, CONFIG_POST_STEPS)).toMatchObject({ kind: 'run-phase', phase: 'plan' })
+  })
+
   test('merge is not current in the post-restart rebuild window (DEFAULT config)', () => {
     // Instance #6: after the rebuild re-passes verify and before
     // finalize.started, `verifyDrained` is true again, `currentPhase` is
@@ -1041,8 +1060,13 @@ describe('an unlanded revise-spec answer parks the WHOLE pipeline (instance #8)'
       ev('finalize.step-completed', { step: 'changelog', ok: true }),
       ...reviseSpec(20, 'finalize').slice(0, 2),
     ])
+    const state = reduceBuild(log)
+    expect(state.restartSince).toBe(0)
+    expect(state.finalizeSteps).toEqual([{ step: 'changelog', ok: true, seq: 19 }])
+
     const build = project(log, CONFIG_POST_STEPS)
     expect(stateOf(build, 'changelog')).toBe('pending')
+    expect(stateOf(build, 'merge')).toBe('pending')
   })
 
   test('a revise-spec answer BEFORE the last restart does not re-park', () => {
@@ -1183,6 +1207,19 @@ describe('f_3535ef75 / merge is gated on drained work', () => {
       kind: 'run-finalize-step',
       step: 'changelog',
     })
+  })
+
+  test('a successful current-spec post-step counts as done and drains into merge', () => {
+    const log = toLog([
+      ...throughPr,
+      ev('finalize.step-completed', { step: 'changelog', ok: true }),
+    ])
+    expect(decideNext(log, CONFIG_POST_STEPS)).toEqual({ kind: 'wait', reason: 'awaiting-pr' })
+
+    const build = project(log, CONFIG_POST_STEPS)
+    expect(stateOf(build, 'changelog')).toBe('done')
+    expect(stepFor(build, 'changelog')?.qualifier).toBeUndefined()
+    expect(stateOf(build, 'merge')).toBe('current')
   })
 
   test('a post-step that FAILED still counts as done — post-steps are failure-tolerant (§5)', () => {
