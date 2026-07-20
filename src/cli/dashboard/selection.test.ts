@@ -19,6 +19,7 @@ describe('dashboard row selection', () => {
       dashboardSelections({
         harvest: {
           kind: 'harvest',
+          run: 'h_1',
           status: 'running',
           steps: [],
           observations: 1,
@@ -103,6 +104,13 @@ describe('dashboard row selection', () => {
         harvest(),
       ),
     ).toEqual(build('a'))
+    expect(
+      reconcileSelection(
+        [global(), harvest()],
+        [global()],
+        harvest(),
+      ),
+    ).toEqual(global())
     expect(
       reconcileSelection(
         [global(), harvest(), build('a'), build('b')],

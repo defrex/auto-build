@@ -253,7 +253,6 @@ const STATUS_COLOR: Record<
   running: 'green',
   paused: 'yellow',
   blocked: 'red',
-  completed: 'green',
   escalated: 'yellow',
   failed: 'red',
 }
@@ -419,9 +418,13 @@ function frameWidths(
 // ── The frame ────────────────────────────────────────────────────────────────
 
 export const DASHBOARD_GLOBAL_LEGEND =
-  'Keys: Up/Down select  m auto-merge default  p intake on/off  Ctrl-C quit'
+  'Keys: Up/Down select  h harvest on/off  m auto-merge default  p intake on/off  Ctrl-C quit'
 export const DASHBOARD_HARVEST_LEGEND =
-  'Keys: Up/Down select  p pause/resume  Ctrl-C quit'
+  'Keys: Up/Down select  Ctrl-C quit'
+export const DASHBOARD_HARVEST_RESUME_LEGEND =
+  'Keys: Up/Down select  p resume  Ctrl-C quit'
+export const DASHBOARD_HARVEST_ACKNOWLEDGE_LEGEND =
+  'Keys: Up/Down select  p acknowledge  Ctrl-C quit'
 export const DASHBOARD_BUILD_LEGEND =
   'Keys: Up/Down select  m auto-merge  p pause/resume  Ctrl-C quit'
 
@@ -446,7 +449,11 @@ function dashboardControls(model: DashboardModel, color: boolean, width: number)
       model.selection?.kind === 'build'
         ? DASHBOARD_BUILD_LEGEND
         : model.selection?.kind === 'harvest'
-          ? DASHBOARD_HARVEST_LEGEND
+          ? model.harvest?.action === 'resume'
+            ? DASHBOARD_HARVEST_RESUME_LEGEND
+            : model.harvest?.action === 'acknowledge'
+              ? DASHBOARD_HARVEST_ACKNOWLEDGE_LEGEND
+              : DASHBOARD_HARVEST_LEGEND
           : DASHBOARD_GLOBAL_LEGEND
     return truncate(paint(legend, 'dim', color), width)
   }
@@ -497,6 +504,9 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
   const autoMergeDefault = model.defaultAutoMerge
     ? paint('auto merge default ON', 'green', color)
     : paint('auto merge default OFF', 'yellow', color)
+  const harvestGate = model.harvestPaused
+    ? paint('harvest OFF', 'yellow', color)
+    : paint('harvest ON', 'green', color)
   const header = truncate(
     `${marker}${[
       paint('Auto Build', 'bold', color),
@@ -508,6 +518,7 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
       ),
       intake,
       autoMergeDefault,
+      harvestGate,
     ].join('  ')}`,
     width,
   )

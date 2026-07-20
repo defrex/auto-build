@@ -28,7 +28,7 @@ import type {
   TerminalOut,
 } from './terminal'
 import type { Config } from '../config/schema'
-import { KERNEL, agentActor } from '../events/envelope'
+import { KERNEL, agentActor, humanActor } from '../events/envelope'
 import { randomUuids, sequentialIds } from '../ids'
 import { reduceHarvest } from '../kernel/harvest'
 import { FakeForge } from '../ports/forge/fake'
@@ -1310,6 +1310,7 @@ type FakeInputKey =
   | 'down'
   | 'auto-merge'
   | 'pause'
+  | 'harvest-gate'
   | 'letter-d'
   | 'interrupt'
   | 'enter'
@@ -1322,6 +1323,8 @@ function fakeInputEvent(key: FakeInputKey): TerminalInputEvent {
       return { type: 'text', text: 'm' }
     case 'pause':
       return { type: 'text', text: 'p' }
+    case 'harvest-gate':
+      return { type: 'text', text: 'h' }
     case 'letter-d':
       return { type: 'text', text: 'd' }
     default:
@@ -1385,6 +1388,14 @@ function fakeTerminal(
     rows: size.rows ?? 40,
     interactive,
   }
+}
+
+function latestDashboardFrame(term: { frames: string[] }): string {
+  return stripAnsi(
+    [...term.frames]
+      .reverse()
+      .find((frame) => stripAnsi(frame).includes('Auto Build')) ?? '',
+  )
 }
 
 /** The longest run of consecutive painted lines the region wrote — i.e. the
@@ -1916,7 +1927,7 @@ describe('abDispatch --once with an interactive terminal', () => {
 })
 
 describe('abDispatch interactive keyboard controls', () => {
-  test('global m toggles the process default; harvest/build controls remain scoped by row', async () => {
+  test('global controls stay scoped, rapid h toggles pending gate intent, and a running Harvest row has no p action', async () => {
     const fx = await makeFixture(
       [
         readyTicket('T-alpha-harvest', { title: 'Alpha work' }),
@@ -1993,30 +2004,45 @@ describe('abDispatch interactive keyboard controls', () => {
         expect(await fx.store.getEvents(slug)).toEqual(beforeBuilds.get(slug)!)
       }
 
+      input.press('harvest-gate')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(beforeRepo.length).some(
+          (event) => event.type === 'harvest.pause-requested',
+        ),
+      )
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest gate: pause requested'),
+      )
+      // A request is not an acknowledgement: the durable header remains ON.
+      expect(stripAnsi(term.all())).toContain('harvest ON')
+
+      input.press('harvest-gate')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(beforeRepo.length).some(
+          (event) => event.type === 'harvest.resume-requested',
+        ),
+      )
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest gate: resume requested'),
+      )
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+
       input.press('down')
       await waitFor(() => /^> .*Harvest/m.test(stripAnsi(term.all())))
       input.press('auto-merge')
       await waitFor(() => stripAnsi(term.all()).includes('Harvest auto-merge unavailable'))
+      const beforeRunningAction = (await fx.store.getRepoEvents(fx.origin)).length
       input.press('pause')
-      await waitFor(async () =>
-        (await fx.store.getRepoEvents(fx.origin)).some(
-          (event) => event.type === 'harvest.pause-requested',
-        ),
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest run has no available action'),
       )
-      await waitFor(() => stripAnsi(term.all()).includes('harvest: pause requested'))
-      await fx.store.appendRepo(fx.origin, {
-        actor: KERNEL,
-        type: 'harvest.paused',
-        payload: {},
-      })
-      await waitFor(() => /Harvest.*PAUSED/.test(stripAnsi(term.all())))
-      input.press('pause')
-      await waitFor(async () =>
-        (await fx.store.getRepoEvents(fx.origin)).some(
-          (event) => event.type === 'harvest.resume-requested',
-        ),
+      expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(
+        beforeRunningAction,
       )
-      await waitFor(() => stripAnsi(term.all()).includes('harvest: resume requested'))
       expect(stripAnsi(term.all())).toContain('intake ON')
 
       const repoAdded = (await fx.store.getRepoEvents(fx.origin)).slice(
@@ -2024,14 +2050,14 @@ describe('abDispatch interactive keyboard controls', () => {
       )
       expect(repoAdded.map((event) => event.type)).toEqual([
         'harvest.pause-requested',
-        'harvest.paused',
         'harvest.resume-requested',
+        'harvest.resumed',
       ])
       expect(repoAdded[0]?.actor).toEqual({
         kind: 'human',
         user: 'harvest-op',
       })
-      expect(repoAdded[2]?.actor).toEqual({
+      expect(repoAdded[1]?.actor).toEqual({
         kind: 'human',
         user: 'harvest-op',
       })
@@ -2066,6 +2092,73 @@ describe('abDispatch interactive keyboard controls', () => {
         (event) => event.actor.kind === 'human' && event.actor.user === 'harvest-op',
       )).toBe(true)
     } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('a fresh dispatcher reads the durable harvest gate and h changes only after acknowledgement', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal(true, { columns: 180 })
+    const input = fakeInput()
+    let run: Promise<void> | undefined
+    try {
+      await fx.store.ensureRepo(fx.origin)
+      await fx.store.appendRepo(fx.origin, {
+        actor: humanActor('prior-operator'),
+        type: 'harvest.pause-requested',
+        payload: {},
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.paused',
+        payload: {},
+      })
+      const before = (await fx.store.getRepoEvents(fx.origin)).length
+
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: { USER: 'current-operator' },
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 60_000,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      await waitFor(() => latestDashboardFrame(term).includes('harvest OFF'))
+      expect(latestDashboardFrame(term)).not.toMatch(/^  Harvest/m)
+
+      input.press('harvest-gate')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(before).some(
+          (event) => event.type === 'harvest.resume-requested',
+        ),
+      )
+      await waitFor(() =>
+        latestDashboardFrame(term).includes('harvest gate: resume requested'),
+      )
+      expect(latestDashboardFrame(term)).toContain('harvest OFF')
+      const request = (await fx.store.getRepoEvents(fx.origin)).at(-1)
+      expect(request?.actor).toEqual({
+        kind: 'human',
+        user: 'current-operator',
+      })
+
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+      await waitFor(() => latestDashboardFrame(term).includes('harvest ON'))
+
+      input.press('interrupt')
+      await run
+      run = undefined
+      expect(fx.err).toEqual([])
+    } finally {
+      input.press('interrupt')
+      await run?.catch(() => {})
       await fx.cleanup()
     }
   }, 30_000)
@@ -2214,7 +2307,91 @@ describe('abDispatch interactive keyboard controls', () => {
     }
   }, 30_000)
 
-  test('p acknowledges exhausted harvest attention, but does not reinterpret escalation', async () => {
+  test('Harvest p resumes an ordinary failed run and never emits a pause', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const input = fakeInput()
+    let run: Promise<void> | undefined
+    try {
+      await fx.store.ensureRepo(fx.origin)
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.started',
+        payload: {
+          run: 'harvest_failed',
+          observations: [{ build: 'observed-build', seq: 1 }],
+          scan: { kind: 'harvest-scan', rev: 0 },
+        },
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.failed',
+        payload: {
+          run: 'harvest_failed',
+          step: 'synthesize',
+          round: 1,
+          attempt: 1,
+          error: 'provider unavailable',
+          willRetry: false,
+        },
+      })
+      expect(
+        await fx.store.claimRepoLease(
+          fx.origin,
+          'other-dispatcher',
+          3_600_000,
+        ),
+      ).toBe(true)
+      const before = (await fx.store.getRepoEvents(fx.origin)).length
+
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: { USER: 'failure-op' },
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 60_000,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      await waitFor(() => /Harvest.*FAILED/.test(latestDashboardFrame(term)))
+      input.press('down')
+      await waitFor(() => /^> .*Harvest.*FAILED/m.test(latestDashboardFrame(term)))
+      input.press('pause')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(before).some(
+          (event) => event.type === 'harvest.resume-requested',
+        ),
+      )
+      const added = (await fx.store.getRepoEvents(fx.origin)).slice(before)
+      expect(added.map((event) => event.type)).toEqual([
+        'harvest.resume-requested',
+      ])
+      expect(added[0]?.actor).toEqual({ kind: 'human', user: 'failure-op' })
+      expect(added.some((event) => event.type === 'harvest.pause-requested')).toBe(
+        false,
+      )
+
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+      await waitFor(() => /Harvest.*RUNNING/.test(latestDashboardFrame(term)))
+
+      input.press('interrupt')
+      await run
+      run = undefined
+      expect(fx.err).toEqual([])
+    } finally {
+      input.press('interrupt')
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('Harvest p acknowledges exhaustion and escalation without ever toggling the gate', async () => {
     const fx = await makeFixture([], happyHandlers())
     const term = fakeTerminal()
     const input = fakeInput()
@@ -2311,15 +2488,33 @@ describe('abDispatch interactive keyboard controls', () => {
         'harvest.resume-requested',
       ])
       expect(added[0]?.actor).toEqual({ kind: 'human', user: 'error-op' })
+      expect(added.some((event) => event.type === 'harvest.pause-requested')).toBe(
+        false,
+      )
 
-      // Settle the attention acknowledgement, then stop a later run by
-      // deliberate escalation. On that state p controls only the repository
-      // pause gate and never treats escalation as recoverable infrastructure.
+      // A second p while the request is pending is a no-op.
+      input.press('pause')
+      await waitFor(() =>
+        stripAnsi(term.all()).includes('harvest run: resume acknowledgement pending'),
+      )
+      expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(before + 1)
+
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
         type: 'harvest.resumed',
         payload: {},
       })
+      await waitFor(() => {
+        const latest = [...term.frames]
+          .reverse()
+          .find((frame) => stripAnsi(frame).includes('Auto Build'))
+        return latest !== undefined &&
+          !/Harvest.*FAILED/.test(stripAnsi(latest)) &&
+          /^> Auto Build/m.test(stripAnsi(latest))
+      })
+
+      // A deliberate escalation uses the same run-attention request and stays
+      // visible until the kernel acknowledges that exact post-terminal fact.
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
         type: 'harvest.started',
@@ -2340,26 +2535,220 @@ describe('abDispatch interactive keyboard controls', () => {
         },
       })
       await waitFor(() => /Harvest.*ESCALATED/.test(stripAnsi(term.all())))
+      input.press('down')
+      await waitFor(() => /^> .*Harvest.*ESCALATED/m.test(stripAnsi(term.all())))
       const beforeEscalatedAction = (await fx.store.getRepoEvents(fx.origin)).length
       input.press('pause')
       await waitFor(async () =>
         (await fx.store.getRepoEvents(fx.origin))
           .slice(beforeEscalatedAction)
-          .some((event) => event.type === 'harvest.pause-requested'),
+          .some((event) => event.type === 'harvest.resume-requested'),
       )
       added = (await fx.store.getRepoEvents(fx.origin)).slice(
         beforeEscalatedAction,
       )
       expect(added.map((event) => event.type)).toEqual([
-        'harvest.pause-requested',
+        'harvest.resume-requested',
       ])
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest: pause requested'),
+      expect(added.some((event) => event.type === 'harvest.pause-requested')).toBe(
+        false,
       )
+      await waitFor(() =>
+        stripAnsi(term.all()).includes(
+          'harvest: escalation acknowledgement requested',
+        ),
+      )
+      expect(stripAnsi(term.all())).toMatch(/Harvest.*ESCALATED/)
+
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+      await waitFor(() => {
+        const latest = [...term.frames]
+          .reverse()
+          .find((frame) => stripAnsi(frame).includes('Auto Build'))
+        return latest !== undefined &&
+          !/Harvest.*ESCALATED/.test(stripAnsi(latest)) &&
+          /^> Auto Build/m.test(stripAnsi(latest))
+      })
 
       input.press('interrupt')
       await run
       expect(fx.cliErrors).toEqual([])
+      expect(fx.err).toEqual([])
+    } finally {
+      input.press('interrupt')
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('a paused gate routes run attention to header h, whose acknowledgement also dismisses escalation', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal(true, { columns: 180 })
+    const input = fakeInput()
+    let run: Promise<void> | undefined
+    try {
+      await fx.store.ensureRepo(fx.origin)
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.started',
+        payload: {
+          run: 'harvest_paused_escalation',
+          observations: [{ build: 'observed-build', seq: 1 }],
+          scan: { kind: 'harvest-scan', rev: 0 },
+        },
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.escalated',
+        payload: {
+          run: 'harvest_paused_escalation',
+          source: 'agent',
+          reason: 'human judgment required',
+          observations: [{ build: 'observed-build', seq: 1 }],
+        },
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: humanActor('prior-operator'),
+        type: 'harvest.pause-requested',
+        payload: {},
+      })
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.paused',
+        payload: {},
+      })
+      const before = (await fx.store.getRepoEvents(fx.origin)).length
+
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: { USER: 'attention-op' },
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 60_000,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      await waitFor(() => {
+        const frame = latestDashboardFrame(term)
+        return frame.includes('harvest OFF') && /Harvest.*ESCALATED/.test(frame)
+      })
+      input.press('down')
+      await waitFor(() =>
+        /^> .*Harvest.*ESCALATED/m.test(latestDashboardFrame(term)),
+      )
+      input.press('pause')
+      await waitFor(() =>
+        latestDashboardFrame(term).includes(
+          'harvest run action unavailable while harvest is OFF; select Dispatcher and press h',
+        ),
+      )
+      expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(before)
+
+      input.press('up')
+      await waitFor(() => /^> Auto Build/m.test(latestDashboardFrame(term)))
+      input.press('harvest-gate')
+      await waitFor(async () =>
+        (await fx.store.getRepoEvents(fx.origin)).slice(before).some(
+          (event) => event.type === 'harvest.resume-requested',
+        ),
+      )
+      expect(latestDashboardFrame(term)).toContain('harvest OFF')
+      const request = (await fx.store.getRepoEvents(fx.origin)).at(-1)
+      expect(request?.actor).toEqual({ kind: 'human', user: 'attention-op' })
+
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.resumed',
+        payload: {},
+      })
+      await waitFor(() => {
+        const frame = latestDashboardFrame(term)
+        return frame.includes('harvest ON') &&
+          !/Harvest.*ESCALATED/.test(frame) &&
+          /^> Auto Build/m.test(frame)
+      })
+
+      input.press('interrupt')
+      await run
+      run = undefined
+      expect(fx.err).toEqual([])
+    } finally {
+      input.press('interrupt')
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('completion removes a selected Harvest row and reconciles selection to global', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const input = fakeInput()
+    let run: Promise<void> | undefined
+    try {
+      await fx.store.ensureRepo(fx.origin)
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.started',
+        payload: {
+          run: 'harvest_completing',
+          observations: [{ build: 'observed-build', seq: 1 }],
+          scan: { kind: 'harvest-scan', rev: 0 },
+        },
+      })
+      expect(
+        await fx.store.claimRepoLease(
+          fx.origin,
+          'other-dispatcher',
+          3_600_000,
+        ),
+      ).toBe(true)
+
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 60_000,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      await waitFor(() => /Harvest.*RUNNING/.test(latestDashboardFrame(term)))
+      input.press('down')
+      await waitFor(() => /^> .*Harvest/m.test(latestDashboardFrame(term)))
+
+      await fx.store.appendRepo(fx.origin, {
+        actor: KERNEL,
+        type: 'harvest.completed',
+        payload: {
+          run: 'harvest_completing',
+          dispositions: [
+            {
+              occurrence: { build: 'observed-build', seq: 1 },
+              action: 'suppressed',
+              proposalKey: 'suppressed:observed-build:1',
+            },
+          ],
+          report: { kind: 'harvest-report', rev: 0 },
+        },
+      })
+      await waitFor(() => {
+        const frame = latestDashboardFrame(term)
+        return !/^> .*Harvest/m.test(frame) &&
+          !/^  Harvest/m.test(frame) &&
+          /^> Auto Build/m.test(frame)
+      })
+
+      input.press('interrupt')
+      await run
+      run = undefined
       expect(fx.err).toEqual([])
     } finally {
       input.press('interrupt')

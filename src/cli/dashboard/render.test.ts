@@ -81,6 +81,7 @@ function model(builds: DashboardBuild[]): DashboardModel {
     capacity: 2,
     drained: false,
     defaultAutoMerge: false,
+    harvestPaused: false,
     statusLine: '',
     builds,
   }
@@ -89,7 +90,7 @@ function model(builds: DashboardBuild[]): DashboardModel {
 const WIDE = { color: false, width: 200 }
 
 describe('renderDashboard: the title and status rows', () => {
-  test('one title names the product, repo basename, mode, capacity, count, intake, and auto-merge default', () => {
+  test('one title names the product, repo, capacity, and all three dispatcher controls', () => {
     const lines = rd(model([build()]), WIDE)
     const header = lines[0]!
     expect(header).toContain('Auto Build')
@@ -100,6 +101,7 @@ describe('renderDashboard: the title and status rows', () => {
     expect(header).toContain('1 active')
     expect(header).toContain('intake ON')
     expect(header).toContain('auto merge default OFF')
+    expect(header).toContain('harvest ON')
     expect(lines.slice(0, -1).join('\n')).not.toContain('Ctrl-C to stop')
   })
 
@@ -138,13 +140,26 @@ describe('renderDashboard: the title and status rows', () => {
     expect(header).toContain('once')
   })
 
-  test('process defaults render explicit ON/OFF state', () => {
+  test('process defaults and the acknowledged durable gate render explicit ON/OFF state', () => {
     expect(rd({ ...model([]), drained: true }, WIDE)[0]).toContain('intake OFF')
     expect(rd(model([]), WIDE)[0]).toContain('intake ON')
     expect(rd(model([]), WIDE)[0]).toContain('auto merge default OFF')
     expect(
       rd({ ...model([]), defaultAutoMerge: true }, WIDE)[0],
     ).toContain('auto merge default ON')
+    expect(rd(model([]), WIDE)[0]).toContain('harvest ON')
+    expect(rd({ ...model([]), harvestPaused: true }, WIDE)[0]).toContain(
+      'harvest OFF',
+    )
+    expect(
+      rd(model([]), { color: true, width: 200 })[0],
+    ).toContain('\x1b[32mharvest ON\x1b[0m')
+    expect(
+      rd(
+        { ...model([]), harvestPaused: true },
+        { color: true, width: 200 },
+      )[0],
+    ).toContain('\x1b[33mharvest OFF\x1b[0m')
   })
 
   test('the header is the selected global row even with no harvest or builds', () => {
@@ -163,11 +178,10 @@ describe('renderDashboard: the title and status rows', () => {
       WIDE,
     )
     expect(globalLines.at(-1)).toBe(
-      'Keys: Up/Down select  m auto-merge default  p intake on/off  Ctrl-C quit',
+      'Keys: Up/Down select  h harvest on/off  m auto-merge default  p intake on/off  Ctrl-C quit',
     )
-    expect(globalLines.at(-1)).toContain('m auto-merge default')
 
-    const harvestLines = rd(
+    const runningHarvestLines = rd(
       {
         ...model([build()]),
         harvest: harvest(),
@@ -175,10 +189,33 @@ describe('renderDashboard: the title and status rows', () => {
       },
       WIDE,
     )
-    expect(harvestLines.at(-1)).toBe(
-      'Keys: Up/Down select  p pause/resume  Ctrl-C quit',
+    expect(runningHarvestLines.at(-1)).toBe(
+      'Keys: Up/Down select  Ctrl-C quit',
     )
-    expect(harvestLines.at(-1)).not.toContain('m auto-merge')
+
+    const resumeHarvestLines = rd(
+      {
+        ...model([build()]),
+        harvest: harvest({ status: 'failed', action: 'resume' }),
+        selection: { kind: 'harvest' },
+      },
+      WIDE,
+    )
+    expect(resumeHarvestLines.at(-1)).toBe(
+      'Keys: Up/Down select  p resume  Ctrl-C quit',
+    )
+
+    const acknowledgeHarvestLines = rd(
+      {
+        ...model([build()]),
+        harvest: harvest({ status: 'escalated', action: 'acknowledge' }),
+        selection: { kind: 'harvest' },
+      },
+      WIDE,
+    )
+    expect(acknowledgeHarvestLines.at(-1)).toBe(
+      'Keys: Up/Down select  p acknowledge  Ctrl-C quit',
+    )
 
     const buildLines = rd(
       {
@@ -190,9 +227,23 @@ describe('renderDashboard: the title and status rows', () => {
     expect(buildLines.at(-1)).toBe(
       'Keys: Up/Down select  m auto-merge  p pause/resume  Ctrl-C quit',
     )
-    for (const controls of [globalLines.at(-1), harvestLines.at(-1), buildLines.at(-1)]) {
+    for (const controls of [
+      globalLines.at(-1),
+      runningHarvestLines.at(-1),
+      resumeHarvestLines.at(-1),
+      acknowledgeHarvestLines.at(-1),
+      buildLines.at(-1),
+    ]) {
       expect(controls).toContain('Up/Down select')
       expect(controls).toContain('Ctrl-C quit')
+    }
+    for (const runControls of [
+      runningHarvestLines.at(-1),
+      resumeHarvestLines.at(-1),
+      acknowledgeHarvestLines.at(-1),
+    ]) {
+      expect(runControls).not.toContain('harvest on/off')
+      expect(runControls).not.toContain('pause')
     }
   })
 })
