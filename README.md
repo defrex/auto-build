@@ -909,12 +909,15 @@ It three-way merges each skill with `git merge-file`:
 | `unknown` | An installed `ab-*` skill that is not in the distribution. Left alone; local additions are legitimate. |
 
 `ab upgrade` never deletes anything. It invokes the optional `[roles.upgrade]`
-tool-free one-shot only when `git merge-file` reports a conflict. The agent's
-text is an untrusted proposal: Autobuild requires the same namespaced skill
-frontmatter, rejects Git marker lines and wrapped/prose output, and verifies
-that every already-clean merge region remains exact and ordered before either
-file is written. This is what makes `resolved` safe while preserving the
-standing bias toward local customization.
+tool-free one-shot only when `git merge-file` reports a conflict, under a fixed
+caller-owned deadline. The agent's text is an untrusted proposal: Autobuild
+requires the same namespaced skill frontmatter and verifies that every
+already-clean merge region remains exact and ordered before either file is
+written. Per-merge unguessable Git labels keep marker-looking skill content from
+being parsed as merge structure; standard marker lines are rejected only in the
+agent-authored conflict-hunk gaps, so existing documentation examples remain
+protected content rather than making resolution impossible. This is what makes
+`resolved` safe while preserving the standing bias toward local customization.
 
 **If the outcome is `conflicted`:** merge by hand against the pristine record —
 `.agents/skills/.ab-pristine/ab-<name>/SKILL.md` holds the bytes you started

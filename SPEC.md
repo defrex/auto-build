@@ -1697,12 +1697,15 @@ a repo:
 pristine version of each installed skill; `ab upgrade` three-way merges
 (pristine base × local edits × new default). A merge conflict routes the
 non-phase, tool-free `upgrade` one-shot role through the normal runtime/model
-resolver, with a standing bias: **prefer the local customization** — upstream
-changes are adopted where they don't collide with what the repo deliberately
-changed. The agent output is only an untrusted full-file proposal. Deterministic
-code validates the same installed-skill identity, absence of conflict-marker
-lines, and exact preservation/order of every already-clean merge region before
-either live nor pristine is written. A validated proposal produces `resolved`
+resolver under a fixed caller-owned deadline, with a standing bias: **prefer
+the local customization** — upstream changes are adopted where they don't
+collide with what the repo deliberately changed. The agent output is only an
+untrusted full-file proposal. Each merge uses unguessable labels so literal
+marker-looking skill content cannot be parsed as structure. Deterministic code
+validates the same installed-skill identity, exact preservation/order of every
+already-clean merge region, and absence of standard marker lines in the
+agent-authored conflict-hunk gaps before either live or pristine is written. A
+validated proposal produces `resolved`
 and advances pristine to incoming. Unavailable or failed judgment, explicit
 ambiguity/decline, or invalid output produces `conflicted`: live and pristine
 remain byte-untouched, the marked merge remains report-only, and the CLI names

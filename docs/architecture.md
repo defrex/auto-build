@@ -257,9 +257,11 @@ have no mutation path and are never re-slugged.
 
 On a vendored-skill merge conflict, `src/cli/upgrade-agent.ts` lazily loads the
 target config, resolves the `upgrade` role, and sends pristine/local/incoming
-bytes to the selected one-shot with extensions and tools unavailable. It
-returns either full-file text or one explicit decline token. It owns no files;
-`src/cli/upgrade.ts` treats that output only as an untrusted proposal.
+bytes to the selected one-shot with extensions and tools unavailable. A fixed
+caller-owned timer races the completion and aborts its signal, so an ignored or
+stalled provider cannot hold the command forever. It returns either full-file
+text or one explicit decline token. It owns no files; `src/cli/upgrade.ts`
+treats that output only as an untrusted proposal.
 
 ## Agent session command environment
 
@@ -345,13 +347,18 @@ including under `--force`.
 ## Skill upgrade boundary
 
 `src/cli/upgrade.ts` owns the pristine × local × incoming merge and all
-filesystem effects. A clean `git merge-file` result is deterministic. For a
-conflict, the optional resolver receives the three exact texts but its returned
-file is accepted only when it has nonempty YAML frontmatter naming the same
-installed `ab-*` skill, contains no standard Git marker line, and retains every
-marker-free region from the failed merge exactly and in order. Validation runs
-before either write. A valid local-biased proposal writes live and advances
-pristine to the exact incoming bytes as `resolved`.
+filesystem effects. Every `git merge-file` call gets cryptographically random
+local/pristine/incoming labels; only those exact start/end lines delimit its
+conflicts, so ordinary skill text such as `<<<<<<< local` remains protected
+content. A clean result is deterministic. For a conflict, the optional resolver
+receives the three exact texts but its returned file is accepted only when it
+has nonempty YAML frontmatter naming the same installed `ab-*` skill and retains
+every region outside the uniquely labelled hunks exactly and in order. Standard
+marker lines are rejected in the remaining agent-authored hunk gaps; identical
+marker-looking lines inside protected clean intervals are permitted because
+they predated resolution. Validation runs before either write. A valid
+local-biased proposal writes live and advances pristine to the exact incoming
+bytes as `resolved`.
 
 Resolver absence, explicit decline, provider/config/capability failure, and
 invalid output all converge on `conflicted`. The exception is caught per skill,

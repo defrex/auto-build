@@ -488,10 +488,14 @@ Outcomes:
 | `installed` | In the distribution but not yet in the repo — installed fresh, like init. |
 | `unknown` | An installed `ab-*` skill absent from the distribution. **Left alone** — local skill additions are legitimate. |
 
-The agent output is only an untrusted proposal. `ab upgrade` requires a complete
-skill with the same namespaced frontmatter, no Git marker lines, and every
-already-clean merge region unchanged and in order before either file is written.
-A rejected proposal remains report-only alongside the marked merge diagnostic;
+The agent runs under a fixed caller-owned deadline, and its output is only an
+untrusted proposal. Each merge uses unguessable labels so marker-looking skill
+content cannot impersonate that merge's structure. `ab upgrade` requires a
+complete skill with the same namespaced frontmatter and every region outside the
+uniquely labelled conflict hunks unchanged and in order; standard marker lines
+are rejected in agent-authored hunk gaps but allowed when already protected as
+exact clean content. Validation finishes before either file is written. A
+rejected proposal remains report-only alongside the marked merge diagnostic;
 the CLI prints the exact pristine path to merge by hand. Local customization
 survives upgrades, and divergence is visible instead of silent.
 
