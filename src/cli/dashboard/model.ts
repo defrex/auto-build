@@ -877,24 +877,27 @@ export function projectHarvest(
   return projectRepositoryHarvest(events).harvest
 }
 
-/** Every active build, sorted by slug — a stable frame, so a redraw never
- * reorders rows under the operator's eyes. */
-export function buildDashboard(
-  entries: { record: BuildRecord; state: BuildState; events: AbEvent[] }[],
-  config: Config,
-  header: {
-    repo: string
-    capacity: number
-    selection?: DashboardSelection
-    statusLine?: string
-    resumeInput?: ResumeInputView
-  },
+export interface DashboardHeader {
+  repo: string
+  capacity: number
+  selection?: DashboardSelection
+  statusLine?: string
+  resumeInput?: ResumeInputView
+}
+
+/**
+ * Compose a frame from already projected active rows. Keeping repository
+ * projection here means build rows (including their phase intervals) may be
+ * cached without caching dispatcher settings or Harvest state.
+ */
+export function buildDashboardFromProjected(
+  projectedBuilds: readonly DashboardBuild[],
+  header: DashboardHeader,
   repositoryEvents: RepositoryEvent[] = [],
 ): DashboardModel {
-  const builds = entries
-    .map(({ record, state, events }) => projectBuild(record, state, config, events))
-    .filter((build): build is DashboardBuild => build !== null)
-    .sort((a, b) => a.slug.localeCompare(b.slug))
+  const builds = [...projectedBuilds].sort((a, b) =>
+    a.slug.localeCompare(b.slug),
+  )
   const harvestProjection = projectRepositoryHarvest(repositoryEvents)
   const settings = reduceDispatchSettings(repositoryEvents)
   return {
@@ -911,4 +914,17 @@ export function buildDashboard(
       ? { harvest: harvestProjection.harvest }
       : {}),
   }
+}
+
+/** Existing entry-based convenience for uncached callers and projection tests. */
+export function buildDashboard(
+  entries: { record: BuildRecord; state: BuildState; events: AbEvent[] }[],
+  config: Config,
+  header: DashboardHeader,
+  repositoryEvents: RepositoryEvent[] = [],
+): DashboardModel {
+  const builds = entries
+    .map(({ record, state, events }) => projectBuild(record, state, config, events))
+    .filter((build): build is DashboardBuild => build !== null)
+  return buildDashboardFromProjected(builds, header, repositoryEvents)
 }

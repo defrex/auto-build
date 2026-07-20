@@ -32,7 +32,13 @@ import { verifyPhase } from '../../ontology'
 import { steppingClock } from '../../testing/fixed'
 import { MemoryBuildStore } from '../../store/memory'
 import type { BuildRecord } from '../../store/types'
-import { buildDashboard, projectBuild, type DashboardBuild, type PipelineStep } from './model'
+import {
+  buildDashboard,
+  buildDashboardFromProjected,
+  projectBuild,
+  type DashboardBuild,
+  type PipelineStep,
+} from './model'
 
 const BUILD = 'auth-rate-limit'
 
@@ -407,6 +413,28 @@ describe('projectBuild: the active-build filter', () => {
       statusLine: '',
     })
     expect('mode' in model).toBe(false)
+
+    const alpha = projectBuild(
+      { ...RECORD, slug: 'alpha' },
+      active,
+      CONFIG,
+      activeLog,
+    )
+    const zebra = projectBuild(
+      { ...RECORD, slug: 'zebra' },
+      active,
+      CONFIG,
+      activeLog,
+    )
+    if (alpha === null || zebra === null) throw new Error('expected active rows')
+    const preprojected = buildDashboardFromProjected(
+      [zebra, alpha],
+      { repo: '/repos/app', capacity: 2 },
+    )
+    expect(preprojected).toEqual(model)
+    expect(preprojected.builds[0]).toBe(alpha)
+    expect(preprojected.builds[1]).toBe(zebra)
+
     const settings = buildDashboard(
       [],
       CONFIG,

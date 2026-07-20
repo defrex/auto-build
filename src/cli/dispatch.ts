@@ -38,13 +38,14 @@ import {
   DEFAULT_MAX_HARVEST_RECOVERY_ATTEMPTS,
   reduceHarvest,
 } from '../kernel/harvest'
-import { reduceBuild, type BuildState } from '../kernel/reducer'
+import type { BuildState } from '../kernel/reducer'
 import {
-  buildDashboard,
+  buildDashboardFromProjected,
   projectHarvest,
   type DashboardModel,
   type DashboardSelection,
 } from './dashboard/model'
+import { DashboardBuildPollCache } from './dashboard/poll'
 import {
   renderDashboard,
   type DashboardRendererResolver,
@@ -113,11 +114,12 @@ function definedEnv(env: Record<string, string | undefined>): Record<string, str
   return defined
 }
 
-/** Dashboard redraw cadence. `listBuilds` is not subscribable, so polling the
- * list is the honest mechanism; the identical-frame check in `live.ts` makes a
- * poll that finds nothing new cost zero writes. Near subscribe's
- * DEFAULT_POLL_MS (store/subscribe.ts:10) — a pure knob: raise it if a
- * RemoteBuildStore makes each frame's HTTP calls bite. */
+/** Dashboard store-read cadence. `listBuilds` remains the discovery read;
+ * the process-local display cache then polls only nonterminal streams with
+ * `getEvents(lastSeq)`, suppresses terminal streams, and reuses unchanged
+ * reductions/timing projections. Repository controls and Harvest are still
+ * read fresh. The identical-frame check in `live.ts` makes an unchanged paint
+ * cost zero terminal writes. */
 const DASHBOARD_POLL_MS = 500
 
 /** Dashboard repaint (not re-read) cadence in watch mode. A running step's
@@ -343,7 +345,9 @@ class DispatchLoop {
    */
   private readonly dashboard: boolean
   private readonly region: LiveRegion | undefined
-  /** Guard against overlapping polls, exactly as pollingSubscribe does. */
+  /** One display-only incremental build cache for this dispatch process. */
+  private readonly dashboardBuilds: DashboardBuildPollCache
+  /** Guard against overlapping timer polls, exactly as pollingSubscribe does. */
   private rendering = false
   private timer: ReturnType<typeof setInterval> | undefined
   /** Watch-mode paint timer (AC 8): repaints the CACHED model against a fresh
@@ -377,6 +381,11 @@ class DispatchLoop {
     this.dashboard = opts.terminal?.interactive === true && opts.plain !== true
     this.region =
       this.dashboard && opts.terminal !== undefined ? new LiveRegion(opts.terminal) : undefined
+    this.dashboardBuilds = new DashboardBuildPollCache(
+      wiring.store,
+      opts.targetRepo,
+      config,
+    )
 
     // `slug` is an internal pre-build role on the same runtime/model resolver. A
     // runtime without the optional capability is normal: omit the seam and let
@@ -1137,33 +1146,39 @@ class DispatchLoop {
   // ── The live region ───────────────────────────────────────────────────────
 
   /**
-   * The store READ half of a frame: read every build this repo owns, reduce
-   * each, project into a cached model, then paint it. Read-only — it appends
-   * nothing and decides nothing. Paint is split out so the watch-mode tick timer
-   * can repaint the cached model against a moving clock without re-reading.
+   * The store READ half of a frame: discover builds, incrementally refresh only
+   * nonterminal streams, combine their cached projections with a fresh
+   * repository-journal projection, then paint. Read-only — it appends nothing
+   * and decides nothing. Paint is split out so the watch-mode tick timer can
+   * repaint cached timing against a moving clock without re-reading.
    */
   private async renderOnce(): Promise<void> {
     const { terminal } = this.opts
     if (this.region === undefined || terminal === undefined) return
-    const records = await this.wiring.store.listBuilds()
-    const entries = []
-    for (const record of records) {
-      // §12 scoping, mirroring the dispatcher: a shared store holds other
-      // repos' builds, and aggregating across repos is out of scope.
-      if (record.repo !== this.opts.targetRepo) continue
-      const events = await this.wiring.store.getEvents(record.slug)
-      entries.push({ record, state: reduceBuild(events), events })
-    }
+    const buildSnapshot = await this.dashboardBuilds.refresh()
+    const repoRecord = await this.wiring.store.getRepo(this.opts.targetRepo)
+    const repositoryEvents =
+      repoRecord === null
+        ? []
+        : await this.wiring.store.getRepoEvents(this.opts.targetRepo)
+
+    // Action-triggered and timer refreshes share the cache but may finish their
+    // repository reads out of order. Never let an older build snapshot replace
+    // one that committed later.
+    if (!this.dashboardBuilds.isCurrent(buildSnapshot)) return
+
     // Polling continues while the operator types. Keep the prompt bound to the
     // captured build/escalations, shrink it around externally answered ids, and
     // clear it rather than ever retargeting feedback to a newly selected row.
     if (this.resumePrompt !== undefined) {
       const prompt = this.resumePrompt
-      const entry = entries.find((item) => item.record.slug === prompt.slug)
+      const state = buildSnapshot.states.get(prompt.slug)
       const active =
-        entry !== undefined &&
-        ['running', 'paused', 'blocked'].includes(entry.state.status)
-      const openIds = new Set(entry?.state.openEscalations.map((item) => item.id) ?? [])
+        state !== undefined &&
+        ['running', 'paused', 'blocked'].includes(state.status)
+      const openIds = new Set(
+        state?.openEscalations.map((item) => item.id) ?? [],
+      )
       const remaining = prompt.escalationIds.filter((id) => openIds.has(id))
       if (!active || remaining.length === 0) {
         this.resumePrompt = undefined
@@ -1175,14 +1190,8 @@ class DispatchLoop {
     const previousRows = this.model === undefined
       ? []
       : dashboardSelections(this.model)
-    const repoRecord = await this.wiring.store.getRepo(this.opts.targetRepo)
-    const repositoryEvents =
-      repoRecord === null
-        ? []
-        : await this.wiring.store.getRepoEvents(this.opts.targetRepo)
-    const projected = buildDashboard(
-      entries,
-      this.config,
+    const projected = buildDashboardFromProjected(
+      buildSnapshot.builds,
       {
         repo: this.opts.targetRepo,
         capacity: this.config.dispatcher.capacity,
