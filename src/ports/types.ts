@@ -192,7 +192,7 @@ export interface Forge {
   readonly name: string
   /** Optional because another forge may support PRs but not public frame assets. */
   readonly dashboardFrames?: DashboardFrameHosting
-  /** Push a local branch to the remote (from the workspace's working copy). */
+  /** Publish the workspace's current HEAD to this remote destination branch. */
   pushBranch(workspacePath: string, branch: string): Promise<void>
   openPr(opts: {
     workspacePath: string
