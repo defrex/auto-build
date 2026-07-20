@@ -102,7 +102,7 @@ readyLabels = []                 # labels that additionally narrow readiness ([]
 # in before claim() moves them to "In Progress". Matched case-sensitively.
 readyState = "Todo"
 claimedState = "In Progress"    # workflow state claim() moves an issue to
-createState = "Backlog"         # state new tickets are filed into (absent = provider default)
+createState = "Todo"         # state new tickets are filed into (absent = provider default)
 triageState = "Backlog"         # where bounced/aborted/closed-unmerged tickets return (team AUT has Triage disabled; "Backlog" is also the linear default)
 # — or file-based: source = "file" with readyState = "ready" and optional dir = "tickets"
 
