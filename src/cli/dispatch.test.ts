@@ -28,7 +28,7 @@ import type {
   TerminalOut,
 } from './terminal'
 import type { Config } from '../config/schema'
-import { KERNEL, agentActor, humanActor } from '../events/envelope'
+import { DISPATCHER, KERNEL, agentActor, humanActor } from '../events/envelope'
 import { randomUuids, sequentialIds } from '../ids'
 import { reduceDispatchSettings } from '../kernel/dispatch-settings'
 import { reduceHarvest } from '../kernel/harvest'
@@ -1430,7 +1430,10 @@ function fakeInputEvent(key: FakeInputKey): TerminalInputEvent {
 }
 
 /** A TerminalInput that records lifecycle and can send text/editing events. */
-function fakeInput(initial: FakeInputKey[] = []): TerminalInput & {
+function fakeInput(
+  initial: FakeInputKey[] = [],
+  onCleanup: () => void = () => {},
+): TerminalInput & {
   press: (key: FakeInputKey) => void
   text: (text: string) => void
   starts: number
@@ -1450,6 +1453,7 @@ function fakeInput(initial: FakeInputKey[] = []): TerminalInput & {
         cleaned = true
         input.cleanups += 1
         onInput = undefined
+        onCleanup()
       }
     },
     press(key: FakeInputKey): void {
@@ -1460,6 +1464,20 @@ function fakeInput(initial: FakeInputKey[] = []): TerminalInput & {
     },
   }
   return input
+}
+
+function deferred(): {
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: unknown) => void
+} {
+  let resolve!: () => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
@@ -1571,6 +1589,275 @@ describe('abDispatch --once with an interactive terminal', () => {
       expect(painted).not.toContain(`one pass over ${fx.origin}`)
       expect(painted).not.toContain('Ctrl-C to stop')
     } finally {
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('shutdown joins an older poll before reading and copying the final frame', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    const term = fakeTerminal()
+    const oldPoll = deferred()
+    const oldPollStarted = deferred()
+    const finalRead = deferred()
+    const finalReadStarted = deferred()
+    const teardownStarted = deferred()
+    let tearingDown = false
+    let finalReads = 0
+    const input = fakeInput([], () => {
+      tearingDown = true
+      teardownStarted.resolve()
+    })
+    const originalListBuilds = fx.store.listBuilds.bind(fx.store)
+    let firstRead = true
+    fx.store.listBuilds = async () => {
+      if (firstRead) {
+        firstRead = false
+        const staleSnapshot = await originalListBuilds()
+        oldPollStarted.resolve()
+        await oldPoll.promise
+        return staleSnapshot
+      }
+      if (tearingDown) {
+        finalReads += 1
+        finalReadStarted.resolve()
+        await finalRead.promise
+      }
+      return originalListBuilds()
+    }
+
+    let run: Promise<void> | undefined
+    try {
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        once: true,
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+
+      await oldPollStarted.promise
+      await teardownStarted.promise
+      // Let the teardown continuation run. Without the join, its final read
+      // crosses the fence immediately while the older snapshot is unresolved.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(finalReads).toBe(0)
+
+      const slug = 'newest-shutdown-state'
+      const ticket = {
+        source: 'fake',
+        id: 'T-newest-shutdown-state',
+        title: 'Newest shutdown state',
+      }
+      await fx.store.createBuild({
+        slug,
+        repo: fx.origin,
+        ticket,
+        branch: `ab/${slug}`,
+      })
+      await fx.store.append(slug, {
+        actor: DISPATCHER,
+        type: 'build.created',
+        payload: { ticket, repo: fx.origin, baseBranch: 'main' },
+      })
+      await fx.store.append(slug, {
+        actor: KERNEL,
+        type: 'runner.attached',
+        payload: { instance: 'shutdown-test', host: 'test-host' },
+      })
+
+      oldPoll.resolve()
+      await finalReadStarted.promise
+      expect(finalReads).toBe(1)
+      finalRead.resolve()
+      await run
+      run = undefined
+
+      const copied = latestDashboardFrame(term)
+      expect(copied).toContain(slug)
+      expect(copied).not.toContain('no active builds')
+      expect(input.cleanups).toBe(1)
+      expect(term.all()).toContain('\x1b[?1049l')
+      expect(term.all()).toContain('\x1b[?25h')
+      expect(fx.err).toEqual([])
+    } finally {
+      oldPoll.resolve()
+      finalRead.resolve()
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('signal shutdown restores input and the terminal when both poll and final reads fail', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    await fx.store.ensureRepo(fx.origin)
+    await fx.store.appendRepo(fx.origin, {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    const term = fakeTerminal()
+    const pollGate = deferred()
+    const pollStarted = deferred()
+    const sleepStarted = deferred()
+    const releaseSleep = deferred()
+    const teardownStarted = deferred()
+    const stop = new AbortController()
+    let gateNextPoll = false
+    let tearingDown = false
+    let finalReads = 0
+    const input = fakeInput([], () => {
+      tearingDown = true
+      teardownStarted.resolve()
+    })
+    const originalListBuilds = fx.store.listBuilds.bind(fx.store)
+    fx.store.listBuilds = async () => {
+      if (gateNextPoll) {
+        gateNextPoll = false
+        pollStarted.resolve()
+        await pollGate.promise
+        throw new Error('poll read failed during shutdown')
+      }
+      if (tearingDown) {
+        finalReads += 1
+        throw new Error('final read failed during shutdown')
+      }
+      return originalListBuilds()
+    }
+
+    let run: Promise<void> | undefined
+    try {
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 1,
+        signal: stop.signal,
+        sleep: async () => {
+          sleepStarted.resolve()
+          await releaseSleep.promise
+        },
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+
+      await sleepStarted.promise
+      await waitFor(() => stripAnsi(term.all()).includes('Auto Build'))
+      gateNextPoll = true
+      await pollStarted.promise
+
+      stop.abort()
+      releaseSleep.resolve()
+      await teardownStarted.promise
+      pollGate.resolve()
+      await run
+      run = undefined
+
+      expect(finalReads).toBe(1)
+      expect(input.cleanups).toBe(1)
+      expect(stripAnsi(term.all())).toContain(
+        'dashboard render failed: poll read failed during shutdown',
+      )
+      expect(term.all()).toContain('\x1b[?1049l')
+      expect(term.all()).toContain('\x1b[?25h')
+      expect(fx.err).toEqual([])
+    } finally {
+      stop.abort()
+      releaseSleep.resolve()
+      pollGate.resolve()
+      await run?.catch(() => {})
+      await fx.cleanup()
+    }
+  }, 30_000)
+
+  test('exceptional watch exit keeps its original error when the final read fails', async () => {
+    const fx = await makeFixture([], happyHandlers())
+    await fx.store.ensureRepo(fx.origin)
+    await fx.store.appendRepo(fx.origin, {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    const term = fakeTerminal()
+    const pollGate = deferred()
+    const pollStarted = deferred()
+    const sleepStarted = deferred()
+    const sleepGate = deferred()
+    const teardownStarted = deferred()
+    const dispatchError = new Error('watch sleep failed')
+    let gateNextPoll = false
+    let tearingDown = false
+    let finalReads = 0
+    const input = fakeInput([], () => {
+      tearingDown = true
+      teardownStarted.resolve()
+    })
+    const originalListBuilds = fx.store.listBuilds.bind(fx.store)
+    fx.store.listBuilds = async () => {
+      if (gateNextPoll) {
+        gateNextPoll = false
+        const staleSnapshot = await originalListBuilds()
+        pollStarted.resolve()
+        await pollGate.promise
+        return staleSnapshot
+      }
+      if (tearingDown) {
+        finalReads += 1
+        throw new Error('exceptional-exit final read failed')
+      }
+      return originalListBuilds()
+    }
+
+    let run: Promise<void> | undefined
+    try {
+      run = abDispatch({
+        targetRepo: fx.origin,
+        env: {},
+        exec: spawnExec,
+        stdout: () => {},
+        stderr: (line) => fx.err.push(line),
+        intervalMs: 1,
+        sleep: async () => {
+          sleepStarted.resolve()
+          await sleepGate.promise
+        },
+        wire: fx.wire,
+        terminal: term,
+        input,
+      })
+      const outcome = run.then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+
+      await sleepStarted.promise
+      await waitFor(() => stripAnsi(term.all()).includes('Auto Build'))
+      gateNextPoll = true
+      await pollStarted.promise
+
+      sleepGate.reject(dispatchError)
+      await teardownStarted.promise
+      pollGate.resolve()
+      const error = await outcome
+      run = undefined
+
+      expect(error).toBe(dispatchError)
+      expect(finalReads).toBe(1)
+      expect(input.cleanups).toBe(1)
+      expect(latestDashboardFrame(term)).toContain('Auto Build')
+      expect(term.all()).toContain('\x1b[?1049l')
+      expect(term.all()).toContain('\x1b[?25h')
+      expect(fx.err).toEqual([])
+    } finally {
+      pollGate.resolve()
+      sleepGate.resolve()
+      await run?.catch(() => {})
       await fx.cleanup()
     }
   }, 30_000)
