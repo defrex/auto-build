@@ -58,8 +58,7 @@ import {
 import { LiveRegion, paintableRows } from './dashboard/live'
 import type { TerminalInput, TerminalInputEvent, TerminalOut } from './terminal'
 import { GitHubForge } from '../ports/forge/github'
-import { ClaudeAgentRunner } from '../ports/runner/claude'
-import { PiAgentRunner } from '../ports/runner/pi'
+import { createProductionRuntimes } from '../ports/runner/production'
 import { createRuntimeResolver, type RuntimeResolver } from '../ports/runner/routing'
 import type { RuntimeRegistry } from '../ports/runner/runtime'
 import { createTicketSource } from '../ports/tickets/create'
@@ -266,10 +265,7 @@ async function defaultWire(config: Config, opts: DispatchOpts): Promise<Dispatch
     opts.targetRepo,
     state.localStateRoot,
   )
-  // One adapter instance carries both capabilities. A one-shot completion is
-  // pre-build judgment, not a second phase runner or a resumable session.
-  const claude = new ClaudeAgentRunner()
-  const pi = new PiAgentRunner()
+  const { runtimes, defaultRuntime } = createProductionRuntimes()
 
   return {
     store,
@@ -278,32 +274,10 @@ async function defaultWire(config: Config, opts: DispatchOpts): Promise<Dispatch
     // A local override relocates the whole tree. Remote stores still need
     // local Git scratch, which stays beneath the repository's default root.
     workspaces: new GitWorktreeProvider({ root: state.worktreeRoot }),
-    // Two registered runtimes (§9): claude serves Claude models (its own SDK
-    // default model ⇒ no `defaultModel`); pi validates configured models against
-    // its provider catalog. Pi model ids are provider-qualified
-    // (`<provider>/<id>`), so pi's prefixes are provider names — no overlap with
-    // claude's bare `claude-*`. Add a provider prefix here to accept more of
-    // Pi's catalog; `ab models` lists the ids. Model ids stay in config, not here.
-    runtimes: {
-      claude: { runner: claude, oneShot: claude, servesModels: ['claude-'] },
-      pi: {
-        runner: pi,
-        oneShot: pi,
-        servesModels: [
-          // OAuth coding providers (what `pi login` writes to auth.json).
-          'openai-codex/',
-          'kimi-coding/',
-          // API-key providers, for keys supplied via env/auth.json.
-          'openai/',
-          'moonshotai/',
-          'cloudflare-workers-ai/',
-          'anthropic/',
-          'openrouter/',
-        ],
-        defaultModel: 'kimi-coding/k3',
-      },
-    },
-    defaultRuntime: 'claude',
+    // Shipped registrations are shared with other non-phase judgment paths.
+    // Model ids stay in config; production.ts owns adapter compatibility data.
+    runtimes,
+    defaultRuntime,
     storeRef,
     ...(token !== undefined && token !== '' ? { token } : {}),
     ids: randomIds(),
@@ -349,6 +323,12 @@ class DispatchLoop {
   private readonly dashboardBuilds: DashboardBuildPollCache
   /** Guard against overlapping timer polls, exactly as pollingSubscribe does. */
   private rendering = false
+  /** The full, warning-handled timer poll. Teardown joins this exact promise
+   * before selecting the final frame. */
+  private renderInFlight: Promise<void> | undefined
+  /** Cleared at the rendering stop boundary so an already-queued timer callback
+   * cannot open a new store read after teardown begins. */
+  private acceptingRenderPolls = false
   private timer: ReturnType<typeof setInterval> | undefined
   /** Watch-mode paint timer (AC 8): repaints the CACHED model against a fresh
    * clock so running elapsed ticks between store reads. Absent in `--once`. */
@@ -1234,10 +1214,12 @@ class DispatchLoop {
 
   private startRendering(): void {
     if (!this.dashboard || this.timer !== undefined) return
+    this.acceptingRenderPolls = true
     const tick = (): void => {
-      if (this.rendering) return // no overlapping polls
+      if (!this.acceptingRenderPolls || this.rendering) return // fenced, no overlap
       this.rendering = true
-      void this.renderOnce()
+      let handled!: Promise<void>
+      handled = this.renderOnce()
         .catch((error: unknown) => {
           // A transient store error must never kill dispatch — the dashboard
           // is a view, and a view that throws is a bug in the view.
@@ -1246,8 +1228,13 @@ class DispatchLoop {
           )
         })
         .finally(() => {
+          // Identity matters if lifecycle code ever stops and restarts polling:
+          // an older completion must not clear a replacement poll's guard.
+          if (this.renderInFlight !== handled) return
+          this.renderInFlight = undefined
           this.rendering = false
         })
+      this.renderInFlight = handled
     }
     this.timer = setInterval(tick, DASHBOARD_POLL_MS)
     // Never hold the process open for a redraw.
@@ -1262,11 +1249,27 @@ class DispatchLoop {
     tick()
   }
 
-  private stopRendering(): void {
+  private async stopRendering(): Promise<void> {
+    // Clear both timer sources before yielding. The boolean also fences a timer
+    // callback that was already queued when clearInterval ran.
     if (this.timer !== undefined) clearInterval(this.timer)
     this.timer = undefined
     if (this.tickTimer !== undefined) clearInterval(this.tickTimer)
     this.tickTimer = undefined
+    this.acceptingRenderPolls = false
+
+    // The poll owns model/controller mutation as well as terminal painting, so
+    // join it rather than merely suppressing a late LiveRegion.update(). Its
+    // normal rejection is warning-handled above; the catch keeps teardown safe
+    // even if reporting that warning itself throws.
+    const inFlight = this.renderInFlight
+    if (inFlight !== undefined) {
+      try {
+        await inFlight
+      } catch {
+        // Dashboard rendering remains best-effort during teardown.
+      }
+    }
   }
 
   /** Stop polling, paint the truth one last time, release the region. Every
@@ -1278,21 +1281,30 @@ class DispatchLoop {
     // actions finish before the final truth is painted and raw mode/cursor are
     // considered released.
     try {
-      this.stopInput()
-    } catch (error) {
-      // Cursor restoration must not be skipped just because stdin restoration
-      // itself failed. Keep the failure visible in the final status row.
-      this.warn(
-        `dashboard input cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-    this.stopRendering()
-    await this.operationTail
-    try {
-      await this.renderOnce()
-    } catch {
-      // Best-effort: a failed final frame must not mask the run's outcome.
+      try {
+        this.stopInput()
+      } catch (error) {
+        // Cursor restoration must not be skipped just because stdin restoration
+        // itself failed. Keep the failure visible in the final status row when
+        // the presentation seam is still usable.
+        try {
+          this.warn(
+            `dashboard input cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        } catch {
+          // Rendering that warning is best-effort too.
+        }
+      }
+      await this.stopRendering()
+      await this.operationTail
+      try {
+        await this.renderOnce()
+      } catch {
+        // Best-effort: a failed final frame must not mask the run's outcome.
+      }
     } finally {
+      // Cursor/normal-screen restoration is unconditional once dashboard
+      // teardown begins, including poll and final-read failures.
       this.region?.finish()
     }
   }
