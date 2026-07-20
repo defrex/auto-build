@@ -206,6 +206,7 @@ is an error, so a typo cannot silently disable a verifier.
 | Table | What it does | Notable defaults |
 |---|---|---|
 | `[project]` | `baseBranch` — what PRs target | `"main"` |
+| `[dashboardFrames]` | Optional GitHub release host for existing dashboard PNG evidence: `provider`, public `repository`, positive `releaseId` | absent ⇒ text-only, no upload |
 | `[commands]` | Free-form map of verb → shell string. `setup` runs after provision and after a rehydrate; others are referenced by name from verify steps. | — |
 | `[verify]` | `steps = [...]` — the ordered configured universe of verify phases | `[]` |
 | `[verify.<step>]` | `kind = "check"` needs `command` (a key in `[commands]`); `kind = "agent"` needs `skill`, optionally `needsServer`; both kinds accept `paths`; `always = true` makes a step unconditional and mandatory | `needsServer = false`; no `paths` ⇒ unconditional; no `always` ⇒ plan-selectable |
@@ -302,9 +303,9 @@ it never inspects the diff or self-skips. This is visual evidence rather than a
 byte-exact golden gate, and it uses no network, live agent runner, browser,
 public repository, forge upload, or hosted asset.
 
-The successful current-cycle capture manifest is projected into the PR comment
-as escaped monospace text. Each colour image remains in the BuildStore and the
-comment gives an exact retrieval command:
+The successful current-cycle capture manifest is always projected into the PR
+comment as escaped monospace text. Each colour image remains authoritative in
+the BuildStore and the comment gives an exact retrieval command:
 
 ```sh
 ab artifact download <build> dashboard-frame:mixed-wide:png@0 --output mixed-wide.png
@@ -313,6 +314,40 @@ ab artifact download <build> dashboard-frame:mixed-wide:png@0 --output mixed-wid
 The revision shown by a real comment is authoritative; use it rather than
 assuming `@0`. Missing, malformed, stale-cycle, or skipped capture evidence is
 safely omitted from the optional PR section.
+
+To render those same PNG bytes inline during review, opt into a pre-existing
+**public, published, mutable GitHub release**:
+
+```toml
+[dashboardFrames]
+provider = "github-release"
+repository = "owner/public-review-assets"
+releaseId = 123456
+```
+
+Hosting is off when this table is absent. Autobuild does not create the release
+or its tag. Create/manage it separately, then obtain its numeric id, for example:
+
+```sh
+gh api repos/owner/public-review-assets/releases/tags/dashboard-frames --jq .id
+```
+
+The `gh` identity used by Autobuild needs **Contents: write** permission on that
+repository. GitHub's image proxy cannot fetch authenticated release assets, so
+a private source repository must point at a separate public asset repository.
+This makes frame contents publicly retrievable/listable for the review window;
+enabling it is an explicit disclosure choice.
+
+Finalize opens or adopts the PR, uploads only the exact current-cycle artifact
+bytes, and embeds images only if every manifest frame was hosted. No PNG or text
+copy is written into the base branch, feature branch, merge commit, or any Git
+workspace. An unsupported forge silently keeps text. A configured upload,
+validation, or timeout failure records a follow-up observation and also keeps
+the full text comment—it never fails verification or stalls finalize. After a
+build becomes merged, closed, or abandoned, the dispatcher automatically
+deletes release copies and retries transient cleanup failures on later ticks.
+The inline URLs intentionally break after that review window; BuildStore
+originals remain queryable under its separate retention policy.
 
 A fresh config always includes `setup = "bun install"`. During that first
 init only, Autobuild recognizes these exact root-package script names:
@@ -472,7 +507,8 @@ triageState = "Backlog"        # optional; absent = "Backlog" — must name a st
 The API key comes from `LINEAR_API_KEY`, in your environment or a local `.env`.
 
 **GitHub** auth is whatever `gh` resolves. There is no autobuild environment
-variable for it.
+variable for it. If `[dashboardFrames]` is enabled, that identity additionally
+needs Contents write permission on the configured public host repository.
 
 ### 4. Validate
 
@@ -658,42 +694,48 @@ Each tick runs in this order:
 1. **janitor** — polls open PRs; reconciles outstanding auto-merge intent,
    performs the guarded squash fallback only for proved-ungated, positively
    mergeable builds parked after all verification/finalize work, completes
-   merged/closed builds, routes conflicts to `reconcile`, and cleans up aborted
-   builds.
+   merged/closed builds, routes conflicts to `reconcile`, cleans up aborted
+   builds, and reclaims hosted dashboard-frame copies after every terminal
+   outcome (retrying unfinished cleanup on already-done builds).
 2. **startup resume** — first tick of an invocation only; attempts every
    actionable current build and automatically retries only an all-`policy`
    escalation set. Agent/stall questions remain parked for a human. Later ticks
    preserve deliberate policy parks.
 3. **lease sweep** — re-attaches runners to builds whose lease went stale.
 4. **dispatch** — claims and launches new work (skipped while intake is off).
-5. **harvest** — independently of build capacity and intake, settle an
-   outstanding recoverable run **before** considering a new scan. A stopped run
+5. **harvest** — independently of build capacity and intake, settle **every**
+   outstanding recoverable run, oldest first, before considering a new scan.
+   Later running or terminal runs cannot shadow an older stop. Each stopped run
    is automatically reopened at most twice through durable monotonic request
    facts and the same `harvest.resumed` acknowledgement a human resume uses.
    Completed steps, approved artifacts, reservations, and filing facts survive;
    an approved run goes straight to filing and creates only missing tickets.
-   This outer budget is fixed and separate from retries inside one step.
-   With no recovery/control settlement due, count newly unclaimed structured
-   observations. Below `[harvest].threshold`, do nothing; at the threshold,
+   This outer budget is fixed per run and separate from retries inside one step.
+   With no parked failure or recovery/control settlement due, count newly
+   unclaimed structured observations. Below `[harvest].threshold`, do nothing;
+   at the threshold,
    claim the accumulation and run one journaled scan/synthesize/review/file
    workflow. Work is tracked in-flight without blocking later watch ticks or
    Ctrl-C, and `--once` drains it before exit. Approved proposals are created
    directly in Triage and are never dispatched by the harvester.
 
-If both automatic reopen attempts fail, one `harvest.recovery-exhausted` fact
-atomically commits the safe partial disposition ledger and releases only work
-still pending. Before approval that is the whole snapshot; after approval,
-filed creates, still-valid frozen joins, and suppressions stay dispositioned,
+If both automatic reopen attempts for a run fail, one
+`harvest.recovery-exhausted` fact atomically commits the safe partial disposition
+ledger and releases only work still pending. Before approval that is the whole
+snapshot; after approval, filed creates, still-valid frozen joins, and
+suppressions stay dispositioned,
 while missing creates, tombstone/unknown joins, and otherwise unclassifiable
 members are released. Successfully read malformed/missing content fails safe to
 release; a rejected artifact read remains retryable infrastructure. A durable
 human-attention barrier prevents those released observations from being
 reclaimed immediately into another hot loop. Select its `Harvest` row and press
 `p` to acknowledge it while the gate is on; if the gate is off, select Global
-and press `h`. The shared resume acknowledgement opens the gate and clears the
-barrier, but the old exhausted run stays finished and only a future scan may
-claim released work. Deliberate agent/stall/policy escalations still consume
-their snapshots and are never automatically recovered.
+and press `h`. One human resume acknowledgement opens the gate, reopens every
+ordinary parked run, and clears every exhaustion barrier, but exhausted runs
+stay finished and only a future scan may claim released work. Existing journals
+receive these all-run semantics on replay without migration. Deliberate
+agent/stall/policy escalations still consume their snapshots and are never
+automatically recovered.
 
 Within one dispatcher process, build-runner launches are single-flighted by
 slug. Repeated polling or a transiently stale lease cannot open another agent
@@ -705,23 +747,26 @@ cross-process stale-runner recovery gate. Accordingly, `resumed` and `swept`
 count runners actually scheduled, not launch requests suppressed as already
 active.
 
-The selectable `Harvest` row is a run, not the repository setting. It appears
-for an open run (including one frozen by the off gate) or unresolved failed or
-escalated attention, with elapsed times, observation count, the shared marker,
-right-aligned status, and existing detail lines. The internal run id is not
-displayed. A completed run removes the row immediately, an idle paused
-repository has no row, and selection moves safely when a row disappears.
-Ordinary failure remains red `FAILED` until resumed; exhausted failure and
+The selectable `Harvest` row is a run, not the repository setting. It chooses
+the oldest unresolved ordinary failure, exhaustion, or escalation attention
+before falling back to the oldest open run (including one frozen by the off
+gate), with elapsed times, observation count, the shared marker, right-aligned
+status, and existing detail lines. The internal run id is not displayed. A
+later running or completed run cannot hide older attention; acknowledgement or
+completion retargets the row to remaining work, and an idle paused repository
+has no row. Ordinary failure remains red `FAILED` until resumed; exhausted failure and
 escalation remain visible until acknowledged. Exhaustion disappears after its
 existing attention acknowledgement. Escalation has no dedicated acknowledgement
 event, so its row stays through the human request and disappears only after the
 later kernel `harvest.resumed`; the run itself remains terminal. A header resume
 while the gate is off intentionally supplies the same shared request/ack pair.
 
-Use `ab harvest status --events 20` for the durable gate, run id, recoverable
-versus terminal state, automatic attempts/limit, stopped boundary, exact pending
-observation/proposal keys, and event-level paper trail. Dispatch restarts do not
-clear pause or exhausted-attention stops, and stopped timers stay frozen.
+Use `ab harvest status --events 20` for the durable gate and one ordered section
+per unresolved failed run plus relevant open/latest context: run ids,
+recoverable versus terminal state, per-run automatic attempts/limit, stopped
+boundaries, exact retained/released observation and proposal keys, and the
+repository-level event paper trail. Dispatch restarts do not clear pause or
+exhausted-attention stops, and stopped timers stay frozen.
 Optional runtime/model overrides are `[roles.harvest]` and
 `[roles.harvest-review]`; the producer continues across revision rounds and
 each reviewer is fresh.
@@ -805,7 +850,7 @@ Run these yourself, from the repo root. They need no `AB_*` environment.
 | `ab builds [--queued] [--all] [--json] [--store <ref>]` | List builds for this repository. Read-only. |
 | `ab build status <slug> [--events <n>] [--json] [--store <ref>]` | Project one build's durable state. Read-only. |
 | `ab artifact download <build> <kind>[@rev] --output <file> [--store <ref>]` | Retrieve exact artifact bytes for this repository, including terminal builds and dashboard PNG evidence. Read-only. |
-| `ab harvest status [--events <n>] [--json] [--store <ref>]` | Project the durable repository gate and latest harvest run, including recovery attempts/limit, stopped boundary, attention state, exact pending work, steps, filing, and failures. Read-only. |
+| `ab harvest status [--events <n>] [--json] [--store <ref>]` | Project the durable repository gate, every unresolved failed run, and relevant open/latest context, including per-run recovery attempts/limit, stopped boundary, attention, exact pending work, steps, and filing. Read-only. |
 | `ab help` | Print the command surface. |
 
 ### Agent build-session commands
@@ -967,8 +1012,9 @@ autobuild.toml: invalid config
 
 Each line is `  <path>: <message>`. Common causes:
 
-- **Unknown table** — the message appends `— known tables: project, commands,
-  server, verify, finalize, roles, policy, dispatcher, tickets, harvest, outer`.
+- **Unknown table** — the message appends `— known tables: project,
+  dashboardFrames, commands, server, verify, finalize, roles, policy,
+  dispatcher, tickets, harvest, outer`.
   Check
   for a typo; the file is strict on purpose.
 - **A step with no table** — `verify step "<s>" is listed in verify.steps but
@@ -1031,7 +1077,10 @@ because nothing failed — the gates just didn't match. Work down the gates:
   preflight, so a bad key surfaces on first use, mid-tick.
 - **`[tickets].source = "linear" requires teamKey…`** — add `teamKey` to
   `[tickets]`.
-- **GitHub** failures surface as raw `gh` stderr. Fix them with `gh auth login`.
+- **GitHub** PR/merge failures surface as raw `gh` stderr. Fix them with
+  `gh auth login`. Optional dashboard-frame upload failures instead become
+  follow-up observations with text fallback; check that the configured host is
+  public and the same identity has Contents write permission.
 - **`missing bearer token` / `invalid or expired token`** — a remote `--store`
   needs `AB_TOKEN`.
 
