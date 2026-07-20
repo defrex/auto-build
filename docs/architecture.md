@@ -118,9 +118,10 @@ acknowledgement clears that barrier;
 the acknowledgement does not reopen the exhausted run. Completed and deliberate
 escalated runs remain terminal, with escalation snapshots still claimed. Typed
 session deposits live under `ab harvest context|submit|verdict`; `ab harvest
-status` and the selectable `Harvest` dashboard row project recovery progress,
-stopped boundary, exhaustion, and pending work from the same journal. The row
-omits the internal run id; status retains it.
+status` projects full history, while the dashboard separates the durable gate
+into its always-present header token and projects a selectable `Harvest` row
+only for an open run or unresolved failure/escalation attention. The row omits
+the internal run id; status retains it.
 
 ## Pre-build identity
 
@@ -238,30 +239,43 @@ status row, a blank separator before the harvest/build body, and another before
 the contextual legend/modal controls. It shares the selection marker and
 right-pinned status column across harvest and build rows; `Harvest` is
 operator-facing identity, while its run id stays in the journal. The header
-projects both process-local controls as explicit intake and auto-merge-default
-ON/OFF tokens. Per-build auto-merge reduction retains four states, but rendering
-collapses the three active states to `auto merge` with cyan/green/yellow
+projects process-local intake and auto-merge-default plus the repository
+reducer's acknowledged durable harvest gate as explicit ON/OFF tokens. Pending
+harvest commands do not optimistically change that token. Per-build auto-merge
+reduction retains four states, but rendering collapses the three active states to `auto merge` with cyan/green/yellow
 emphasis and omits the token for `off`.
 
 The dashboard is an operator command producer, not forge plumbing. Its model
 tracks selection as `{kind: 'global'} | {kind: 'harvest'} | {kind: 'build',
 slug}` over global first, optional harvest second, and slug-sorted builds. The
 always-present global identity and structural reconciliation prevent repaint,
-insertion, or removal from retargeting by row index. The legend derives from
-that identity. `m` branches by identity: global toggles the process-local
+insertion, or removal from retargeting by row index. When a completed or
+acknowledged harvest row disappears, its old index chooses the valid successor
+or final predecessor. The legend derives from identity plus the run's currently
+safe action. `m` branches by identity: global toggles the process-local
 claim-time auto-merge default, builds append their normal durable control event,
 and harvest remains explanatory. `p` branches by identity: global toggles
-process-local intake, builds
-append human events to their stream, while harvest appends
-`harvest.resume-requested` when the reduced gate is paused, an ordinary failed
-run is manually resumed, or exhausted attention needs acknowledgement;
-otherwise it appends `harvest.pause-requested`. `FAILED` stays distinct from
-`RUNNING`: an ordinary stop names its step and automatic progress, while
-exhaustion clearly names the attention barrier and pending count. The
-exhaustion acknowledgement does not reopen the old run. Error recovery uses a
-distinct status message, and an escalated run is never treated as recoverable
-infrastructure state. Build-runner and harvest-runner acknowledge pause/resume
-at their respective safe boundaries;
+process-local intake, builds append human events to their stream, and a harvest
+row only writes `harvest.resume-requested` for an ordinary failed run or
+unresolved exhaustion/escalation. Running and pending-acknowledgement rows write
+nothing; a paused gate directs the operator to the header rather than emitting a
+run action. `h` is global-only: it re-reduces the repository journal, treats the
+newest pending command as requested state so rapid presses oppose, and appends
+the corresponding pause/resume request. The header remains acknowledged-only.
+
+The harvest projection independently filters the latest run. Running stays
+visible (with timing frozen when the gate is paused), completed is absent,
+ordinary failure is visible until reopened, and exhausted failure is absent
+after `attentionAcknowledgedSeq`. Escalation is absent only after a display-only
+pair: a human resume request with seq after `terminalSeq`, followed by the kernel
+resume that acknowledges it. The request alone remains visible and no reducer
+lifecycle changes. This intentionally means a header resume can both open a
+paused gate and settle visible run attention through the shared event
+vocabulary. `FAILED` stays distinct from `RUNNING`: an ordinary stop names its step and
+automatic progress, while exhaustion clearly names the attention barrier and
+pending count. Exhaustion acknowledgement does not reopen the old run, and
+escalation remains terminal. Build-runner and harvest-runner acknowledge
+pause/resume at their respective safe boundaries;
 dispatcher code reconciles auto-merge via the `Forge` port. On a blocked build,
 `p` instead opens slug/escalation-bound process state: Enter
 appends one human `escalation.answered` per captured id (`retry` for blank
@@ -324,8 +338,54 @@ keyboard handling, or build-runner code still require a restart. Ctrl-C follows
 the normal CLI teardown path, including raw-mode cleanup and cursor restoration.
 The installed `ab` binary remains the non-watching production entry.
 
-The seams are the contract: every `BuildStore` adapter must pass the suite
-in `src/store/contract.ts`; every event write passes
-`validateEventWrite` or `validateHarvestEventWrite`; phase behavior derives from the table in
-`src/kernel/phases.ts`. When adding an adapter, start from the contract
-tests, not the interface.
+The seams are the contract. Four reusable contract families run the same
+behavioral assertions against every implementation:
+
+- `src/store/contract.ts` — `BuildStore` and `BlobStore`;
+- `src/ports/tickets/contract.ts` — `TicketSource`;
+- `src/ports/workspace/contract.ts` — `WorkspaceProvider`;
+- `src/ports/forge/contract.ts` — `Forge`.
+
+A normal `bun test` runs the memory/fake/local registrations, including the
+real filesystem and real local-git adapters. The Linear and GitHub
+registrations are present in the same test run but reported as skipped: live
+provider mutation requires both credentials and an explicit opt-in.
+
+To run the Linear contract manually against a destructive scratch target:
+
+```sh
+AB_RUN_LIVE_PORT_CONTRACTS=1 \
+LINEAR_API_KEY=… \
+AB_LINEAR_CONTRACT_TEAM_KEY=SCRATCH \
+AB_LINEAR_CONTRACT_PROJECT_ID=… \
+bun test src/ports/tickets/linear.live.test.ts
+```
+
+The token must be able to create, update, relate, and archive issues in the
+configured project. The team needs a claimable `unstarted` or `backlog` state,
+a `started` state, and a `completed` or `canceled` state. Every issue gets a
+reserved UUID, is attached to that project, and is archived during best-effort
+cleanup. Use a project with no real work in it.
+
+To run the GitHub contract manually:
+
+```sh
+AB_RUN_LIVE_PORT_CONTRACTS=1 \
+GH_TOKEN=… \
+AB_GITHUB_CONTRACT_REPO=owner/destructive-scratch-repo \
+bun test src/ports/forge/github.live.test.ts
+```
+
+`GITHUB_TOKEN` may be used instead of `GH_TOKEN`. The repository must have
+native auto-merge enabled, an initialized default branch, no inherited
+merge-blocking rule that catches the UUID-namespaced contract branches, and a
+token with repository admin, contents, pull-request, comment, and branch
+protection permissions. The fixture creates and deletes temporary branches,
+PRs, comments, and a required-check protection rule; it never pushes to or
+merges into the default branch. Use a dedicated scratch repository only.
+
+Provisioning or scheduling these credentials/resources in CI is deliberately
+out of scope; live runs remain explicit. Every event write still passes
+`validateEventWrite` or `validateHarvestEventWrite`, and phase behavior derives
+from `src/kernel/phases.ts`. When adding an adapter, start from its contract
+suite, not only the interface.

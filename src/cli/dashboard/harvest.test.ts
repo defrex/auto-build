@@ -63,6 +63,7 @@ describe('dashboard harvest row', () => {
     const byLabel = new Map(projected.steps.map((step) => [step.label, step]))
     expect(projected).toMatchObject({
       status: 'failed',
+      action: 'resume',
       detail:
         'stopped at synthesize r1 — automatic recovery 0/2; no-terminal',
     })
@@ -84,6 +85,7 @@ describe('dashboard harvest row', () => {
           capacity: 1,
           drained: false,
           defaultAutoMerge: false,
+          harvestPaused: false,
           statusLine: '',
           builds: [],
           harvest: projected,
@@ -184,6 +186,7 @@ describe('dashboard harvest row', () => {
     let projected = projectHarvest(await store.getRepoEvents('/repo'))!
     expect(projected).toMatchObject({
       status: 'failed',
+      action: 'acknowledge',
       detail:
         'recovery exhausted — human attention required; stopped at file; pending 1',
     })
@@ -195,6 +198,7 @@ describe('dashboard harvest row', () => {
           capacity: 1,
           drained: false,
           defaultAutoMerge: false,
+          harvestPaused: false,
           statusLine: '',
           builds: [],
           harvest: projected,
@@ -210,17 +214,19 @@ describe('dashboard harvest row', () => {
       type: 'harvest.resume-requested',
       payload: {},
     })
+    projected = projectHarvest(await store.getRepoEvents('/repo'))!
+    expect(projected.status).toBe('failed')
+    expect(projected.action).toBeUndefined()
+
     await store.appendRepo('/repo', {
       actor: KERNEL,
       type: 'harvest.resumed',
       payload: {},
     })
-    projected = projectHarvest(await store.getRepoEvents('/repo'))!
-    expect(projected.detail).toContain('attention acknowledged')
-    expect(projected.status).toBe('failed')
+    expect(projectHarvest(await store.getRepoEvents('/repo'))).toBeUndefined()
   })
 
-  test('projects an acknowledged repository pause, freezes open timing, and supports no-run pauses', async () => {
+  test('an acknowledged gate pause freezes an open run without manufacturing an idle row', async () => {
     const store = new MemoryBuildStore()
     await store.ensureRepo('/repo')
     await store.appendRepo('/repo', {
@@ -266,6 +272,7 @@ describe('dashboard harvest row', () => {
           capacity: 1,
           drained: false,
           defaultAutoMerge: false,
+          harvestPaused: true,
           statusLine: '',
           builds: [],
           harvest: projected,
@@ -287,15 +294,10 @@ describe('dashboard harvest row', () => {
       type: 'harvest.paused',
       payload: {},
     })
-    expect(projectHarvest(await idleStore.getRepoEvents('/idle'))).toMatchObject({
-      kind: 'harvest',
-      status: 'paused',
-      observations: 0,
-      rounds: 0,
-    })
+    expect(projectHarvest(await idleStore.getRepoEvents('/idle'))).toBeUndefined()
   })
 
-  test('projects the staged run, keeps terminal runs visible, and renders a selectable Harvest row', async () => {
+  test('projects an open staged run and renders a selectable Harvest row', async () => {
     const store = new MemoryBuildStore()
     await store.ensureRepo('/repo')
     await store.appendRepoWithArtifacts(
@@ -345,6 +347,7 @@ describe('dashboard harvest row', () => {
         capacity: 2,
         drained: false,
         defaultAutoMerge: false,
+        harvestPaused: false,
         statusLine: '',
         selection: { kind: 'harvest' },
         builds: [],
@@ -355,5 +358,138 @@ describe('dashboard harvest row', () => {
     const plain = stripAnsi(lines.join('\n'))
     expect(plain).toContain('> Harvest')
     expect(plain).not.toContain('h_1')
+  })
+
+  test('completion removes the latest run row immediately', async () => {
+    const store = new MemoryBuildStore()
+    await store.ensureRepo('/repo')
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_completed',
+        observations: [{ build: 'a', seq: 1 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))?.status).toBe(
+      'running',
+    )
+
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.completed',
+      payload: {
+        run: 'h_completed',
+        dispositions: [
+          {
+            occurrence: { build: 'a', seq: 1 },
+            action: 'suppressed',
+            proposalKey: 'suppressed:a:1',
+          },
+        ],
+        report: { kind: 'harvest-report', rev: 0 },
+      },
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))).toBeUndefined()
+  })
+
+  test('escalation stays visible through a request and disappears only after its acknowledged resume pair', async () => {
+    const store = new MemoryBuildStore()
+    await store.ensureRepo('/repo')
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_escalated',
+        observations: [{ build: 'a', seq: 1 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.escalated',
+      payload: {
+        run: 'h_escalated',
+        source: 'agent',
+        reason: 'operator judgment required',
+        observations: [{ build: 'a', seq: 1 }],
+      },
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))).toMatchObject({
+      status: 'escalated',
+      action: 'acknowledge',
+      detail: 'operator judgment required',
+    })
+
+    // Model the header route: the gate is acknowledged off, then h requests
+    // its resume. The same request also becomes the run-attention evidence.
+    await store.appendRepo('/repo', {
+      actor: humanActor('prior-process'),
+      type: 'harvest.pause-requested',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.paused',
+      payload: {},
+    })
+    await store.appendRepo('/repo', {
+      actor: humanActor('header-operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    const pending = projectHarvest(await store.getRepoEvents('/repo'))
+    expect(pending).toMatchObject({ status: 'escalated' })
+    expect(pending?.action).toBeUndefined()
+
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))).toBeUndefined()
+  })
+
+  test('an ordinary failed run stays visible while resume is pending and reopens on acknowledgement', async () => {
+    const store = new MemoryBuildStore()
+    await store.ensureRepo('/repo')
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.started',
+      payload: {
+        run: 'h_resume',
+        observations: [{ build: 'a', seq: 1 }],
+        scan: { kind: 'harvest-scan', rev: 0 },
+      },
+    })
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.failed',
+      payload: {
+        run: 'h_resume',
+        step: 'scan',
+        attempt: 1,
+        error: 'store unavailable',
+        willRetry: false,
+      },
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))?.action).toBe(
+      'resume',
+    )
+    await store.appendRepo('/repo', {
+      actor: humanActor('operator'),
+      type: 'harvest.resume-requested',
+      payload: {},
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))?.action).toBeUndefined()
+    await store.appendRepo('/repo', {
+      actor: KERNEL,
+      type: 'harvest.resumed',
+      payload: {},
+    })
+    expect(projectHarvest(await store.getRepoEvents('/repo'))).toMatchObject({
+      status: 'running',
+    })
   })
 })
