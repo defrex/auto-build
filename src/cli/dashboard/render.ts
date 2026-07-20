@@ -44,13 +44,12 @@ export interface RenderOpts {
    */
   now: number
   /**
-   * Hard cap on the NUMBER of lines — the screen's rows.
+   * Hard cap on the NUMBER of lines — the screen's paintable rows.
    *
-   * Same invariant as `width`, on the other axis, and for a sharper reason:
-   * the live region repaints by cursoring up over the rows it painted, which
-   * only works while they are still on screen. A frame taller than the screen
-   * scrolls its own top away, so the cursor-up clamps at the top margin and
-   * the header — the line the ACs name — is the first thing lost.
+   * The live region clears its alternate display and re-anchors this frame
+   * from the terminal's current bottom on every effective paint. The cap still
+   * matters: every rendered line has a trailing newline, so a frame as tall as
+   * the screen scrolls its own top away even on a freshly cleared display.
    *
    * This is a cap on LINES, and it is NOT the screen's row count: the region
    * needs a row for the cursor to rest on, so a caller painting a terminal
@@ -517,8 +516,8 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
   const controls = dashboardControls(model, color, width)
 
   // No paintable height at all (a 1-row screen — see `paintableRows`): paint
-  // nothing. A single line would scroll itself off and land in scrollback on
-  // every repaint, which is worse than an empty region.
+  // nothing. Its trailing newline would scroll a single line off even on the
+  // alternate display, which is worse than an empty region.
   if (height !== undefined && height <= 0) return []
   if (height !== undefined && height === 1) return [header]
   if (height !== undefined && height === 2) return [header, status]

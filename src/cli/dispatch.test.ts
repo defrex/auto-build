@@ -1388,7 +1388,7 @@ function fakeTerminal(
 }
 
 /** The longest run of consecutive painted lines the region wrote — i.e. the
- * tallest frame it will later have to cursor UP over. */
+ * tallest frame the terminal had to display. */
 function tallestFrame(term: { frames: string[] }): number {
   return Math.max(
     0,

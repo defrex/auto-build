@@ -200,7 +200,7 @@ including under `--force`.
 | `src/ports/` | TicketSource / Workspace / Forge / AgentRunner / Telemetry interfaces, adapters, fakes. Runtime/model/extension routing lives in `ports/runner/`: `runtime.ts` (the capability-carrying registry), `routing.ts` (the eager resolver), `one-shot.ts` (optional pre-build completion), `provider-error.ts` (shared permanent-failure classifier), `session-env.ts` (per-turn ambient/scoped merge plus managed CLI PATH), and the `claude.ts` / `pi.ts` SDK error extractors/adapters | §3.2, §6.3, §8.1, §9, §13 |
 | `bin/agent/ab` | Private executable launcher placed first on agent-session PATH; delegates to canonical `bin/ab.ts` | §8.1 |
 | `src/cli/` | The `ab` CLI — the only agent↔store channel; `init.ts` owns first-config package-script detection and rendering | §8, §16.3 |
-| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame — pure reducer projection/rendering, discriminated global/harvest/build row selection, contextual controls, status overlay pixels, and in-place replacement | §14, §15.5 |
+| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame — pure reducer projection/rendering, discriminated global/harvest/build row selection, contextual controls, status overlay pixels, and alternate-screen replacement | §14, §15.5 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty and harvest trigger), harvest deterministic core + runner | §3.3, §12, §15.7 |
 | `src/config/` | `autobuild.toml` parsing and validation | §16.1 |
 | `skills/` | Canonical defaults; `ab init` vendors them to `.agents/skills/ab-*` (Pi/Agent Skills) and links `.claude/skills/ab-*` | §16.3 |
@@ -268,9 +268,12 @@ process-local latest-status overlay reapplied after every asynchronous
 projection; dashboard
 mode never routes them to line sinks or scrollback, while plain mode keeps those
 sinks.
-The live region therefore owns only in-place frame replacement and cursor
-restoration. Raw input and live output remain separate adapters so keypresses
-cannot write into or tear a rendered frame.
+The live region therefore owns alternate-screen frame replacement. Every
+effective paint clears that display and anchors the frame from the terminal's
+current height, so a resize never depends on rows from the prior frame. During
+teardown it restores the normal display, copies the final snapshot there, and
+restores the cursor. Raw input and live output remain separate adapters so
+keypresses cannot write into or tear a rendered frame.
 
 ## Development
 
