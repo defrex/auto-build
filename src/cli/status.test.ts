@@ -213,6 +213,46 @@ describe('summarize', () => {
     expect(renderSummaries([summary], NOW, 'none').join('\n')).toContain('verify:unit a3')
   })
 
+  test('the reconcile attempt survives completion and remains rendered', async () => {
+    const store = new MemoryBuildStore({ clock: steppingClock() })
+    await seedBuild(store, { slug: 'b1' })
+    await store.append('b1', {
+      actor: KERNEL,
+      type: 'reconcile.started',
+      payload: { attempt: 2, baseSha: 'sha-main-2' },
+    })
+
+    const inFlight = summarize(
+      (await store.getBuild('b1'))!,
+      await store.getEvents('b1'),
+      NOW,
+    )
+    expect(inFlight.phase).toBe('reconcile')
+    expect(inFlight.attempt).toBe(2)
+    expect(inFlight.round).toBeUndefined()
+    expect(renderSummaries([inFlight], NOW, 'none').join('\n')).toContain('reconcile a2')
+
+    await store.append('b1', {
+      actor: agentActor('reconcile', 's_reconcile_2'),
+      type: 'reconcile.completed',
+      payload: {
+        mergeCommit: 'sha-merge-2',
+        artifact: { kind: 'reconcile-notes', rev: 1 },
+      },
+    })
+    const events = await store.getEvents('b1')
+    const completed = summarize((await store.getBuild('b1'))!, events, NOW)
+    expect({ phase: completed.phase, attempt: completed.attempt }).toEqual({
+      phase: inFlight.phase,
+      attempt: inFlight.attempt,
+    })
+    expect(completed.round).toBeUndefined()
+    expect(renderSummaries([completed], NOW, 'none').join('\n')).toContain('reconcile a2')
+    expect(
+      renderDetail(detail((await store.getBuild('b1'))!, events, NOW), NOW).join('\n'),
+    ).toContain('reconcile a2')
+  })
+
   test('a completed loop phase keeps reporting its own round', async () => {
     const store = new MemoryBuildStore({ clock: steppingClock() })
     await seedBuild(store, { slug: 'b1' })
