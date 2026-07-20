@@ -171,11 +171,12 @@ export interface BuildState {
    * read it. Compare this against `restartSince`, exactly as engine.ts:707-708
    * post-filters its own `finalizeCompleted`. */
   finalizeCompletedSeq: number
-  /** `finalize.step-completed` facts after `restartSince`, in order (§5).
+  /** Full-log `finalize.step-completed` facts, in event order (§5).
    * Post-steps are failure-tolerant, so a completion counts whether `ok` is
-   * true or false. Post-restart only, matching engine.ts's `finalizeStepsDone`
-   * (engine.ts:710-712) — a spec revision re-runs the post-steps. */
-  finalizeSteps: { step: string; ok: boolean }[]
+   * true or false. Current-spec membership is determined by
+   * `finalizeSteps.filter(f => f.seq > restartBoundary)`, matching
+   * engine.ts's post-restart `finalizeStepsDone` scope (engine.ts:710-712). */
+  finalizeSteps: { step: string; ok: boolean; seq: number }[]
   lastEvent?: AbEvent
   /** 0 for an empty log; `runner.attached {resumedFromSeq}` cites this. */
   lastSeq: number
@@ -266,7 +267,7 @@ export function reduceBuild(events: AbEvent[]): BuildState {
   let specRev: number | undefined
   let restartSince = 0
   let finalizeCompletedSeq = 0
-  let finalizeSteps: BuildState['finalizeSteps'] = []
+  const finalizeSteps: BuildState['finalizeSteps'] = []
   const plan: BuildState['plan'] = { round: 0, approved: false }
   const implement: BuildState['implement'] = { round: 0 }
   let codeReviewApproved = false
@@ -386,11 +387,11 @@ export function reduceBuild(events: AbEvent[]): BuildState {
         specRev = event.payload.artifact.rev
         // §6.3: rev N+1 restarts the build from plan. The restart boundary
         // invalidates every approval and result at or before it, so it is also
-        // a verify cycle boundary, and it re-runs the finalize post-steps
-        // (engine.ts:710-712).
+        // a verify cycle boundary. Finalize post-steps remain in full-log
+        // history; consumers use this boundary to select the current spec,
+        // matching engine.ts:710-712.
         restartSince = event.seq
         verify.cycleSince = Math.max(verify.cycleSince, event.seq)
-        finalizeSteps = []
         break
 
       case 'session.started':
@@ -503,9 +504,9 @@ export function reduceBuild(events: AbEvent[]): BuildState {
         break
       case 'finalize.step-completed':
         // §5: post-steps are independent and failure-tolerant — a completion
-        // counts whether `ok` is true or false. `spec.revised` clears the list
-        // above, matching engine.ts:710-712's post-restart scoping.
-        finalizeSteps.push({ step: event.payload.step, ok: event.payload.ok })
+        // counts whether `ok` is true or false. Retain full-log history with
+        // occurrence identity; readers scope it with `seq > restartBoundary`.
+        finalizeSteps.push({ step: event.payload.step, ok: event.payload.ok, seq: event.seq })
         break
 
       case 'pr.auto-merge-enabled':
