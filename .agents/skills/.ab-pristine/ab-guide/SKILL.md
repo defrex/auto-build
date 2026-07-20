@@ -503,7 +503,7 @@ prose: a `Ticket[]` for `list`, and the complete `Ticket` for `show` or `move`.
 
 On a TTY, `ab dispatch` renders one fixed interactive frame. Its first two
 lines are the always-present process-global section: a selectable `Auto Build`
-title with the repository basename, mode, capacity, active-build count,
+title with the repository basename, capacity, active-build count,
 `intake ON`/`intake OFF`, `auto merge default ON`/`auto merge default OFF`, and
 `harvest ON`/`harvest OFF`, then one status slot. All three controls are durable
 repository projections and converge across dispatchers on the existing poll;

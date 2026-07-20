@@ -860,7 +860,7 @@ or repository log (§15.2.7): `escalation.answered`,
 - v2.0 front end: terminal, with herdr as the multiplexer.
 - `ab dispatch` on a TTY is an interactive fixed frame. Its first two rows form
   an always-present process-global top section: one selectable `Auto Build`
-  title row with the repository basename, mode, capacity, active-build count,
+  title row with the repository basename, capacity, active-build count,
   `intake ON`/`intake OFF`, `auto merge default ON`/`auto merge default OFF`,
   and `harvest ON`/`harvest OFF`, followed by one process-local status slot.
   All three control values come from the repository journal and survive process

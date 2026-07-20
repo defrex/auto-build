@@ -514,7 +514,7 @@ ab dispatch --plain        # force line-oriented output, even on a TTY
 
 On a TTY the interactive dashboard is one fixed frame. Its first two lines are
 an always-present, selectable global section: `Auto Build` plus the repository
-basename, mode, capacity, active-build count, `intake ON`/`intake OFF`,
+basename, capacity, active-build count, `intake ON`/`intake OFF`,
 `auto merge default ON`/`auto merge default OFF`, and `harvest ON`/`harvest
 OFF`, then one status slot. All three controls are reduced from the repository
 event log, survive process restarts, and reflect changes made by another
