@@ -58,10 +58,19 @@ describe('runCli — routing and exit codes', () => {
     }
   })
 
-  test('help documents status and every sessionless build-control command', async () => {
+  test('help documents ticket grooming, status, and every sessionless build-control command', async () => {
     const d = deps()
     expect(await runCli(['help'], d)).toBe(0)
     const help = d.out.join('\n')
+    for (const command of [
+      'ab ticket create <title>',
+      'ab ticket update <id>',
+      'ab ticket block <id> <blocker-id>',
+      'ab ticket unblock <id> <blocker-id>',
+    ]) {
+      expect(help).toContain(command)
+    }
+    expect(help).toContain('the first id is always the ticket being changed')
     expect(help).toContain('ab builds [--queued] [--all] [--json] [--store <ref>]')
     expect(help).toContain('ab build status <slug> [--events <n>] [--json] [--store <ref>]')
     expect(help).toContain('running, paused, blocked')

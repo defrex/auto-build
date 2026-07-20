@@ -32,7 +32,7 @@ import { observe } from './observe'
 import { ServerControl } from './server-control'
 import { abBuilds, abBuildStatus } from './status'
 import { done, escalate, verdict } from './terminals'
-import { abTicketCreate } from './ticket'
+import { abTicket } from './ticket'
 import { abUpgrade } from './upgrade'
 import {
   abHarvestStatus,
@@ -175,8 +175,12 @@ const HELP = [
   '  ab upgrade [target]                    three-way merge vendored ab-* skills with the new defaults (§16.3; runs outside sessions)',
   '  ab ticket create <title> --body <file> [--labels a,b] [--blocked-by id,id]',
   '                                         file a ticket to the configured [tickets] source (§8.8; runs outside sessions).',
-  '                                         --blocked-by takes comma-separated ticket ids from that same source',
-  '                                         (e.g. AUT-8 for linear, file-1 for file); dispatch waits for all of them.',
+  '  ab ticket update <id> [--title <title>] [--body <file>] [--labels a,b]',
+  '                                         partially update editable fields; omitted fields survive and --labels "" clears labels.',
+  '  ab ticket block <id> <blocker-id>      add a blocker to an existing ticket (idempotent).',
+  '  ab ticket unblock <id> <blocker-id>    remove a blocker from an existing ticket (idempotent).',
+  '                                         Ticket ids are source-local (e.g. AUT-8 or file-1); the first id is always the ticket being changed.',
+  '                                         State remains a separate transition operation; ticket update never changes it.',
   '  ab dispatch [--once] [--interval <s>] [--store <ref>] [--plain] [--intake | --no-intake] [--auto-merge | --no-auto-merge]',
   '                                         run the outer loop for this repo — resume current builds, janitor, lease sweep, dispatch (§3.3, §12; runs outside sessions)',
   '                                         --auto-merge seeds durable intent on newly claimed builds only (default off); opposite flag forms cannot be combined',
@@ -208,7 +212,7 @@ const HELP = [
   'Every phase ends with exactly one terminal command (D5).',
 ].join('\n')
 
-const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report', 'body', 'labels', 'blocked-by'])
+const VALUE_FLAGS = new Set(['kind', 'files', 'refs', 'notes', 'findings', 'reason', 'report'])
 const BOOLEAN_FLAGS = new Set(['json'])
 
 interface ParsedArgs {
@@ -449,33 +453,16 @@ async function dispatch(argv: string[], deps: SessionlessCliDeps): Promise<numbe
       return 0
     }
 
-    // ticket runs OUTSIDE build sessions too (§8.8): it files to the repo's
-    // configured TicketSource, before any build exists.
+    // Ticket grooming runs OUTSIDE build sessions (§8.8): one parser and one
+    // configured-source seam own create/update/block/unblock.
     case 'ticket': {
-      const [sub, ...more] = rest
-      const usage =
-        'usage: ab ticket create <title> --body <file> [--labels a,b] ' +
-        '[--blocked-by id,id] (§8.8)'
-      if (sub !== 'create') {
-        throw new Error(usage)
-      }
-      const parsed = parseArgs(more)
-      const title = parsed.positionals.join(' ')
-      const bodyFile = stringFlag(parsed, 'body')
-      if (title === '' || bodyFile === undefined) {
-        throw new Error(usage)
-      }
-      const labels = listFlag(parsed, 'labels')
-      const blockedBy = listFlag(parsed, 'blocked-by')
       if (deps.exec === undefined) {
-        throw new Error("'ab ticket create' needs an exec seam — this is a wiring bug in the ab binary")
+        throw new Error(
+          "'ab ticket' needs an exec seam — this is a wiring bug in the ab binary",
+        )
       }
-      await abTicketCreate({
+      await abTicket(rest, {
         targetRepo: deps.workspacePath,
-        title,
-        bodyFile,
-        ...(labels !== undefined ? { labels } : {}),
-        ...(blockedBy !== undefined ? { blockedBy } : {}),
         env: deps.processEnv ?? {},
         exec: deps.exec,
         stdout,
