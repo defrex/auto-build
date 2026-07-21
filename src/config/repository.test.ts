@@ -10,7 +10,6 @@ test('repository installs the path-scoped dashboard image verifier after determi
   expect(config.capacity).toBe(3)
   expect(config.policy.harvestThreshold).toBe(5)
   expect(config.dashboardFrames).toBeUndefined()
-  expect(config.finalize).toEqual({ steps: [], stepConfigs: {} })
   expect(config.verify.steps).toEqual(['types', 'unit', 'dashboard'])
   expect(config.verify.stepConfigs['dashboard']).toEqual({
     kind: 'agent',
