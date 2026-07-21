@@ -258,8 +258,9 @@ const STATUS_COLOR: Record<
 
 /** The marker is one shared visual grammar for every selectable row. */
 function selectionMarker(selected: boolean, selecting: boolean, color: boolean): string {
-  if (!selecting) return ''
-  return selected ? paint('> ', 'cyan', color) : '  '
+  // The marker owns a fixed two-column lane even when keyboard selection is
+  // unavailable. No identity or detail text may drift into those columns.
+  return selecting && selected ? paint('> ', 'cyan', color) : '  '
 }
 
 /** Pin a right cluster to the frame edge while keeping exactly one flexible,
@@ -525,7 +526,7 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
   const harvestGate = model.harvestPaused
     ? paint('harvest OFF', 'yellow', color)
     : paint('harvest ON', 'green', color)
-  const header = truncate(
+  const summary = truncate(
     `${marker}${[
       paint('Auto Build', 'bold', color),
       displayText(basename(model.repo)),
@@ -534,27 +535,40 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
         'dim',
         color,
       ),
-      intake,
-      autoMergeDefault,
-      harvestGate,
     ].join('  ')}`,
     width,
   )
-  // One reserved physical row, even before the first notice. Escaping controls
-  // here prevents a diagnostic from adding rows or violating ASCII width.
-  const status = truncate(displayText(model.statusLine), width)
+  // The global controls live on their own mandatory line. Its fixed blank
+  // marker prefix aligns the first toggle with the title while keeping the
+  // selection lane empty.
+  const toggles = truncate(
+    `  ${[intake, autoMergeDefault, harvestGate].join('  ')}`,
+    width,
+  )
+  // A warning is conditional chrome, not a reserved log slot. Escaping
+  // controls prevents external text from adding rows or violating ASCII width.
+  const warning =
+    model.warningLine === undefined
+      ? undefined
+      : truncate(`  ${displayText(model.warningLine)}`, width)
+  const top = [summary, toggles, ...(warning !== undefined ? [warning] : [])]
   const controls = dashboardControls(model, color, width)
 
   // No paintable height at all (a 1-row screen — see `paintableRows`): paint
   // nothing. Its trailing newline would scroll a single line off even on the
-  // alternate display, which is worse than an empty region.
+  // alternate display, which is worse than an empty region. The two mandatory
+  // header lines outrank warning/body/controls as height disappears.
   if (height !== undefined && height <= 0) return []
-  if (height !== undefined && height === 1) return [header]
-  if (height !== undefined && height === 2) return [header, status]
-  // At three rows there is no room for spacing; retain title, status, and the
-  // controls. Four rows can retain one separator; a visible body requires both.
-  if (height !== undefined && height === 3) return [header, status, controls]
-  if (height !== undefined && height === 4) return [header, status, '', controls]
+  if (height !== undefined && height <= top.length) return top.slice(0, height)
+  // Once the complete top section fits, retain controls before spending rows
+  // on body content. One additional row has no room for spacing; two retain
+  // the top/body separator. A visible body requires both separators.
+  if (height !== undefined && height === top.length + 1) {
+    return [...top, controls]
+  }
+  if (height !== undefined && height === top.length + 2) {
+    return [...top, '', controls]
+  }
 
   const widths = frameWidths(model.builds, model.harvest)
   const rows: RenderedDashboardRow[] = dashboardSelections(model).flatMap(
@@ -589,7 +603,10 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
     },
   )
 
-  const bodyBudget = height === undefined ? Number.POSITIVE_INFINITY : Math.max(0, height - 5)
+  const bodyBudget =
+    height === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, height - top.length - 3)
   let body: string[]
   if (rows.length === 0) {
     body = bodyBudget >= 1
@@ -680,5 +697,5 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
   // Both blank separators are fixed frame chrome, not part of a row block:
   // the first separates the global top section from harvest/build content and
   // the second separates that content from the contextual controls.
-  return [header, status, '', ...body, '', controls]
+  return [...top, '', ...body, '', controls]
 }
