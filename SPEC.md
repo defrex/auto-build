@@ -309,11 +309,14 @@ contract (`src/store/contract.ts` is the shared conformance suite):
 
 ### 7.3 Persistence granularity
 
-Artifacts persist at **phase/round boundaries only**; a killed phase re-runs
-from its start. Designated first exception (future, out of scope for v2.0):
-**live transcript streaming**, so a web UI controlling remote agents can
-watch output in real time. The store's types should reserve a streaming
-revision concept even while no adapter implements it.
+Required phase outputs persist at **phase/round boundaries**; a killed phase
+re-runs from its start. An agent may also explicitly deposit a review artifact
+mid-session, including an atomic PR-attachment designation (§7.5, §8.2); these
+immutable revisions are harmless if a killed phase later retries. Designated
+streaming exception (future, out of scope for v2.0): **live transcript
+streaming**, so a web UI controlling remote agents can watch output in real
+time. The store's types should reserve a streaming revision concept even while
+no adapter implements it.
 
 ### 7.4 Resumption across sandboxes
 
@@ -340,16 +343,24 @@ Three base-selection invariants make this safe with Git:
 A summary comment — verdict history, verification results, links into the
 store. The full audit trail is queryable, not committed to the branch.
 
-Evidence artifacts (such as dashboard-frame captures) are projected into the
-PR as text with exact retrieval commands; the BuildStore copy is always
-authoritative. Optionally, config may name a **public** GitHub release as an
-image host so frames render inline during review. Two invariants govern that
-option: enabling it is an explicit public-disclosure choice made in config,
-and hosted copies are temporary — the dispatcher reclaims them after the
-build reaches a terminal outcome, while store artifacts remain under the
-store's retention policy. Hosting failures degrade to text; they never fail
-verification or block finalize. No frame is ever written into a Git branch or
-workspace.
+Any agent session can explicitly designate an exact deposited artifact as a PR
+attachment through `ab artifact put <kind> <file> --attach`. Designation is a
+typed, atomic event on the ordinary artifact channel — never an artifact-name,
+verify-step, or report-format convention. The current post-spec-restart
+designation for each artifact kind is projected as text with an exact pinned
+retrieval command; distinct kinds remain distinct. The BuildStore copy is
+always authoritative, and non-image artifacts use this same path.
+
+Optionally, `[pr.imageHost]` may name a **public** GitHub release so designated
+`image/*` media render inline during review. Non-images never cross that host
+boundary. Enabling it is an explicit public-disclosure choice made in config,
+and hosted copies are temporary — the dispatcher reclaims them after the build
+reaches a terminal outcome, while store artifacts remain under the store's
+retention policy. Upload/validation/timeout failures record follow-up
+observations and preserve the complete text projection; they never fail
+verification or block finalize. Agents receive no forge credentials. A
+designation after the PR exists publishes a new complete summary, so finalize
+post-steps and post-reconcile verifiers need no custom phase.
 
 ## 8. The `ab` CLI
 
@@ -402,7 +413,7 @@ sessions need no separate global installation.
 | Command | Purpose | Terminal? |
 |---|---|---|
 | `ab context` | hydrate `.ab/` with the phase's inputs; print the manifest | no |
-| `ab artifact put <kind> <file>` | deposit a versioned artifact → returns rev | no |
+| `ab artifact put <kind> <file> [--attach]` | deposit a versioned artifact → returns rev; optionally designate that exact revision for the PR | no |
 | `ab artifact get <kind>[@rev]` | fetch an artifact within own build | no |
 | `ab artifact download …` | sessionless, read-only exact-byte retrieval; works after build termination | no |
 | `ab observe --kind <followup\|refactor\|latent-bug> …` | structured observation, any phase, any time | no |
@@ -824,6 +835,7 @@ The families, with illustrative members:
 | Sessions | `session.started`, `session.ended` (with transcript ref and usage — the analysis corpus) |
 | Plan/code loops | `plan.started` … `plan-review.verdict`; `implement.started` … `code-review.verdict` |
 | Verify/finalize | `verify.started`, `verify.completed {step, outcome}`, `finalize.completed {pr}` |
+| PR attachments | `pr-attachment.designated`, `pr-attachment.hosted`, `pr-attachment.reclaimed`, `pr-attachment.reclaim-failed` |
 | Post-PR [D1] | `pr.merged`, `pr.conflicted`, `reconcile.started`, `reconcile.completed` |
 | Cross-cutting | `observation.recorded`, `escalation.raised`, `phase.failed` |
 | Repository journal | dispatcher setting facts; the `harvest.*` workflow, recovery, and ledger facts |
@@ -881,9 +893,10 @@ plan.started{r1} → plan.completed{plan@1, verifySteps}
 plan-review.started{r1} → plan-review.verdict{approve}
 implement.started{r1} → implement.completed{commits, notes@1}
 code-review.started{r1} → code-review.verdict{approve}
-verify.started{types} → verify.completed{outcome:pass} → …unit → …e2e
-finalize.started → finalize.completed{pr} → finalize.step-completed{release-notes}
-(later, janitor:) pr.merged → workspace.released → build.completed{merged}
+verify.started{types} → verify.completed{outcome:pass} → …unit
+verify.started{e2e} → pr-attachment.designated{artifact,filename,mediaType} → verify.completed{outcome:pass}
+finalize.started → pr-attachment.hosted{designationSeq,asset} → finalize.completed{pr} → finalize.step-completed{release-notes}
+(later, janitor:) pr.merged → workspace.released → build.completed{merged} → pr-attachment.reclaimed{hostedSeq}
 ```
 
 **A — verify failure:** `verify.completed {step: e2e, outcome: fail,
@@ -926,8 +939,11 @@ PR, but *something* must watch it to merge/close, release the workspace, and
 emit `build.completed`. v2 makes it a deterministic **janitor duty of the
 dispatcher** (which already polls on cron): it checks open PRs for its
 builds, emits `pr.merged`/`pr.closed`/`pr.conflicted`, releases workspaces,
-and completes builds. A merged-PR fixup request is a *new ticket*, never a
-reopened build.
+and completes builds. After any terminal outcome it also reclaims every
+pending hosted PR-attachment copy. Reclamation success and failure are durable
+correlated facts; a failed delete remains pending and retries on later ticks,
+including after the build is already done. A merged-PR fixup request is a *new
+ticket*, never a reopened build.
 
 **Merge standard: one rule per direction, never rebase.**
 
@@ -991,6 +1007,11 @@ itself: the system can retune its own configuration via a ticket and a PR.
 baseBranch = "main"
 capacity = 3                    # concurrent builds for this repo
 
+#[pr.imageHost]                 # optional public inline rendering for attached images
+#provider = "github-release"
+#repository = "owner/public-review-assets"
+#releaseId = 123456
+
 [commands]                      # deterministic verbs the kernel may run
 setup = "bun install"           # after provision / sandbox rehydrate (§15.6-C)
 typecheck = "bun run type-check"
@@ -1049,8 +1070,9 @@ kernel, dispatcher, CLI, and any future tooling parse it without evaluating
 anything; commands are plain shell strings. Parsing is strict — an unknown table or key is an error, so a
 typo cannot silently disable a verifier. The full config surface, field
 semantics, and validation rules live with the config code and
-`docs/configuration.md`. The removed `[project]`, `[dispatcher]`, `[harvest]`,
-and `[outer]` tables have no aliases or migration shims.
+`docs/configuration.md`. The removed `[dashboardFrames]`, `[project]`,
+`[dispatcher]`, `[harvest]`, and `[outer]` tables have no aliases or migration
+shims.
 
 Two configurable narrowing mechanisms govern which verify steps run, both
 resolving to the ordinary `skipped` outcome so exclusions stay queryable:

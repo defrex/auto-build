@@ -44,14 +44,15 @@ K unclaimed observation.recorded events
 | `src/events/` | Separate build and repository envelopes/catalogs, frozen payload schemas, actor validation | §15 |
 | `src/harvest/` | Structured occurrence, scan packet, proposal, and ledger schemas | §12 |
 | `src/store/` | BuildStore plus repository-journal contract; memory, SQLite/blob, and remote HTTP adapters | §7 |
-| `src/kernel/` | Phase table, build reducer, engine; pure harvest and dispatcher-settings reducers; converge, stall detection, verify gating, server lifecycle | §5, §10, §12, §15.4–15.5, §16.2 |
+| `src/kernel/` | Phase table, build reducer, engine; pure harvest, dispatcher-settings, and PR-attachment selectors; converge, stall detection, verify gating, server lifecycle | §5, §7.5, §10, §12, §15.4–15.5, §16.2 |
 | `src/ports/` | TicketSource / Workspace / Forge / AgentRunner / Telemetry interfaces, adapters, and fakes; runtime/model routing under `ports/runner/` | §3.2, §9, §13 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty and harvest trigger), harvest deterministic core + runner | §3.3, §12, §15.7 |
 | `src/cli/` and `bin/ab.ts` | The `ab` CLI — the only agent↔store channel — plus init/upgrade and the dispatch loop | §8, §16.3 |
-| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame: pure projection, renderer, poll cache, and frame evidence | §7.5, §14 |
+| `src/cli/dashboard/` | `ab dispatch`'s fixed live frame: pure projection, renderer, poll cache, and deterministic image renderer | §14 |
 | `bin/agent/ab` | Private launcher placed first on agent-session `PATH`; delegates to the canonical `bin/ab.ts` | §8.1 |
 | `src/config/` | `autobuild.toml` parsing and strict validation; user reference in `docs/configuration.md` | §16.1 |
-| `src/integration/` | End-to-end harness and scenarios; the scripted dashboard-capture scene for `verify:dashboard` | — |
+| `src/integration/` | End-to-end harness and product scenarios | — |
+| `tools/` | This repository's local verification tooling, including its dashboard-capture scene; not shipped product behavior | — |
 | `skills/` | Canonical defaults; `ab init` vendors them to `.agents/skills/ab-*` and links `.claude/skills/ab-*` | §16.3 |
 | `skills/guide/` | `ab-guide` — the model-invocable reference for the lifecycle and the full config surface. Update it when config changes; `src/cli/guide-skill.test.ts` fails if a schema field goes undocumented | §16.3 |
 | `docs/spec-standard.md` | The definition of "buildable" every ticket surface cites | §6.1 |
@@ -133,12 +134,22 @@ store precedence (`--store` > `AB_STORE` > `.autobuild/`);
 classifies build/harvest session tuples and routes sessionless invocations,
 so phase-only commands report their complete runner context when run by hand.
 
+**PR attachments.** `src/cli/artifact.ts` atomically turns an explicit
+`artifact put --attach` into an exact artifact plus designation fact.
+`src/kernel/pr-attachments.ts` selects current designations, hosted
+correlations, and pending cleanup without coupling to a producer or verify-step
+name. `src/cli/pr-attachments.ts` performs optional image hosting through the
+narrow Forge capability, while `src/cli/pr-summary.ts` renders the same complete
+text projection for finalize and late designations. The GitHub release transport
+lives in `src/ports/forge/github-pr-attachments.ts`; terminal-build reclamation
+and retry facts remain dispatcher janitor duty.
+
 **Dashboard.** `src/cli/dashboard/model.ts` is the only build-row projection;
 `render.ts` composes the ASCII frame; `live.ts` owns the alternate-screen
 region and teardown; `poll.ts` is a display-only incremental cache (the logs
-remain authoritative — cache loss just rehydrates); `frame-image.ts` and
-`frame-artifacts.ts` render deterministic text/PNG evidence with pinned
-fonts. The dashboard is an operator command producer: every keypress that
+remain authoritative — cache loss just rehydrates); `frame-image.ts` renders a
+deterministic PNG with pinned fonts. The dashboard is an operator command
+producer: every keypress that
 does anything appends a human event to the applicable log, and the header
 shows acknowledged durable state, never optimistic intent. Forge mutation
 stays in dispatcher plumbing.
