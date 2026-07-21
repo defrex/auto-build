@@ -3,8 +3,9 @@
 The contributor-facing map: how the codebase is organized and where the
 seams are. `SPEC.md` is the source of truth for the design and terminology;
 this document maps it to the code. For the user journey — install, configure,
-operate — see [`README.md`](../README.md). Behavioral detail beyond what a
-map needs lives with the code and its tests; when this document and the code
+operate — see [`README.md`](../README.md); for the complete declarative surface,
+see [`docs/configuration.md`](configuration.md). Behavioral detail beyond what
+a map needs lives with the code and its tests; when this document and the code
 disagree, the code is authoritative.
 
 ## Constitution
@@ -49,7 +50,7 @@ K unclaimed observation.recorded events
 | `src/cli/` and `bin/ab.ts` | The `ab` CLI — the only agent↔store channel — plus init/upgrade and the dispatch loop | §8, §16.3 |
 | `src/cli/dashboard/` | `ab dispatch`'s fixed live frame: pure projection, renderer, poll cache, and frame evidence | §7.5, §14 |
 | `bin/agent/ab` | Private launcher placed first on agent-session `PATH`; delegates to the canonical `bin/ab.ts` | §8.1 |
-| `src/config/` | `autobuild.toml` parsing and strict validation | §16.1 |
+| `src/config/` | `autobuild.toml` parsing and strict validation; user reference in `docs/configuration.md` | §16.1 |
 | `src/integration/` | End-to-end harness and scenarios; the scripted dashboard-capture scene for `verify:dashboard` | — |
 | `skills/` | Canonical defaults; `ab init` vendors them to `.agents/skills/ab-*` and links `.claude/skills/ab-*` | §16.3 |
 | `skills/guide/` | `ab-guide` — the model-invocable reference for the lifecycle and the full config surface. Update it when config changes; `src/cli/guide-skill.test.ts` fails if a schema field goes undocumented | §16.3 |
@@ -74,12 +75,12 @@ consults a snapshot in place of the append-only log.
 only through `src/cli/` terminals, which convert artifact deposits into
 event facts atomically — the engine never reads blobs.
 
-**Finalize publication.** Content-producing `finalize:*` agents select and
-commit files locally and leave a clean worktree. `build-runner.ts` derives the
-last published head from event facts, rejects a non-descendant `HEAD`, and
-uses the `Forge.pushBranch` port for a regular kernel-side push before
-checkpointing the new head on `finalize.step-completed`. An unchanged head is
-a no-op; Git/Forge failures stay failure-tolerant observations.
+**Finalize publication.** Content-producing `finalize:*` checks or agents
+select and commit files locally and leave a clean worktree. `build-runner.ts`
+derives the last published head from event facts, rejects a non-descendant
+`HEAD`, and uses the `Forge.pushBranch` port for a regular kernel-side push
+before checkpointing the new head on `finalize.step-completed`. An unchanged
+head is a no-op; Git/Forge failures stay failure-tolerant observations.
 
 **Verify gating.** `src/ontology.ts` owns the canonical
 `pass | fail | skipped` outcome (only `fail` routes back to implement or

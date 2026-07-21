@@ -82,51 +82,58 @@ function model(builds: DashboardBuild[]): DashboardModel {
     drained: false,
     defaultAutoMerge: false,
     harvestPaused: false,
-    statusLine: '',
     builds,
   }
 }
 
 const WIDE = { color: false, width: 200 }
 
-describe('renderDashboard: the title and status rows', () => {
-  test('one title names the product, repo, queue depth, and all three dispatcher controls', () => {
-    const lines = rd(model([build()]), WIDE)
-    const header = lines[0]!
-    expect(header).toContain('Auto Build')
-    expect(header).toContain('app') // the repo basename
-    expect(header).not.toContain('/repos/app')
-    expect(header).toContain('queue 2 | active 1')
-    expect(header).not.toMatch(/\b(?:watch|once)\b/)
-    expect(header).toContain('intake ON')
-    expect(header).toContain('auto merge OFF')
-    expect(header).toContain('harvest ON')
+describe('renderDashboard: two-line header and conditional warning', () => {
+  test('summary is first, controls are second, and both start at the title column', () => {
+    const lines = rd(model([build()]), WIDE).map(stripAnsi)
+    const summary = lines[0]!
+    const toggles = lines[1]!
+    expect(summary).toContain('Auto Build')
+    expect(summary).toContain('app') // the repo basename
+    expect(summary).not.toContain('/repos/app')
+    expect(summary).toContain('queue 2 | active 1')
+    expect(summary).not.toMatch(/\b(?:watch|once)\b/)
+    expect(summary).not.toContain('intake ON')
+    expect(toggles).toContain('intake ON')
+    expect(toggles).toContain('auto merge OFF')
+    expect(toggles).toContain('harvest ON')
+    expect(summary.indexOf('Auto Build')).toBe(2)
+    expect(toggles.search(/\S/)).toBe(summary.indexOf('Auto Build'))
     expect(lines.slice(0, -1).join('\n')).not.toContain('Ctrl-C to stop')
   })
 
-  test('exactly one status row is always second, including before the first notice', () => {
-    const empty = rd(model([build()]), WIDE)
-    expect(empty[1]).toBe('')
+  test('the warning row is absent until needed, then appears aligned below both headers', () => {
+    const clean = rd(model([build()]), WIDE).map(stripAnsi)
+    expect(clean[2]).toBe('')
 
-    const messaged = rd(
-      { ...model([build()]), statusLine: 'tick: dispatched=1' },
+    const warned = rd(
+      { ...model([build()]), warningLine: 'ticket source unavailable' },
       WIDE,
-    )
-    expect(messaged[1]).toBe('tick: dispatched=1')
-    expect(messaged.filter((line) => line.includes('tick:'))).toHaveLength(1)
-    expect(messaged).toHaveLength(empty.length)
+    ).map(stripAnsi)
+    expect(warned[2]).toBe('  ticket source unavailable')
+    expect(warned[2]!.search(/\S/)).toBe(warned[0]!.indexOf('Auto Build'))
+    expect(warned[3]).toBe('')
+    expect(warned).toHaveLength(clean.length + 1)
   })
 
-  test('long, multiline, and non-ASCII notices stay on one safe physical row', () => {
-    const short = rd(model([build()]), { color: true, width: 40 })
-    const long = rd(
-      { ...model([build()]), statusLine: `warning\n${'x'.repeat(100)} café` },
+  test('long, multiline, and non-ASCII warnings stay on one safe physical row', () => {
+    const clean = rd(model([build()]), { color: true, width: 40 })
+    const warned = rd(
+      {
+        ...model([build()]),
+        warningLine: `warning\n${'x'.repeat(100)} café`,
+      },
       { color: true, width: 40 },
     )
-    expect(long).toHaveLength(short.length)
-    expect(stripAnsi(long[1]!).length).toBeLessThanOrEqual(40)
-    expect(long[1]).not.toContain('\n')
-    expect(stripAnsi(long[1]!)).toContain('warning\\u{a}')
+    expect(warned).toHaveLength(clean.length + 1)
+    expect(stripAnsi(warned[2]!).length).toBeLessThanOrEqual(40)
+    expect(warned[2]).not.toContain('\n')
+    expect(stripAnsi(warned[2]!)).toContain('warning\\u{a}')
   })
 
   test('an empty dashboard says so', () => {
@@ -135,23 +142,23 @@ describe('renderDashboard: the title and status rows', () => {
   })
 
   test('the summary contains no loop-mode word', () => {
-    const [header] = rd(model([]), WIDE)
-    expect(header).toContain('queue 2 | active 0')
-    expect(header).not.toMatch(/\b(?:watch|once)\b/)
+    const [summary] = rd(model([]), WIDE)
+    expect(summary).toContain('queue 2 | active 0')
+    expect(summary).not.toMatch(/\b(?:watch|once)\b/)
   })
 
   test('process defaults and the acknowledged durable gate render explicit ON/OFF state', () => {
-    expect(rd({ ...model([]), drained: true }, WIDE)[0]).toContain('intake OFF')
-    expect(rd(model([]), WIDE)[0]).toContain('intake ON')
-    expect(rd(model([]), WIDE)[0]).toContain('auto merge OFF')
+    expect(rd({ ...model([]), drained: true }, WIDE)[1]).toContain('intake OFF')
+    expect(rd(model([]), WIDE)[1]).toContain('intake ON')
+    expect(rd(model([]), WIDE)[1]).toContain('auto merge OFF')
     expect(
-      rd({ ...model([]), defaultAutoMerge: true }, WIDE)[0],
+      rd({ ...model([]), defaultAutoMerge: true }, WIDE)[1],
     ).toContain('auto merge ON')
-    expect(rd(model([]), WIDE)[0]).toContain('harvest ON')
-    expect(rd({ ...model([]), harvestPaused: true }, WIDE)[0]).toContain(
+    expect(rd(model([]), WIDE)[1]).toContain('harvest ON')
+    expect(rd({ ...model([]), harvestPaused: true }, WIDE)[1]).toContain(
       'harvest OFF',
     )
-    const defaults = rd(model([]), { color: true, width: 200 })[0]!
+    const defaults = rd(model([]), { color: true, width: 200 })[1]!
     expect(defaults).toContain('\x1b[32mintake ON\x1b[0m')
     expect(defaults).toContain('\x1b[33mauto merge OFF\x1b[0m')
     expect(defaults).toContain('\x1b[32mharvest ON\x1b[0m')
@@ -164,18 +171,19 @@ describe('renderDashboard: the title and status rows', () => {
         harvestPaused: true,
       },
       { color: true, width: 200 },
-    )[0]!
+    )[1]!
     expect(toggled).toContain('\x1b[33mintake OFF\x1b[0m')
     expect(toggled).toContain('\x1b[32mauto merge ON\x1b[0m')
     expect(toggled).toContain('\x1b[33mharvest OFF\x1b[0m')
   })
 
-  test('the header is the selected global row even with no harvest or builds', () => {
+  test('the summary is the selected global row even with no harvest or builds', () => {
     const lines = rd(
       { ...model([]), selection: { kind: 'global' } },
       WIDE,
     ).map(stripAnsi)
     expect(lines[0]!.startsWith('> Auto Build')).toBe(true)
+    expect(lines[1]!.startsWith('  intake ON')).toBe(true)
     expect(lines.filter((line) => line.startsWith('> '))).toHaveLength(1)
     expect(lines.join('\n')).toContain('no active builds')
   })
@@ -486,6 +494,28 @@ describe('renderDashboard: layout', () => {
     expect(lines.at(-2)).toBe('')
   })
 
+  test('the two-column cursor lane contains only spaces or the selected marker before the legend', () => {
+    const lines = rd(
+      {
+        ...model([
+          build({ slug: 'alpha', blockers: ['operator input required'] }),
+          build({ slug: 'beta' }),
+        ]),
+        warningLine: 'ticket source warning',
+        harvest: harvest({ detail: 'stopped at review' }),
+        selection: { kind: 'build', slug: 'beta' },
+      },
+      WIDE,
+    ).map(stripAnsi)
+    const legend = lines.findIndex((line) => line.startsWith('Keys:'))
+    expect(legend).toBeGreaterThan(0)
+    for (const line of lines.slice(0, legend)) {
+      if (line === '') continue
+      expect(['  ', '> ']).toContain(line.slice(0, 2))
+    }
+    expect(lines.slice(0, legend).filter((line) => line.startsWith('> '))).toHaveLength(1)
+  })
+
   test('PR and status columns remain aligned when the auto-merge token is absent', () => {
     const lines = rd(
       model([
@@ -738,6 +768,32 @@ describe('renderDashboard: `height` caps the LINE count', () => {
     }
   })
 
+  test('warning and no-warning height sweeps keep complete header lines ahead of body', () => {
+    for (const warningLine of [undefined, 'store read failed'] as const) {
+      const dashboard = {
+        ...model(many(5)),
+        ...(warningLine !== undefined ? { warningLine } : {}),
+      }
+      for (let height = 0; height <= 16; height += 1) {
+        const lines = rd(dashboard, {
+          color: true,
+          width: 80,
+          height,
+        }).map(stripAnsi)
+        expect(lines.length).toBeLessThanOrEqual(height)
+        if (height >= 1) expect(lines[0]).toContain('Auto Build')
+        if (height >= 2) {
+          expect(lines[1]).toContain('intake ON')
+          expect(lines[1]).toContain('harvest ON')
+        }
+        if (warningLine !== undefined && height >= 3) {
+          expect(lines[2]).toBe(`  ${warningLine}`)
+        }
+        for (const line of lines) expect(line.length).toBeLessThanOrEqual(80)
+      }
+    }
+  })
+
   test('the header survives the clamp — it is the line the ACs name', () => {
     for (let height = 1; height <= 12; height += 1) {
       const [header] = rd(model(many(8)), { color: false, width: 80, height })
@@ -895,11 +951,11 @@ describe('renderDashboard: the progress row WRAPS rather than truncating', () =>
 describe('renderDashboard: the ticket-first, status-right slug line', () => {
   /** The one slug line in a frame (the row carrying the status word). */
   const slugLine = (lines: string[], status = 'RUNNING'): string =>
-    lines.find((l) => stripAnsi(l).includes(status) && !l.startsWith('  '))!
+    lines.find((line) => stripAnsi(line).includes(status))!
 
   test('the ticket id is the first token, the slug follows it (AC 1)', () => {
     const line = stripAnsi(slugLine(rd(model([build({ pr: undefined })]), WIDE)))
-    expect(line.startsWith('ENG-42')).toBe(true)
+    expect(line.startsWith('  ENG-42')).toBe(true)
     expect(line.indexOf('auth-rate-limit')).toBeGreaterThan(line.indexOf('ENG-42'))
   })
 
@@ -942,7 +998,7 @@ describe('renderDashboard: the ticket-first, status-right slug line', () => {
     const line = stripAnsi(
       slugLine(rd(model([build({ slug: 'solo', ticketId: undefined, pr: undefined })]), WIDE)),
     )
-    expect(line.startsWith('solo')).toBe(true) // no left padding for an absent column
+    expect(line.startsWith('  solo')).toBe(true) // marker lane, no ticket column
   })
 })
 

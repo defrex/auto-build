@@ -13,7 +13,7 @@
  * `ab ticket create` constructs its TicketSource via a factory, so the whole
  * loop is testable over fakes.
  *
- * Concurrency is config, not code (§16.1): `[dispatcher].capacity` caps the
+ * Concurrency is config, not code (§16.1): top-level `capacity` caps the
  * concurrent builds for this repo. `launchRunner` starts each build-runner
  * IN-PROCESS but does not block the dispatcher on it (fire-and-forget,
  * tracked) — so with capacity N up to N builds run at once, while the
@@ -337,7 +337,7 @@ class DispatchLoop {
   /** Ephemeral per-process presentation controls. Dispatcher settings are
    * projected from the repository journal and never cached here. */
   private selection: DashboardSelection | undefined = { kind: 'global' }
-  private statusLine = ''
+  private warningLine: string | undefined
   /** Last intake-enabled tick's standing queue depth, for the dashboard header. */
   private queuedCount = 0
   /** A slug/id-bound blocked-resume field. The model receives only slug/value;
@@ -446,13 +446,15 @@ class DispatchLoop {
     if (this.model === undefined) return
     const {
       selection: _oldSelection,
-      statusLine: _oldStatusLine,
+      warningLine: _oldWarningLine,
       resumeInput: _oldResumeInput,
       ...base
     } = this.model
     this.model = {
       ...base,
-      statusLine: this.statusLine,
+      ...(this.warningLine !== undefined
+        ? { warningLine: this.warningLine }
+        : {}),
       ...(this.selection !== undefined
         ? { selection: this.selection }
         : {}),
@@ -1067,42 +1069,41 @@ class DispatchLoop {
 
   // ── Message routing ───────────────────────────────────────────────────────
   //
-  // The interactive frame is the dashboard's ONLY output surface. Every
-  // dispatcher notice replaces one process-local status row and repaints the
-  // cached projection synchronously; a concurrent store poll overlays this
-  // value again before painting, so an older projection cannot erase it.
+  // The interactive frame is the dashboard's ONLY output surface. Routine
+  // notices are intentionally silent there; only warnings/errors become a
+  // process-local warning row. A concurrent store poll overlays the latest
+  // warning again before painting, so an older projection cannot erase it.
   // Plain/non-interactive mode keeps the existing line sinks exactly.
 
-  private setStatus(line: string): void {
-    this.statusLine = line
+  private setWarning(line: string): void {
+    this.warningLine = line
     this.syncModelControls()
     this.paint()
   }
 
   private say(line: string): void {
-    if (this.dashboard) this.setStatus(line)
-    else this.opts.stdout(line)
+    if (!this.dashboard) this.opts.stdout(line)
   }
 
   private warn(line: string): void {
-    if (this.dashboard) this.setStatus(line)
+    if (this.dashboard) this.setWarning(line)
     else this.opts.stderr(line)
   }
 
   /**
    * Ticket and dependency diagnostics are independent notices (line-oriented
-   * in plain mode, successive replacements of the one dashboard status row on
-   * a TTY). Invalid ticket records use the warning seam so scripted JSON/stdout
+   * in plain mode; on a TTY only warning-severity diagnostics are rendered).
+   * Invalid ticket records use the warning seam so scripted JSON/stdout
    * consumers stay clean; dependency holds retain their ordinary notice seam.
-   * This is the operator's only view of why a ready ticket is sitting still,
-   * and the acceptance criterion is that it needs no provider, filesystem, or
-   * database inspection. The counts map guards on `typeof count === 'number'`
+   * In line-oriented mode this is the operator's view of why a ready ticket is
+   * sitting still, with no provider, filesystem, or database inspection. The
+   * counts map guards on `typeof count === 'number'`
    * because a non-numeric TickReport field would otherwise be dropped here
    * silently (`count > 0` is false for an array, with no type error).
    *
-   * `say()` is the plain stdout identity and the dashboard status overlay, so
-   * line-oriented behavior is unchanged while interactive output never leaves
-   * the frame.
+   * `say()` is the plain stdout identity and intentionally silent on the
+   * dashboard, so line-oriented behavior is unchanged while routine
+   * interactive chatter disappears.
    */
   private printReport(
     report: Awaited<ReturnType<Dispatcher['tick']>>,
@@ -1120,8 +1121,8 @@ class DispatchLoop {
       this.say(`tick: ${parts.join(' ')}`)
       return true
     }
-    // A tick that did something is worth a plain line or dashboard status;
-    // idle is the every-10s noise the interactive frame suppresses.
+    // A tick that did something is worth a plain line. Interactive mode
+    // suppresses both action counts and the every-10s idle noise.
     if (!this.dashboard && printIdle) {
       this.opts.stdout('tick: idle')
       return true
@@ -1291,7 +1292,7 @@ class DispatchLoop {
         this.stopInput()
       } catch (error) {
         // Cursor restoration must not be skipped just because stdin restoration
-        // itself failed. Keep the failure visible in the final status row when
+        // itself failed. Keep the failure visible in the final warning row when
         // the presentation seam is still usable.
         try {
           this.warn(
@@ -1316,7 +1317,7 @@ class DispatchLoop {
   }
 
   async run(): Promise<void> {
-    const capacity = this.config.dispatcher.capacity
+    const capacity = this.config.capacity
     if (this.opts.once) {
       if (!this.dashboard) {
         this.say(`ab dispatch — one pass over ${this.opts.targetRepo} (capacity ${capacity})`)

@@ -184,15 +184,17 @@ engine. Exactly two extension points:
   another step's failure. A skip is produced either by an agent verifier's
   explicit verdict or by the kernel, when the approved plan did not select an
   optional step or a configured path-applicability rule excludes it (§16.1).
-- **`finalize:*`** — optional post-steps (release notes, changelog,
-  screenshots, ticket linking). Independent and failure-tolerant: a failed
-  post-step files an observation; it never kills a green build. A step that
-  produces repository content selects and commits its files locally and must
-  finish with a clean worktree. The runner verifies that the last durably
-  published head remains an ancestor, then regular-pushes the new head and
-  checkpoints it on `finalize.step-completed`. An unchanged head creates and
-  pushes no commit; Git or publication failure is the ordinary failed-step
-  observation, never a reason to rewrite history or fail the green build.
+- **`finalize:*`** — optional ordered post-steps (release notes, changelog,
+  publishing, ticket linking). Each configured step is either a deterministic
+  command check with no agent session or an agent running an exact skill.
+  Independent and failure-tolerant: a failed post-step files an observation;
+  it never kills a green build. A step that produces repository content
+  selects and commits its files locally and must finish with a clean worktree.
+  The runner verifies that the last durably published head remains an ancestor,
+  then regular-pushes the new head and checkpoints it on
+  `finalize.step-completed`. An unchanged head creates and pushes no commit;
+  Git or publication failure is the ordinary failed-step observation, never a
+  reason to rewrite history or fail the green build.
 
 Everything else — phase order, the two review loops, escalation semantics —
 is kernel-hard-coded. That is what keeps the system inspectable.
@@ -493,10 +495,10 @@ not build failures.
 All `git push`, PR creation, and forge API calls happen kernel-side. `ab done`
 in `implement` pushes the branch and records `{base, head}`; `ab done` in
 `finalize` has the kernel open the PR using the deposited `pr-description`
-artifact. After a successful content-producing `finalize:*` turn, the runner
+artifact. After a successful content-producing `finalize:*` step, the runner
 requires a clean worktree and a descendant local `HEAD`, then regular-pushes
 the configured build branch and records that head before completing the step.
-A no-op turn has no push. Agents only ever commit locally. Consequences: forge
+A no-op step has no push. Agents only ever commit locally. Consequences: forge
 credentials **never enter the sandbox** (load-bearing once builds run on
 remote sandboxes), history is extended rather than force-pushed, and the
 push-at-boundary rule from [D3] is enforced by construction rather than
@@ -655,11 +657,12 @@ signals (telemetry, observations)
    → build → PR → merge
 ```
 
-Scheduled ingesters such as `ingest:sentry` are cron-driven through
-`[outer]`. Observation harvest is instead threshold-driven: the dispatcher
-counts unclaimed structured observations across the repository each tick, and
-at `[harvest].threshold` it claims the whole current accumulation as one
-immutable snapshot and starts one staged run. Occurrence identity is
+Additional scheduled ingesters such as `ingest:sentry` remain an open design
+thread and have no shipped config surface. Observation harvest is
+threshold-driven: the dispatcher counts unclaimed structured observations
+across the repository each tick, and at `[policy].harvestThreshold` it claims
+the whole current accumulation as one immutable snapshot and starts one staged
+run. Occurrence identity is
 `{build slug, event seq}` — never payload id or a scalar high-water mark,
 because event sequences are per build. Harvest state lives in the repository
 journal, separate from build streams; the repository lease is the
@@ -995,13 +998,14 @@ and because it is repo-versioned, changes to it flow through the pipeline
 itself: the system can retune its own configuration via a ticket and a PR.
 
 ```toml
-[project]
 baseBranch = "main"
+capacity = 3                    # concurrent builds for this repo
 
 [commands]                      # deterministic verbs the kernel may run
 setup = "bun install"           # after provision / sandbox rehydrate (§15.6-C)
 typecheck = "bun run type-check"
 test = "bun run test"
+publish = "bun run publish"
 
 [server]                        # dev-server lifecycle — see §16.2
 start = "bun dev"
@@ -1022,7 +1026,13 @@ needsServer = true
 paths = ["web/**"]              # optional changed-path applicability
 
 [finalize]
-steps = ["release-notes"]       # optional post-steps, failure-tolerant (§5)
+steps = ["publish", "release-notes"] # ordered, failure-tolerant (§5)
+[finalize.publish]
+kind = "check"
+command = "publish"
+[finalize.release-notes]
+kind = "agent"
+skill = "ab-release-notes"
 
 [roles.default]                 # reserved inheritance base, never a phase (§9)
 runtime = "claude"
@@ -1035,26 +1045,22 @@ model = "moonshotai/kimi-k3"
 stallRounds = 3
 maxVerifyAttempts = 3
 maxReconcileAttempts = 3
-
-[dispatcher]
-capacity = 3                    # concurrent builds for this repo
+maxReviewRounds = 4
+harvestThreshold = 5            # observation-count back-pressure in dispatch
 
 [tickets]
 source = "file"
 readyState = "ready"            # required: the one state a ticket must sit in to dispatch
-
-[harvest]                       # observation-count back-pressure in dispatch
-threshold = 5
-
-[outer]                         # cron schedules for OTHER ingesters
-"ingest:sentry" = { cron = "0 */4 * * *" }
 ```
 
-Declarative (TOML), not executable config: the kernel, dispatcher, CLI, and
-any future tooling parse it without evaluating anything; commands are plain
-shell strings. Parsing is strict — an unknown table or key is an error, so a
+The two root scalars must appear before the first table header (TOML otherwise
+nests them in that table). Declarative (TOML), not executable config: the
+kernel, dispatcher, CLI, and any future tooling parse it without evaluating
+anything; commands are plain shell strings. Parsing is strict — an unknown table or key is an error, so a
 typo cannot silently disable a verifier. The full config surface, field
-semantics, and validation rules live with the config code and `README.md`.
+semantics, and validation rules live with the config code and
+`docs/configuration.md`. The removed `[project]`, `[dispatcher]`, `[harvest]`,
+and `[outer]` tables have no aliases or migration shims.
 
 Two configurable narrowing mechanisms govern which verify steps run, both
 resolving to the ordinary `skipped` outcome so exclusions stay queryable:
@@ -1135,6 +1141,6 @@ visible instead of silent.
 2. **[OPEN] Retention/archival policy** — the v1 archival gap, now a store
    config concern rather than a repo problem. Needs a default (e.g. prune
    blobs for merged builds after N months, keep events).
-3. **[OPEN] Global capacity** — per-repo capacity lives in `[dispatcher]`
-   (§16.1); whether a cross-repo global cap is needed, and where it lives,
-   is unresolved.
+3. **[OPEN] Global capacity** — per-repo capacity is the top-level `capacity`
+   scalar (§16.1); whether a cross-repo global cap is needed, and where it
+   lives, is unresolved.

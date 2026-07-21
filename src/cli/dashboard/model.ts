@@ -148,10 +148,9 @@ export interface DashboardModel {
   harvestPaused: boolean
   /** Stable row identity, never a row index. */
   selection?: DashboardSelection
-  /** Latest process-local dispatcher notice. Always rendered on one reserved
-   * physical row; an empty string keeps that row present before the first
-   * notice. */
-  statusLine: string
+  /** Latest process-local warning/error. Routine dispatcher notices never
+   * enter the interactive model; absence means the warning row is omitted. */
+  warningLine?: string
   /** Ephemeral blocked-resume field; never derived from or stored in events. */
   resumeInput?: ResumeInputView
   builds: DashboardBuild[]
@@ -882,7 +881,7 @@ export interface DashboardHeader {
   repo: string
   queued: number
   selection?: DashboardSelection
-  statusLine?: string
+  warningLine?: string
   resumeInput?: ResumeInputView
 }
 
@@ -907,8 +906,10 @@ export function buildDashboardFromProjected(
     drained: !settings.intake,
     defaultAutoMerge: settings.defaultAutoMerge,
     harvestPaused: harvestProjection.harvestPaused,
-    statusLine: header.statusLine ?? '',
     ...(header.selection !== undefined ? { selection: header.selection } : {}),
+    ...(header.warningLine !== undefined
+      ? { warningLine: header.warningLine }
+      : {}),
     ...(header.resumeInput !== undefined ? { resumeInput: header.resumeInput } : {}),
     builds,
     ...(harvestProjection.harvest !== undefined

@@ -29,9 +29,9 @@
  *   fails (a rambling session is never continued — fresh start next attempt,
  *   D5) or when `run` exits; the cumulative turn log is discarded then,
  *   because every round already deposited its own transcript.
- * - `finalize.step-completed` and `observation.recorded` admit only agent
- *   actors (§15.3), so the runner records a post-step's outcome on the
- *   session's behalf using the session's own agent actor.
+ * - Finalize checks are deterministic kernel work with no synthetic session;
+ *   finalize agents retain their session actor. Both paths are deliberately
+ *   failure-tolerant and drain through the same completion/observation writer.
  * - The D5 retry guard also covers agent-verify steps (keyed `verify:<step>`,
  *   round = attempt): a no-terminal or provider-failed verify session would
  *   otherwise re-run forever, since its `verify.completed` never lands.
@@ -42,7 +42,7 @@
  */
 import type { Config } from '../config/schema'
 import type { AbEvent, EventWrite } from '../events/catalog'
-import { KERNEL, agentActor } from '../events/envelope'
+import { KERNEL, agentActor, type Actor } from '../events/envelope'
 import type { IdSource } from '../ids'
 import { decideNext, type Decision } from '../kernel/engine'
 import { PHASE_SPECS } from '../kernel/phases'
@@ -57,7 +57,6 @@ import {
 } from '../ontology'
 import { createRuntimeResolver, type RuntimeResolver } from '../ports/runner/routing'
 import type { RuntimeRegistry } from '../ports/runner/runtime'
-import { installedSkillName } from '../skills'
 import type {
   AgentRunner,
   AgentSessionHandle,
@@ -810,18 +809,77 @@ export class BuildRunner {
   }
 
   /**
-   * Failure-tolerant post-step (§5). Agents may select and commit repository
-   * content locally, but only this kernel boundary may publish it (D7). A
-   * clean descendant HEAD is regular-pushed and checkpointed before the step
-   * completion fact; Git/Forge failures become the ordinary failed outcome
-   * plus an observation and never route a green build backward.
+   * Failure-tolerant post-step (§5). Checks run directly and agents run their
+   * exact configured skill, but either kind may commit selected repository
+   * content locally. Only this kernel boundary may publish it (D7): a clean
+   * descendant HEAD is regular-pushed and checkpointed before completion.
+   * Step, Git, and Forge failures become the ordinary failed outcome plus an
+   * observation and never route a green build backward.
    */
   private async runFinalizeStep(
     decision: RunFinalizeStepDecision,
     events: AbEvent[],
   ): Promise<void> {
-    const { store, slug, ids, workspacePath, forge } = this.deps
-    const { step } = decision
+    const { step, action } = decision
+    let actor: Actor = KERNEL
+    let durableHead: string | undefined
+    let failureNote: string | undefined
+
+    try {
+      await this.requireFinalizeWorktreeClean('before the post-step starts')
+      durableHead = selectPublishedBranchHead(events)
+    } catch (error) {
+      failureNote = `finalize publication preflight failed: ${errorMessage(error)}`
+    }
+
+    if (failureNote === undefined) {
+      if (action.kind === 'check') {
+        failureNote = await this.runFinalizeCheck(action.command)
+      } else {
+        const outcome = await this.runFinalizeAgent(step, action.skill)
+        actor = outcome.actor
+        failureNote = outcome.failureNote
+      }
+    }
+
+    let pushedHead: string | undefined
+    if (failureNote === undefined && durableHead !== undefined) {
+      try {
+        await this.requireFinalizeWorktreeClean('after the post-step finishes')
+        const head = await this.resolveFinalizeHead()
+        if (head !== durableHead) {
+          await this.requirePublishedHeadAncestor(durableHead, head)
+          await this.deps.forge.pushBranch(this.deps.workspacePath, this.deps.branch)
+          pushedHead = head
+        }
+      } catch (error) {
+        failureNote = `finalize publication failed: ${errorMessage(error)}`
+      }
+    }
+
+    await this.recordFinalizeOutcome(step, actor, failureNote, pushedHead)
+  }
+
+  /** A finalize check is direct kernel plumbing: no agent session is created. */
+  private async runFinalizeCheck(command: string): Promise<string | undefined> {
+    try {
+      const result = await this.deps.exec(['sh', '-c', command], {
+        cwd: this.deps.workspacePath,
+      })
+      return result.exitCode === 0 ? undefined : `command exited ${result.exitCode}`
+    } catch (error) {
+      return `command execution failed: ${errorMessage(error)}`
+    }
+  }
+
+  /** A finalize agent uses the configured skill verbatim and the logical step
+   * name for role routing. Provider/launch failures remain post-step failures,
+   * not build failures. */
+  private async runFinalizeAgent(
+    step: string,
+    skill: string,
+  ): Promise<{ actor: Actor; failureNote: string | undefined }> {
+    const { store, slug, ids, workspacePath } = this.deps
     const session = ids('s')
     const { runner, runtime: runnerName, model, extensions } = this.resolver.resolve(step)
 
@@ -838,34 +896,24 @@ export class BuildRunner {
       },
     } satisfies EventWrite<'session.started'>)
 
-    let durableHead: string | undefined
+    let handle: AgentSessionHandle | undefined
     let failureNote: string | undefined
     try {
-      await this.requireFinalizeWorktreeClean('before the post-step starts')
-      durableHead = selectPublishedBranchHead(events)
-    } catch (error) {
-      failureNote = `finalize publication preflight failed: ${errorMessage(error)}`
-    }
-
-    let handle: AgentSessionHandle | undefined
-    if (failureNote === undefined) {
-      try {
-        const turn = await runner.start({
-          skill: installedSkillName(step), // installed names carry `ab-` (§4)
-          invocation: slug,
-          buildSlug: slug,
-          workspacePath,
-          ...(model !== undefined ? { model } : {}),
-          ...(extensions !== undefined ? { extensions } : {}),
-          env: this.sessionEnvFor('finalize@1', session),
-        })
-        handle = turn.session
-        if (turn.result.kind === 'failed') {
-          failureNote = `agent turn failed: ${turn.result.failure.message}`
-        }
-      } catch (error) {
-        failureNote = `agent session failed: ${errorMessage(error)}`
+      const turn = await runner.start({
+        skill,
+        invocation: slug,
+        buildSlug: slug,
+        workspacePath,
+        ...(model !== undefined ? { model } : {}),
+        ...(extensions !== undefined ? { extensions } : {}),
+        env: this.sessionEnvFor('finalize@1', session),
+      })
+      handle = turn.session
+      if (turn.result.kind === 'failed') {
+        failureNote = `agent turn failed: ${turn.result.failure.message}`
       }
+    } catch (error) {
+      failureNote = `agent session failed: ${errorMessage(error)}`
     }
 
     if (handle !== undefined) {
@@ -883,22 +931,19 @@ export class BuildRunner {
       }
     }
 
-    let pushedHead: string | undefined
-    if (failureNote === undefined && durableHead !== undefined) {
-      try {
-        await this.requireFinalizeWorktreeClean('after the post-step finishes')
-        const head = await this.resolveFinalizeHead()
-        if (head !== durableHead) {
-          await this.requirePublishedHeadAncestor(durableHead, head)
-          await forge.pushBranch(workspacePath, this.deps.branch)
-          pushedHead = head
-        }
-      } catch (error) {
-        failureNote = `finalize publication failed: ${errorMessage(error)}`
-      }
-    }
+    return { actor: agentActor(step, session), failureNote }
+  }
 
-    const actor = agentActor(step, session)
+  /** Both finalize kinds append the same facts and always let the engine
+   * advance. Durable-write failures still propagate; only step/publication
+   * work is failure-tolerant. */
+  private async recordFinalizeOutcome(
+    step: string,
+    actor: Actor,
+    failureNote: string | undefined,
+    pushedHead: string | undefined,
+  ): Promise<void> {
+    const { store, slug, ids } = this.deps
     if (failureNote === undefined) {
       await store.append(slug, {
         actor,
