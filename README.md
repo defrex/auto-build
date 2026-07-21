@@ -98,12 +98,16 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
 4. **verify:\*** — your verification steps, in the order you declare them:
    shell commands judged by exit code, or agent verifiers that return a
    verdict.
-5. **finalize** — the PR opens with an agent-written description, then any
-   post-PR steps you've configured run failure-tolerant. A content-producing
-   step commits selected files locally and finishes clean; the runner extends
-   the open PR branch with a regular push. A no-op adds no commit, and a
-   publication failure becomes a follow-up observation rather than failing
-   the green build.
+5. **finalize** — the PR opens with an agent-written description and a summary
+   of explicitly attached evidence, then any post-PR steps you've configured
+   (changelogs, release notes) run failure-tolerant. A content-producing step
+   commits selected files locally; the runner extends the open PR branch with
+   a regular push. A no-op adds no commit, and a publication failure becomes a
+   follow-up observation rather than failing the green build. Agent verifiers
+   attach an exact screenshot, trace, or other artifact with
+   `ab artifact put <kind> <file> --attach`; the PR always gets a pinned
+   retrieval command, and configured public image hosting can also render
+   images inline.
 6. **epilogue** — the dispatcher watches the open PR. Conflicts route back
    through reconcile and re-verify; the build ends `merged` or `closed`.
 

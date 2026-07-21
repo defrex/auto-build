@@ -7,8 +7,8 @@ Commands are shell strings; the config itself is never executed as code.
 
 Parsing is strict. Unknown top-level keys or tables, unknown fields inside a
 known table, malformed step tables, and dangling command references are errors.
-The removed `[project]`, `[dispatcher]`, `[harvest]`, and `[outer]` tables have
-no aliases or migration behavior.
+The removed `[dashboardFrames]`, `[project]`, `[dispatcher]`, `[harvest]`, and
+`[outer]` tables have no aliases or migration behavior.
 
 ## Root scalars
 
@@ -216,11 +216,18 @@ canonicalizes case on input.
 Set `LINEAR_API_KEY` in the environment (a local `.env` works); secrets never
 belong in `autobuild.toml`.
 
-## `[dashboardFrames]`
+## `[pr]` and `[pr.imageHost]`
 
-Optional and off by default. This temporary review-window feature copies PNGs
-from a successful current-cycle `verify:dashboard` report to an existing public
-GitHub release and embeds the public asset URLs in the PR summary.
+PR attachments are explicit and work without hosting. In any agent session,
+`ab artifact put <kind> <file> --attach` atomically deposits the bytes and
+designates that exact revision. Finalize lists every current designation with a
+pinned `ab artifact download` command. A later designation of the same artifact
+kind replaces the earlier revision; distinct kinds remain distinct. Non-image
+artifacts are listed exactly like images.
+
+`[pr.imageHost]` is optional and off by default. It opts attached `image/*`
+media into temporary public hosting on an existing GitHub release, allowing the
+PR summary to render them inline. Non-images are never uploaded.
 
 | Field | Default | Constraints | Purpose |
 |---|---:|---|---|
@@ -228,16 +235,27 @@ GitHub release and embeds the public asset URLs in the PR summary.
 | `repository` | — | required public `owner/repo` pair | Repository containing the release. |
 | `releaseId` | — | required positive integer | Existing published, mutable release id. |
 
-Autobuild creates no release or tag. The `gh` identity needs Contents write
-permission. Hosted copies are deleted after `build.completed`; BuildStore
-artifacts remain authoritative. Hosting failure files a follow-up and preserves
-the text-frame PR comment without changing verification.
+Autobuild creates no release or tag. The release must be published and mutable,
+and the `gh` identity needs Contents write permission. A private source repo
+must use a separate public asset repository because inline image fetching is
+unauthenticated; configuring the table is explicit temporary-public-disclosure
+consent. Upload, validation, and timeout failures file follow-up observations,
+preserve the complete text attachment projection, and never change verification
+or block finalize. Hosted copies are deleted after `build.completed`; failed
+deletions are durable and retry on later dispatcher ticks. BuildStore artifacts
+remain authoritative under the store's separate retention policy.
 
 ## Complete example
 
 ```toml
 baseBranch = "main"
 capacity = 2
+
+# Optional temporary public hosting for explicitly attached images.
+#[pr.imageHost]
+#provider = "github-release"
+#repository = "owner/public-review-assets"
+#releaseId = 123456
 
 [commands]
 setup = "bun install"
