@@ -338,6 +338,8 @@ class DispatchLoop {
    * projected from the repository journal and never cached here. */
   private selection: DashboardSelection | undefined = { kind: 'global' }
   private statusLine = ''
+  /** Last intake-enabled tick's standing queue depth, for the dashboard header. */
+  private queuedCount = 0
   /** A slug/id-bound blocked-resume field. The model receives only slug/value;
    * captured escalation ids stay controller-private. */
   private resumePrompt: ResumePrompt | undefined
@@ -426,12 +428,16 @@ class DispatchLoop {
       // Sample inside the serialized tick, not at process startup. Every
       // dispatcher therefore gates claims from the latest repository facts.
       const settings = await this.readDispatchSettings()
-      return this.dispatcher.tick({
+      const report = await this.dispatcher.tick({
         resumeCurrent,
         acceptNewWork: settings.intake,
         defaultAutoMerge: settings.defaultAutoMerge,
         autoMergeUser: buildControlUser(this.opts.env),
       })
+      // A drained tick never ran the ready scan, so its zero is not a queue
+      // fact — keep the last observed depth on screen instead.
+      if (settings.intake) this.queuedCount = report.queued
+      return report
     })
   }
 
@@ -1101,7 +1107,9 @@ class DispatchLoop {
     report: Awaited<ReturnType<Dispatcher['tick']>>,
     printIdle = true,
   ): boolean {
-    const { ticketDiagnostics, dependencyDiagnostics, ...counts } = report
+    // `queued` is a standing depth, not a tick action — the header owns it;
+    // repeating it in the notice would make every saturated tick look busy.
+    const { ticketDiagnostics, dependencyDiagnostics, queued: _queued, ...counts } = report
     for (const line of ticketDiagnostics) this.warn(line)
     for (const line of dependencyDiagnostics) this.say(line)
     const parts = Object.entries(counts)
@@ -1171,7 +1179,7 @@ class DispatchLoop {
       buildSnapshot.builds,
       {
         repo: this.opts.targetRepo,
-        capacity: this.config.dispatcher.capacity,
+        queued: this.queuedCount,
       },
       repositoryEvents,
     )

@@ -360,14 +360,13 @@ function renderHarvest(
 ): string[] {
   const { color, width, now } = opts
   const marker = selectionMarker(selected, selecting, color)
-  // Harvest has no ticket id, but it occupies the shared empty ticket column so
-  // its identity follows the same row grammar as builds in mixed frames.
-  const ticketCol = widths.ticket > 0 ? `${' '.repeat(widths.ticket)}  ` : ''
-  const leftPrefix = `${marker}${ticketCol}`
-  const identity = [
-    paint('Harvest', 'bold', color),
-    paint(`${harvest.observations} observations`, 'dim', color),
-  ].join('  ')
+  // Harvest has no ticket id, so its title takes the ticket column itself —
+  // aligned with the ids, not the slugs — and the observation count sits in
+  // the flexible slug slot, keeping one row grammar across mixed frames.
+  const title =
+    widths.ticket > 0 ? HARVEST_TITLE.padEnd(widths.ticket) : HARVEST_TITLE
+  const leftPrefix = `${marker}${paint(title, 'bold', color)}  `
+  const identity = paint(`${harvest.observations} observations`, 'dim', color)
   const statusColor = STATUS_COLOR[harvest.status]
   const status = paint(
     harvest.status.toUpperCase().padStart(widths.status),
@@ -405,16 +404,25 @@ interface Widths {
   status: number
 }
 
+const HARVEST_TITLE = 'Harvest'
+
 /** Pad ticket id and status to the widest in the FRAME, so columns line up down
  * the whole dashboard rather than per-row. `ticket` is 0 when no build in the
- * frame has a ticket id — then there is no ticket column at all. Harvest joins
- * the status-width calculation even in a mixed frame. */
+ * frame has a ticket id — then there is no ticket column at all. The Harvest
+ * title lives in the ticket column, so when that column exists it must also fit
+ * the title; Harvest joins the status-width calculation even in a mixed frame. */
 function frameWidths(
   builds: DashboardBuild[],
   harvest: DashboardHarvest | undefined,
 ): Widths {
+  const ticketIds = builds.map((b) => (b.ticketId ?? '').length)
+  const hasTicketColumn = ticketIds.some((length) => length > 0)
   return {
-    ticket: Math.max(0, ...builds.map((b) => (b.ticketId ?? '').length)),
+    ticket: Math.max(
+      0,
+      ...ticketIds,
+      ...(harvest !== undefined && hasTicketColumn ? [HARVEST_TITLE.length] : []),
+    ),
     status: Math.max(
       0,
       ...builds.map((b) => b.status.length),
@@ -509,9 +517,11 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
   const intake = model.drained
     ? paint('intake OFF', 'yellow', color)
     : paint('intake ON', 'green', color)
+  // "default" is implicit at the top level — the header is repo-wide state,
+  // while a build row's own `auto merge` token is that build's setting.
   const autoMergeDefault = model.defaultAutoMerge
-    ? paint('auto merge default ON', 'green', color)
-    : paint('auto merge default OFF', 'yellow', color)
+    ? paint('auto merge ON', 'green', color)
+    : paint('auto merge OFF', 'yellow', color)
   const harvestGate = model.harvestPaused
     ? paint('harvest OFF', 'yellow', color)
     : paint('harvest ON', 'green', color)
@@ -520,7 +530,7 @@ export function renderDashboard(model: DashboardModel, opts: RenderOpts): string
       paint('Auto Build', 'bold', color),
       displayText(basename(model.repo)),
       paint(
-        `capacity ${model.capacity} | ${model.builds.length} active`,
+        `queue ${model.queued} | active ${model.builds.length}`,
         'dim',
         color,
       ),

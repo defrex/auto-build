@@ -78,7 +78,7 @@ function unclosedLinks(line: string): number {
 function model(builds: DashboardBuild[]): DashboardModel {
   return {
     repo: '/repos/app',
-    capacity: 2,
+    queued: 2,
     drained: false,
     defaultAutoMerge: false,
     harvestPaused: false,
@@ -90,16 +90,16 @@ function model(builds: DashboardBuild[]): DashboardModel {
 const WIDE = { color: false, width: 200 }
 
 describe('renderDashboard: the title and status rows', () => {
-  test('one title names the product, repo, capacity, and all three dispatcher controls', () => {
+  test('one title names the product, repo, queue depth, and all three dispatcher controls', () => {
     const lines = rd(model([build()]), WIDE)
     const header = lines[0]!
     expect(header).toContain('Auto Build')
     expect(header).toContain('app') // the repo basename
     expect(header).not.toContain('/repos/app')
-    expect(header).toContain('capacity 2 | 1 active')
+    expect(header).toContain('queue 2 | active 1')
     expect(header).not.toMatch(/\b(?:watch|once)\b/)
     expect(header).toContain('intake ON')
-    expect(header).toContain('auto merge default OFF')
+    expect(header).toContain('auto merge OFF')
     expect(header).toContain('harvest ON')
     expect(lines.slice(0, -1).join('\n')).not.toContain('Ctrl-C to stop')
   })
@@ -136,24 +136,24 @@ describe('renderDashboard: the title and status rows', () => {
 
   test('the summary contains no loop-mode word', () => {
     const [header] = rd(model([]), WIDE)
-    expect(header).toContain('capacity 2 | 0 active')
+    expect(header).toContain('queue 2 | active 0')
     expect(header).not.toMatch(/\b(?:watch|once)\b/)
   })
 
   test('process defaults and the acknowledged durable gate render explicit ON/OFF state', () => {
     expect(rd({ ...model([]), drained: true }, WIDE)[0]).toContain('intake OFF')
     expect(rd(model([]), WIDE)[0]).toContain('intake ON')
-    expect(rd(model([]), WIDE)[0]).toContain('auto merge default OFF')
+    expect(rd(model([]), WIDE)[0]).toContain('auto merge OFF')
     expect(
       rd({ ...model([]), defaultAutoMerge: true }, WIDE)[0],
-    ).toContain('auto merge default ON')
+    ).toContain('auto merge ON')
     expect(rd(model([]), WIDE)[0]).toContain('harvest ON')
     expect(rd({ ...model([]), harvestPaused: true }, WIDE)[0]).toContain(
       'harvest OFF',
     )
     const defaults = rd(model([]), { color: true, width: 200 })[0]!
     expect(defaults).toContain('\x1b[32mintake ON\x1b[0m')
-    expect(defaults).toContain('\x1b[33mauto merge default OFF\x1b[0m')
+    expect(defaults).toContain('\x1b[33mauto merge OFF\x1b[0m')
     expect(defaults).toContain('\x1b[32mharvest ON\x1b[0m')
 
     const toggled = rd(
@@ -166,7 +166,7 @@ describe('renderDashboard: the title and status rows', () => {
       { color: true, width: 200 },
     )[0]!
     expect(toggled).toContain('\x1b[33mintake OFF\x1b[0m')
-    expect(toggled).toContain('\x1b[32mauto merge default ON\x1b[0m')
+    expect(toggled).toContain('\x1b[32mauto merge ON\x1b[0m')
     expect(toggled).toContain('\x1b[33mharvest OFF\x1b[0m')
   })
 
@@ -742,10 +742,10 @@ describe('renderDashboard: `height` caps the LINE count', () => {
     for (let height = 1; height <= 12; height += 1) {
       const [header] = rd(model(many(8)), { color: false, width: 80, height })
       expect(header).toContain('Auto Build')
-      expect(header).toContain('capacity 2')
+      expect(header).toContain('queue 2')
       // The count is on the header, so it still reports every build even when
       // most rows are clamped away.
-      expect(header).toContain('8 active')
+      expect(header).toContain('active 8')
     }
   })
 

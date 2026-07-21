@@ -137,7 +137,8 @@ export interface ResumeInputView {
 
 export interface DashboardModel {
   repo: string
-  capacity: number
+  /** Ready tickets waiting for a slot — the dispatcher's standing queue depth. */
+  queued: number
   /** Durable repository intake state (`true` means claims are disabled). */
   drained: boolean
   /** Durable repository claim-time default for newly claimed builds. */
@@ -879,7 +880,7 @@ export function projectHarvest(
 
 export interface DashboardHeader {
   repo: string
-  capacity: number
+  queued: number
   selection?: DashboardSelection
   statusLine?: string
   resumeInput?: ResumeInputView
@@ -902,7 +903,7 @@ export function buildDashboardFromProjected(
   const settings = reduceDispatchSettings(repositoryEvents)
   return {
     repo: header.repo,
-    capacity: header.capacity,
+    queued: header.queued,
     drained: !settings.intake,
     defaultAutoMerge: settings.defaultAutoMerge,
     harvestPaused: harvestProjection.harvestPaused,

@@ -262,6 +262,11 @@ export interface TickReport {
   invalidTickets: number
   /** Actionable source diagnostics for each excluded invalid record. */
   ticketDiagnostics: string[]
+  /** Standing queue depth: ready tickets still waiting after this tick —
+   * excludes tickets already embodied by an active build, and ones that left
+   * the queue this tick (dispatched, bounced, or claimed elsewhere). Like the
+   * invalid/dependency fields it re-reports on every ready scan. */
+  queued: number
   /** Dependency gate (§13): ready tickets held back by unresolved blockers. */
   dependencyBlocked: number
   /** One line per held ticket naming its unresolved blockers — the operator's
@@ -291,6 +296,7 @@ export function emptyTickReport(): TickReport {
     claimRaces: 0,
     invalidTickets: 0,
     ticketDiagnostics: [],
+    queued: 0,
     dependencyBlocked: 0,
     dependencyDiagnostics: [],
     harvestStarted: 0,
@@ -922,18 +928,29 @@ export class Dispatcher {
     // pending work are live, only waiting on a human. Capacity is per repo
     // (§16.1) — another repo's builds never consume this repo's slots.
     let active = 0
+    const activeTicketIds = new Set<string>()
     for (const record of await store.listBuilds()) {
       if (record.repo !== this.deps.repo) continue
       const state = reduceBuild(await store.getEvents(record.slug))
-      if (state.status !== 'done' && state.status !== 'aborted') active += 1
+      if (state.status !== 'done' && state.status !== 'aborted') {
+        active += 1
+        if (record.ticket) activeTicketIds.add(record.ticket.id)
+      }
     }
     let capacity = config.dispatcher.capacity - active
-    if (capacity <= 0) return
 
+    // The ready scan runs even at full capacity: `queued` is the operator's
+    // standing queue-depth report and must stay honest exactly when the
+    // dispatcher is saturated. Sources that keep a claimed ticket in the
+    // ready state are deduped against the active builds embodying them.
     const listing = await tickets.listReady(readyCriteria(config))
-    const ready = listing.tickets
+    const ready = listing.tickets.filter(
+      (ticket) => !activeTicketIds.has(ticket.ref.id),
+    )
     report.invalidTickets += listing.diagnostics.length
     report.ticketDiagnostics.push(...listing.diagnostics)
+    report.queued = ready.length
+    if (capacity <= 0) return
     // One dependency-node cache per tick: blockers are commonly shared across
     // the ready set, and a blocker's resolution must be re-read every tick
     // (never cached across them) so a completion lands on the next pass.
@@ -981,6 +998,7 @@ export class Dispatcher {
       // (or an earlier tick) owns this ticket.
       if (!(await tickets.claim(ticket.ref.id))) {
         report.claimRaces += 1
+        report.queued -= 1
         continue
       }
 
@@ -1002,6 +1020,7 @@ export class Dispatcher {
       if (!conformance.conforms) {
         await this.bounce(ticket, conformance.missing)
         report.bounced += 1
+        report.queued -= 1
         continue
       }
 
@@ -1077,6 +1096,7 @@ export class Dispatcher {
       await tickets.comment(ticket.ref.id, `build ${slug} dispatched`)
       await this.launch(slug, launched)
       report.dispatched += 1
+      report.queued -= 1
       capacity -= 1
     }
   }

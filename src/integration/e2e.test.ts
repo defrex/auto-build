@@ -575,9 +575,10 @@ test('ungated auto-merge intent finalizes, guarded-squashes in janitor, and comp
 
   // First janitor poll owns the fallback. It writes no speculative merge fact;
   // the guarded command itself moves only the fake forge's external state.
+  // (FakeTicketSource keeps the claimed ticket in Ready, but the ready scan
+  // dedupes it against its active build, so no claim is re-attempted.)
   expect(await h.dispatcher.tick()).toEqual({
     ...emptyTickReport(),
-    claimRaces: 1,
   })
   expect(h.forge.squashMergeCalls).toHaveLength(1)
   expect(h.forge.squashMergeCalls[0]).toMatchObject({
@@ -664,8 +665,7 @@ test('a2. reconcile merges the current base when main advances after conflict de
     ...emptyTickReport(),
     conflicted: 1,
     // FakeTicketSource keeps its claimed ticket in Ready until completion;
-    // the second claim is correctly refused while janitor work continues.
-    claimRaces: 1,
+    // the ready scan dedupes it against its active build, so no re-claim.
   })
   const detected = ofType(await h.events(SLUG), 'pr.conflicted')[0]!
   expect(detected.payload.baseSha).toBe(detectedBase)
@@ -1092,7 +1092,7 @@ test('c. persists chain stalls, human guidance unblocks, loop converges (§15.6-
   // A blocked build is NOT swept, even with an expired lease (§15.6-C).
   h.clock.advance(4 * 3_600_000)
   const tickBlocked = await h.dispatcher.tick()
-  expect(tickBlocked).toEqual({ ...emptyTickReport(), claimRaces: 1 })
+  expect(tickBlocked).toEqual(emptyTickReport())
   expect(h.launched).toHaveLength(1)
 
   // A human answers with guidance (§11: an event, from any UI).
@@ -1104,7 +1104,7 @@ test('c. persists chain stalls, human guidance unblocks, loop converges (§15.6-
 
   // Now actionable: the sweep re-attaches a runner (cron path, §15.6-C).
   const tickSwept = await h.dispatcher.tick()
-  expect(tickSwept).toEqual({ ...emptyTickReport(), swept: 1, claimRaces: 1 })
+  expect(tickSwept).toEqual({ ...emptyTickReport(), swept: 1 })
   expect(h.launched).toHaveLength(2)
   const resumedFrom = (await h.events(SLUG)).length
 
