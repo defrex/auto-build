@@ -126,14 +126,14 @@ describe('LiveRegion: terminal resize', () => {
   test('shrink and grow both clear and repaint at row 1', () => {
     const term = fakeTerm(8)
     const region = new LiveRegion(term)
-    const tall = ['header', 'status', '', 'row', '', 'controls']
+    const tall = ['summary', 'toggles', 'warning', '', 'row', '', 'controls']
     region.update(tall)
 
-    // Shrink below the six-line frame that was actually painted. The next
+    // Shrink below the seven-line frame that was actually painted. The next
     // render is already capped for the new screen, and its repaint must not
     // depend on how much of the old frame survived the resize.
     term.rows = 4
-    const shrunk = ['header', 'status', 'controls']
+    const shrunk = ['summary', 'toggles', 'controls']
     let before = term.writes.length
     region.update(shrunk)
     expect(term.writes.slice(before)).toEqual([
@@ -142,7 +142,7 @@ describe('LiveRegion: terminal resize', () => {
     ])
 
     // An ordinary changed repaint is likewise a whole-display replacement.
-    const changed = ['header', 'changed']
+    const changed = ['summary', 'changed']
     before = term.writes.length
     region.update(changed)
     expect(term.writes.slice(before)).toEqual([

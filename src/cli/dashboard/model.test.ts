@@ -410,8 +410,8 @@ describe('projectBuild: the active-build filter', () => {
       drained: false,
       defaultAutoMerge: false,
       harvestPaused: false,
-      statusLine: '',
     })
+    expect(model.warningLine).toBeUndefined()
     expect('mode' in model).toBe(false)
 
     const alpha = projectBuild(
@@ -460,6 +460,20 @@ describe('projectBuild: the active-build filter', () => {
     )
     expect(settings.drained).toBe(true)
     expect(settings.defaultAutoMerge).toBe(true)
+  })
+
+  test('a process-local warning is optional header state, not a reserved blank row', () => {
+    const clean = buildDashboard([], CONFIG, {
+      repo: '/repos/app',
+      queued: 0,
+    })
+    const warned = buildDashboard([], CONFIG, {
+      repo: '/repos/app',
+      queued: 0,
+      warningLine: 'store unavailable',
+    })
+    expect(clean.warningLine).toBeUndefined()
+    expect(warned.warningLine).toBe('store unavailable')
   })
 
   test('the header gate follows acknowledgements, not pending commands or a synthetic row', async () => {
