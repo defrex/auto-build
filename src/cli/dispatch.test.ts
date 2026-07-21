@@ -690,7 +690,7 @@ model = "gpt-slug-name"
         wire: fx.wire,
       })
 
-      expect(fx.err).toContain(diagnostic)
+      expect(fx.err).toEqual([diagnostic])
       const tick = out.find((line) => line.startsWith('tick: '))
       expect(tick).toContain('dispatched=1')
       expect(tick).toContain('invalidTickets=1')
@@ -1574,7 +1574,7 @@ describe('abDispatch --once with an interactive terminal', () => {
     }
   }, 30_000)
 
-  test('dashboard startup and notices stay inside the fixed frame, never the line sinks', async () => {
+  test('dashboard startup stays in-frame while routine notices are suppressed', async () => {
     const fx = await makeFixture(readyTicket('T-frame'), happyHandlers())
     const term = fakeTerminal()
     const out: string[] = []
@@ -1595,8 +1595,9 @@ describe('abDispatch --once with an interactive terminal', () => {
       expect(out).toEqual([])
       expect(fx.err).toEqual([])
       expect(painted).toContain('Auto Build')
-      expect(painted).toContain(`build ${slug} parked`)
       expect(painted).toContain(slug)
+      expect(painted).not.toContain(`build ${slug} parked`)
+      expect(painted).not.toContain('tick:')
       expect(painted).not.toContain(`one pass over ${fx.origin}`)
       expect(painted).not.toContain('Ctrl-C to stop')
     } finally {
@@ -1962,8 +1963,15 @@ describe('abDispatch --once with an interactive terminal', () => {
       const painted = stripAnsi(term.all())
       expect(painted).toContain('> Auto Build')
       expect(painted).toContain('intake OFF')
-      expect(painted).toContain('dispatcher intake OFF')
+      expect(painted).not.toContain('dispatcher intake OFF')
       expect(painted).toContain('no active builds')
+      expect(
+        (await fx.store.getRepoEvents(fx.origin)).some(
+          (event) =>
+            event.type === 'dispatcher.intake-set' &&
+            event.payload.enabled === false,
+        ),
+      ).toBe(true)
     } finally {
       await fx.cleanup()
     }
@@ -1987,16 +1995,24 @@ describe('abDispatch --once with an interactive terminal', () => {
       })
       const painted = stripAnsi(term.all())
       expect(painted).toContain('> Auto Build')
-      expect(painted).toContain('dispatcher intake OFF')
+      expect(painted).toContain('intake OFF')
+      expect(painted).not.toContain('dispatcher intake OFF')
       expect(painted).not.toContain('no active row is selected')
+      expect(
+        (await fx.store.getRepoEvents(fx.origin)).some(
+          (event) =>
+            event.type === 'dispatcher.intake-set' &&
+            event.payload.enabled === false,
+        ),
+      ).toBe(true)
       expect(fx.err).toEqual([])
     } finally {
       await fx.cleanup()
     }
   }, 30_000)
 
-  test('a non-interactive terminal (a pipe or redirect) auto-selects plain', async () => {
-    const fx = await makeFixture(readyTicket('T-pipe'), happyHandlers())
+  test('a non-interactive terminal (a pipe or redirect) preserves exact plain output', async () => {
+    const fx = await makeFixture([], happyHandlers())
     const term = fakeTerminal(false)
     const out: string[] = []
     try {
@@ -2011,13 +2027,18 @@ describe('abDispatch --once with an interactive terminal', () => {
         terminal: term,
       })
       expect(term.all()).toBe('')
+      expect(out).toEqual([
+        `ab dispatch — one pass over ${fx.origin} (capacity 1)`,
+        'tick: idle',
+      ])
       expect(out.join('\n')).not.toContain('\x1b')
+      expect(fx.err).toEqual([])
     } finally {
       await fx.cleanup()
     }
   }, 30_000)
 
-  test('watch: successive diagnostics replace the reserved status row without using line sinks', async () => {
+  test('watch: warnings use the conditional row while routine diagnostics and counts stay hidden', async () => {
     const fx = await makeFixture(
       [
         readyTicket('T-blocked-tty', { title: 'Blocked work', blockedBy: ['T-9'] }),
@@ -2059,24 +2080,23 @@ describe('abDispatch --once with an interactive terminal', () => {
       const invalidFrame = term.frames.find((chunk) =>
         stripAnsi(chunk).includes(invalid),
       )
-      const diagnosticFrame = term.frames.find((chunk) => stripAnsi(chunk).includes(diagnostic))
-      const countFrame = term.frames.find((chunk) =>
-        stripAnsi(chunk).includes('tick: invalidTickets=1 dependencyBlocked=1'),
-      )
+      const painted = stripAnsi(term.all())
       expect(out).toEqual([])
       expect(fx.err).toEqual([])
       expect(invalidFrame).toBeDefined()
-      expect(diagnosticFrame).toBeDefined()
-      expect(countFrame).toBeDefined()
-      expect(stripAnsi(invalidFrame!).split('\n')[1]).toBe(invalid)
-      const diagnosticLines = stripAnsi(diagnosticFrame!).split('\n').slice(0, -1)
-      const countLines = stripAnsi(countFrame!).split('\n').slice(0, -1)
-      expect(diagnosticLines[0]).toContain('Auto Build')
-      expect(diagnosticLines[0]).toContain('queue 0 | active 0')
-      expect(diagnosticLines[0]).not.toMatch(/\bwatch\b/)
-      expect(diagnosticLines[1]).toBe(diagnostic)
-      expect(countLines[1]).toBe('tick: invalidTickets=1 dependencyBlocked=1')
-      expect(countLines).toHaveLength(diagnosticLines.length)
+      expect(painted).not.toContain(diagnostic)
+      expect(painted).not.toContain(
+        'tick: invalidTickets=1 dependencyBlocked=1',
+      )
+      const warningLines = stripAnsi(invalidFrame!).split('\n').slice(0, -1)
+      expect(warningLines[0]).toContain('Auto Build')
+      expect(warningLines[0]).toContain('queue 0 | active 0')
+      expect(warningLines[0]).not.toMatch(/\bwatch\b/)
+      expect(warningLines[1]).toContain('intake ON')
+      expect(warningLines[2]).toBe(`  ${invalid}`)
+      expect(warningLines[2]!.search(/\S/)).toBe(
+        warningLines[0]!.indexOf('Auto Build'),
+      )
     } finally {
       await fx.cleanup()
     }
@@ -2524,15 +2544,17 @@ describe('abDispatch interactive keyboard controls', () => {
       await waitFor(() => stripAnsi(term.all()).includes('> Auto Build'))
 
       input.press('auto-merge')
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('dispatcher auto-merge default ON'),
+      await waitFor(async () =>
+        reduceDispatchSettings(await fx.store.getRepoEvents(fx.origin))
+          .defaultAutoMerge,
       )
-      expect(stripAnsi(term.all())).toContain('auto merge ON')
+      await waitFor(() => latestDashboardFrame(term).includes('auto merge ON'))
       input.press('auto-merge')
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('dispatcher auto-merge default OFF'),
+      await waitFor(async () =>
+        !reduceDispatchSettings(await fx.store.getRepoEvents(fx.origin))
+          .defaultAutoMerge,
       )
-      expect(stripAnsi(term.all())).toContain('auto merge OFF')
+      await waitFor(() => latestDashboardFrame(term).includes('auto merge OFF'))
       expect(
         (await fx.store.getRepoEvents(fx.origin))
           .slice(beforeRepo.length)
@@ -2563,9 +2585,6 @@ describe('abDispatch interactive keyboard controls', () => {
           (event) => event.type === 'harvest.pause-requested',
         ),
       )
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest gate: pause requested'),
-      )
       // A request is not an acknowledgement: the durable header remains ON.
       expect(stripAnsi(term.all())).toContain('harvest ON')
 
@@ -2575,9 +2594,6 @@ describe('abDispatch interactive keyboard controls', () => {
           (event) => event.type === 'harvest.resume-requested',
         ),
       )
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest gate: resume requested'),
-      )
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
         type: 'harvest.resumed',
@@ -2586,17 +2602,19 @@ describe('abDispatch interactive keyboard controls', () => {
 
       input.press('down')
       await waitFor(() => /^> .*Harvest/m.test(stripAnsi(term.all())))
-      input.press('auto-merge')
-      await waitFor(() => stripAnsi(term.all()).includes('Harvest auto-merge unavailable'))
       const beforeRunningAction = (await fx.store.getRepoEvents(fx.origin)).length
+      input.press('auto-merge')
       input.press('pause')
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest run has no available action'),
-      )
+      // A later serialized selection move is the synchronization point for
+      // both routine no-op actions; neither gets a transient message row.
+      input.press('down')
+      await waitFor(() => /^> .*alpha-work/m.test(stripAnsi(term.all())))
       expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(
         beforeRunningAction,
       )
       expect(stripAnsi(term.all())).toContain('intake ON')
+      expect(stripAnsi(term.all())).not.toContain('Harvest auto-merge unavailable')
+      expect(stripAnsi(term.all())).not.toContain('harvest run has no available action')
 
       const repoAdded = (await fx.store.getRepoEvents(fx.origin)).slice(
         beforeRepo.length,
@@ -2620,8 +2638,6 @@ describe('abDispatch interactive keyboard controls', () => {
       }
       expect(out).toEqual([])
 
-      input.press('down')
-      await waitFor(() => /^> .*alpha-work/m.test(stripAnsi(term.all())))
       input.press('auto-merge')
       input.press('pause')
       await waitFor(async () => {
@@ -2688,10 +2704,10 @@ describe('abDispatch interactive keyboard controls', () => {
           (event) => event.type === 'harvest.resume-requested',
         ),
       )
-      await waitFor(() =>
-        latestDashboardFrame(term).includes('harvest gate: resume requested'),
-      )
       expect(latestDashboardFrame(term)).toContain('harvest OFF')
+      expect(stripAnsi(term.all())).not.toContain(
+        'harvest gate: resume requested',
+      )
       const request = (await fx.store.getRepoEvents(fx.origin)).at(-1)
       expect(request?.actor).toEqual({
         kind: 'human',
@@ -2751,10 +2767,12 @@ describe('abDispatch interactive keyboard controls', () => {
           sleeps += 1
           if (sleeps === 1) {
             input.press('auto-merge')
+            await waitFor(async () =>
+              reduceDispatchSettings(await fx.store.getRepoEvents(fx.origin))
+                .defaultAutoMerge,
+            )
             await waitFor(() =>
-              stripAnsi(term.all()).includes(
-                'dispatcher auto-merge default ON',
-              ),
+              latestDashboardFrame(term).includes('auto merge ON'),
             )
             fx.tickets.add(
               readyTicket('T-seeded-default', { title: 'Seeded work' }),
@@ -2793,10 +2811,12 @@ describe('abDispatch interactive keyboard controls', () => {
             input.press('up')
             input.press('up')
             input.press('auto-merge')
+            await waitFor(async () =>
+              !reduceDispatchSettings(await fx.store.getRepoEvents(fx.origin))
+                .defaultAutoMerge,
+            )
             await waitFor(() =>
-              stripAnsi(term.all()).includes(
-                'dispatcher auto-merge default OFF',
-              ),
+              latestDashboardFrame(term).includes('auto merge OFF'),
             )
             fx.tickets.add(
               readyTicket('T-unseeded-default', { title: 'Unseeded work' }),
@@ -3079,11 +3099,6 @@ describe('abDispatch interactive keyboard controls', () => {
           (event) => event.type === 'harvest.resume-requested',
         ),
       )
-      await waitFor(() =>
-        stripAnsi(term.all()).includes(
-          'harvest: exhausted recovery attention acknowledgement requested',
-        ),
-      )
       let added = (await fx.store.getRepoEvents(fx.origin)).slice(before)
       expect(added.map((event) => event.type)).toEqual([
         'harvest.resume-requested',
@@ -3093,12 +3108,15 @@ describe('abDispatch interactive keyboard controls', () => {
         false,
       )
 
-      // A second p while the request is pending is a no-op.
+      // A second p while the request is pending is a no-op. The queued Up is
+      // its serialization fence; neither action needs a transient notice.
       input.press('pause')
-      await waitFor(() =>
-        stripAnsi(term.all()).includes('harvest run: resume acknowledgement pending'),
-      )
+      input.press('up')
+      await waitFor(() => /^> Auto Build/m.test(latestDashboardFrame(term)))
       expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(before + 1)
+      expect(stripAnsi(term.all())).not.toContain(
+        'harvest run: resume acknowledgement pending',
+      )
 
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
@@ -3154,12 +3172,10 @@ describe('abDispatch interactive keyboard controls', () => {
       expect(added.some((event) => event.type === 'harvest.pause-requested')).toBe(
         false,
       )
-      await waitFor(() =>
-        stripAnsi(term.all()).includes(
-          'harvest: escalation acknowledgement requested',
-        ),
-      )
       expect(stripAnsi(term.all())).toMatch(/Harvest.*ESCALATED/)
+      expect(stripAnsi(term.all())).not.toContain(
+        'harvest: escalation acknowledgement requested',
+      )
 
       await fx.store.appendRepo(fx.origin, {
         actor: KERNEL,
@@ -3244,15 +3260,14 @@ describe('abDispatch interactive keyboard controls', () => {
         /^> .*Harvest.*ESCALATED/m.test(latestDashboardFrame(term)),
       )
       input.press('pause')
-      await waitFor(() =>
-        latestDashboardFrame(term).includes(
-          'harvest run action unavailable while harvest is OFF; select Dispatcher and press h',
-        ),
-      )
-      expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(before)
-
       input.press('up')
+      // The selection move is serialized after the no-op run action.
       await waitFor(() => /^> Auto Build/m.test(latestDashboardFrame(term)))
+      expect(await fx.store.getRepoEvents(fx.origin)).toHaveLength(before)
+      expect(stripAnsi(term.all())).not.toContain(
+        'harvest run action unavailable while harvest is OFF',
+      )
+
       input.press('harvest-gate')
       await waitFor(async () =>
         (await fx.store.getRepoEvents(fx.origin)).slice(before).some(
@@ -3945,8 +3960,12 @@ describe('abDispatch interactive keyboard controls', () => {
             await new Promise((resolve) => setTimeout(resolve, 0))
             expect(stripAnsi(term.all())).toContain('intake OFF')
             input.press('pause')
+            await waitFor(async () =>
+              reduceDispatchSettings(await fx.store.getRepoEvents(fx.origin))
+                .intake,
+            )
             await waitFor(() =>
-              stripAnsi(term.all()).includes('dispatcher intake ON'),
+              latestDashboardFrame(term).includes('intake ON'),
             )
           } else {
             input.press('interrupt')

@@ -66,7 +66,9 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
   order. A failing step sends the build back to `implement` with the report;
   an explicit skip records why the step did not apply and advances.
 - **`finalize`** — the agent writes the PR description; the kernel opens the
-  PR. `[finalize].steps` run afterward and are failure-tolerant.
+  PR. `[finalize].steps` run afterward and are failure-tolerant. A
+  content-producing step commits selected files locally and finishes clean;
+  the runner regular-pushes a descendant head to extend the open PR branch.
 - **Epilogue.** If main moves and the PR conflicts, `pr.conflicted` sends the
   build to `reconcile` (merge base *into* the branch — never a rebase), then
   back through `verify:*`. This can repeat. The build terminates **merged** or
@@ -133,8 +135,9 @@ The distinctions that change an administrator's answer:
 - **Ticket providers** (`linear`, `file`) sit behind one port; the dispatcher
   does not know which is configured.
 - **Forge operations and pushes are kernel-side plumbing.** Agents commit
-  locally and never push, never touch the remote, never open the PR. The push
-  happens at the phase boundary when the agent's terminal command succeeds.
+  locally and never push, never touch the remote, never open the PR. A push
+  happens at the implement terminal boundary or after the runner validates a
+  successful content-producing finalize post-step; neither path force-pushes.
 
 ## `autobuild.toml` reference
 
@@ -348,6 +351,13 @@ neither kind can turn an otherwise green build red.
 Validation rejects a listed name with no table, a table whose name is not in
 `steps`, a check command absent from `[commands]`, an unknown kind, or any
 field outside the selected strict variant. Diagnostics name the logical step.
+
+A post-step that produces repository content must select and commit its files
+locally and leave a clean worktree. The runner proves the last published head
+is an ancestor and performs the regular, non-force push through the Forge port;
+the agent never pushes. An unchanged `HEAD` creates and pushes no commit. Dirty
+output, rewritten history, Git errors, and publication failures record the
+step as failed and file an observation while the green build continues.
 
 ### `[roles]`
 
@@ -617,20 +627,24 @@ in-session `put|get` still require ambient phase auth.
 On a TTY, `ab dispatch` renders one fixed interactive frame anchored at the
 terminal's first row. Its header remains on that top row as frame height changes
 and after a resize; unused rows remain below. On exit, the final frame is copied
-to the normal screen and remains in scrollback. Its first two lines are the
-always-present process-global section: a selectable `Auto Build`
-title with the repository basename, capacity, active-build count,
-`intake ON`/`intake OFF`, `auto merge default ON`/`auto merge default OFF`, and
-`harvest ON`/`harvest OFF`, then one status slot. All three controls are durable
-repository projections and converge across dispatchers on the existing poll;
-harvest specifically reflects its acknowledged gate, not pending intent. Tick
-counts, dependency diagnostics, parked-build notices,
-harvest outcomes, action confirmations, and warnings replace that slot instead
-of scrolling above the frame. A blank line separates the global section from
-the first body row, and another separates the body from the legend or feedback
-controls. The duplicate startup banner is suppressed; `--plain` and non-TTY
-output remain line-oriented and unchanged. A satisfied verify skip carries the
-literal `skipped` qualifier, so it remains distinct from a pass without color.
+to the normal screen and remains in scrollback. Its always-present two-line
+process-global header has a selectable `Auto Build` summary with the repository
+basename, queue depth, and active-build count, followed by an indented controls
+line for `intake ON`/`intake OFF`, `auto merge ON`/`auto merge OFF`, and
+`harvest ON`/`harvest OFF`. The controls start in the title column. From the top
+of the frame through the body, the two-column marker lane stays empty except for
+the selected row's `> ` marker. All three controls are durable repository
+projections and converge across dispatchers on the existing poll; harvest
+specifically reflects its acknowledged gate, not pending intent. Routine tick
+counts, dependency diagnostics, parked-build notices, harvest outcomes, and
+action confirmations are suppressed in the interactive frame. The latest true
+warning or error instead appears on a conditional row below the header, aligned
+to the title; when none exists, that row consumes no space. A blank line
+separates the global section from the first body row, and another separates the
+body from the legend or feedback controls. The duplicate startup banner is
+suppressed; `--plain` and non-TTY output remain line-oriented and unchanged. A
+satisfied verify skip carries the literal `skipped` qualifier, so it remains
+distinct from a pass without color.
 
 Up/Down moves without wrapping through global first, optional `Harvest` second,
 then slug-sorted builds. Stable discriminated identity preserves selection

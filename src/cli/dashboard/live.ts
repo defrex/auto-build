@@ -8,9 +8,9 @@
  *
  *   >>> The region's first line is always terminal row 1. <<<
  *
- * Dispatcher messages are part of the frame's reserved status row, so this
- * seam owns only in-place replacement and cursor restoration. Nothing may
- * print through it into dashboard scrollback.
+ * Dispatcher warnings are conditional frame chrome, so this seam owns only
+ * in-place replacement and cursor restoration. Routine notices never enter
+ * the live region, and nothing may print through it into dashboard scrollback.
  */
 import type { TerminalOut } from '../terminal'
 

@@ -100,8 +100,11 @@ spec → plan ⇄ plan-review → implement ⇄ code-review → verify:* → fin
    verdict.
 5. **finalize** — the PR opens with an agent-written description and a summary
    of explicitly attached evidence, then any post-PR steps you've configured
-   (changelogs, release notes) run failure-tolerant. Agent verifiers attach an
-   exact screenshot, trace, or other artifact with
+   (changelogs, release notes) run failure-tolerant. A content-producing step
+   commits selected files locally; the runner extends the open PR branch with
+   a regular push. A no-op adds no commit, and a publication failure becomes a
+   follow-up observation rather than failing the green build. Agent verifiers
+   attach an exact screenshot, trace, or other artifact with
    `ab artifact put <kind> <file> --attach`; the PR always gets a pinned
    retrieval command, and configured public image hosting can also render
    images inline.
@@ -117,9 +120,10 @@ durable state, and every decision along the way stays queryable after the
 fact.
 
 The pipeline grammar is fixed on purpose; `verify:*` and `finalize:*` are the
-extension points, declared per-repo in `autobuild.toml`. For the seams and
-the reasoning behind them, see [`docs/architecture.md`](docs/architecture.md)
-and [`SPEC.md`](SPEC.md).
+extension points, declared per-repo in `autobuild.toml`. Post-step agents may
+commit locally but never push or call the forge; publication stays
+kernel-owned. For the seams and the reasoning behind them, see
+[`docs/architecture.md`](docs/architecture.md) and [`SPEC.md`](SPEC.md).
 
 ### Observation harvesting
 
