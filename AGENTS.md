@@ -9,6 +9,27 @@
 - `README.md` is the user-facing guide: install, configure, operate.
 - `autobuild.toml` is this repository's declarative pipeline configuration.
 
+## Product versus this repository's configuration
+
+Autobuild builds itself, so every change here wears exactly one of two hats.
+Sorting out which is a top-level concern for any ticket, spec, or request:
+
+- **The product** — what ships to every user: `src/`, `bin/`, the canonical
+  skill defaults in `skills/`, `templates/`, `SPEC.md`, `README.md`, and
+  `docs/`. Nothing here may encode this repository's specifics — its
+  dashboard-capture evidence, its Linear team, its verify steps.
+- **This repository's configuration** — how we run autobuild on autobuild:
+  `autobuild.toml`, the vendored editable skills in `.agents/skills/ab-*`,
+  and the repo-local tooling they invoke. Our own e2e evidence capture
+  belongs here, not in the product.
+
+Decide which hat the work wears before planning it, and write specs that name
+the hat explicitly. If it is still ambiguous when work starts, escalate —
+`ab escalate` in a build, a question to the user in a session — rather than
+guessing. The cost asymmetry is known from experience: a repo-specific
+concern hardcoded into the product took a dedicated ticket to unwind
+(AUT-78), while a clarifying question costs minutes.
+
 ## Core design rules
 
 1. **Judgment in skills, determinism in code.** Agents plan and review; tested code owns state, transitions, gating, deduplication, and plumbing.
