@@ -81,7 +81,7 @@ describe('dashboard harvest row', () => {
       renderDashboard(
         {
           repo: '/repo',
-          capacity: 1,
+          queued: 1,
           drained: false,
           defaultAutoMerge: false,
           harvestPaused: false,
@@ -218,7 +218,7 @@ describe('dashboard harvest row', () => {
       renderDashboard(
         {
           repo: '/repo',
-          capacity: 1,
+          queued: 1,
           drained: false,
           defaultAutoMerge: false,
           harvestPaused: false,
@@ -291,7 +291,7 @@ describe('dashboard harvest row', () => {
       renderDashboard(
         {
           repo: '/repo',
-          capacity: 1,
+          queued: 1,
           drained: false,
           defaultAutoMerge: false,
           harvestPaused: true,
@@ -365,7 +365,7 @@ describe('dashboard harvest row', () => {
     const lines = renderDashboard(
       {
         repo: '/repo',
-        capacity: 2,
+        queued: 2,
         drained: false,
         defaultAutoMerge: false,
         harvestPaused: false,

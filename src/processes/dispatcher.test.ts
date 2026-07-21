@@ -927,7 +927,8 @@ releaseId = 42
     })
 
     const first = await h.dispatcher.tick()
-    expect(first).toEqual({ ...emptyTickReport(), dispatched: 1 })
+    // T-2 remains waiting behind capacity — the standing queue depth reports it.
+    expect(first).toEqual({ ...emptyTickReport(), dispatched: 1, queued: 1 })
     expect((await h.store.listBuilds()).map((b) => b.slug)).toEqual(['first-feature'])
     // T-2 was never claimed — capacity ran out before it.
     expect(await h.tickets.claim('T-2')).toBe(true)
@@ -966,7 +967,10 @@ releaseId = 42
       type: 'escalation.raised',
       payload: { id: 'e_1', phase: 'implement', source: 'stall', question: 'same finding 3 rounds' },
     })
-    expect(await blocked.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(await blocked.dispatcher.tick()).toEqual({
+      ...emptyTickReport(),
+      queued: 1,
+    })
     expect((await blocked.store.listBuilds()).map((b) => b.slug)).toEqual(['stuck'])
     expect(blocked.launches).toEqual([])
     expect(blocked.tickets.comments).toEqual([])
@@ -979,7 +983,10 @@ releaseId = 42
       type: 'build.paused',
       payload: {},
     })
-    expect(await paused.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(await paused.dispatcher.tick()).toEqual({
+      ...emptyTickReport(),
+      queued: 1,
+    })
     expect((await paused.store.listBuilds()).map((b) => b.slug)).toEqual(['parked'])
     expect(paused.launches).toEqual([])
   })
@@ -1426,7 +1433,7 @@ describe('Dispatcher harvest coordination', () => {
     await h.store.claimLease('capacity-holder', 'live-runner', 3_600_000)
 
     expect(await h.dispatcher.tick({ acceptNewWork: false })).toEqual(emptyTickReport())
-    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    expect(await h.dispatcher.tick()).toEqual({ ...emptyTickReport(), queued: 1 })
     expect(calls).toBe(2)
     expect(h.launches).toEqual([])
     expect(h.tickets.claims).toEqual([])
@@ -2884,8 +2891,9 @@ describe('Dispatcher tick idempotency', () => {
       )
     const before = await eventCounts()
 
-    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
-    expect(await h.dispatcher.tick()).toEqual(emptyTickReport())
+    // `queued` is a standing depth, not an action: identical on both runs.
+    expect(await h.dispatcher.tick()).toEqual({ ...emptyTickReport(), queued: 1 })
+    expect(await h.dispatcher.tick()).toEqual({ ...emptyTickReport(), queued: 1 })
 
     expect(await eventCounts()).toEqual(before)
     expect(h.launches).toEqual([])

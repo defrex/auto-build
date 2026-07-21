@@ -401,12 +401,12 @@ describe('projectBuild: the active-build filter', () => {
         { record: { ...RECORD, slug: 'alpha' }, state: active, events: activeLog },
       ],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
     )
     expect(model.builds.map((b) => b.slug)).toEqual(['alpha', 'zebra'])
     expect(model).toMatchObject({
       repo: '/repos/app',
-      capacity: 2,
+      queued: 2,
       drained: false,
       defaultAutoMerge: false,
       harvestPaused: false,
@@ -429,7 +429,7 @@ describe('projectBuild: the active-build filter', () => {
     if (alpha === null || zebra === null) throw new Error('expected active rows')
     const preprojected = buildDashboardFromProjected(
       [zebra, alpha],
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
     )
     expect(preprojected).toEqual(model)
     expect(preprojected.builds[0]).toBe(alpha)
@@ -438,7 +438,7 @@ describe('projectBuild: the active-build filter', () => {
     const settings = buildDashboard(
       [],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
       [
         {
           repo: '/repos/app',
@@ -473,7 +473,7 @@ describe('projectBuild: the active-build filter', () => {
     let model = buildDashboard(
       [],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
       await store.getRepoEvents('/repos/app'),
     )
     expect(model.harvestPaused).toBe(false)
@@ -487,7 +487,7 @@ describe('projectBuild: the active-build filter', () => {
     model = buildDashboard(
       [],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
       await store.getRepoEvents('/repos/app'),
     )
     expect(model.harvestPaused).toBe(true)
@@ -501,7 +501,7 @@ describe('projectBuild: the active-build filter', () => {
     model = buildDashboard(
       [],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
       await store.getRepoEvents('/repos/app'),
     )
     expect(model.harvestPaused).toBe(true)
@@ -514,7 +514,7 @@ describe('projectBuild: the active-build filter', () => {
     model = buildDashboard(
       [],
       CONFIG,
-      { repo: '/repos/app', capacity: 2 },
+      { repo: '/repos/app', queued: 2 },
       await store.getRepoEvents('/repos/app'),
     )
     expect(model.harvestPaused).toBe(false)

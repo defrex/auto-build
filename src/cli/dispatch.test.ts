@@ -416,9 +416,7 @@ describe('abDispatch --once', () => {
       )
       expect(firstBuildFrame).toBeDefined()
       expect(stripAnsi(firstBuildFrame!)).toContain('auto merge')
-      expect(stripAnsi(firstTerminal.all())).toContain(
-        'auto merge default ON',
-      )
+      expect(stripAnsi(firstTerminal.all())).toContain('auto merge ON')
 
       const beforeRestart = await fx.store.getEvents(record!.slug)
       const restartTerminal = fakeTerminal(true, { columns: 180 })
@@ -435,7 +433,7 @@ describe('abDispatch --once', () => {
 
       expect(await fx.store.getEvents(record!.slug)).toEqual(beforeRestart)
       const restarted = stripAnsi(restartTerminal.all())
-      expect(restarted).toContain('auto merge default ON')
+      expect(restarted).toContain('auto merge ON')
       expect(restarted).toContain('auto merge')
       expect(
         (await fx.store.getEvents(record!.slug)).filter(
@@ -456,7 +454,7 @@ describe('abDispatch --once', () => {
         terminal: overrideTerminal,
       })
       expect(stripAnsi(overrideTerminal.all())).toContain(
-        'auto merge default OFF',
+        'auto merge OFF',
       )
       expect(
         (await fx.store.getRepoEvents(fx.origin))
@@ -1550,7 +1548,7 @@ describe('abDispatch --once with an interactive terminal', () => {
       const slug = builds[0]!.slug
       const painted = term.all()
       const header = latestDashboardFrame(term).split('\n')[0]!
-      expect(header).toContain('capacity 1 | 1 active')
+      expect(header).toContain('queue 0 | active 1')
       expect(header).not.toMatch(/\bonce\b/)
       expect(painted).toContain(slug)
       // A progress row, with the pipeline in it.
@@ -2061,7 +2059,7 @@ describe('abDispatch --once with an interactive terminal', () => {
       const diagnosticLines = stripAnsi(diagnosticFrame!).split('\n').slice(0, -1)
       const countLines = stripAnsi(countFrame!).split('\n').slice(0, -1)
       expect(diagnosticLines[0]).toContain('Auto Build')
-      expect(diagnosticLines[0]).toContain('capacity 1 | 0 active')
+      expect(diagnosticLines[0]).toContain('queue 0 | active 0')
       expect(diagnosticLines[0]).not.toMatch(/\bwatch\b/)
       expect(diagnosticLines[1]).toBe(diagnostic)
       expect(countLines[1]).toBe('tick: invalidTickets=1 dependencyBlocked=1')
@@ -2364,7 +2362,7 @@ describe('abDispatch interactive keyboard controls', () => {
       await waitFor(
         () =>
           latestDashboardFrame(termA).includes('intake ON') &&
-          latestDashboardFrame(termB).includes('auto merge default OFF'),
+          latestDashboardFrame(termB).includes('auto merge OFF'),
       )
 
       inputA.press('pause')
@@ -2383,7 +2381,7 @@ describe('abDispatch interactive keyboard controls', () => {
           .defaultAutoMerge,
       )
       await waitFor(() =>
-        latestDashboardFrame(termB).includes('auto merge default ON'),
+        latestDashboardFrame(termB).includes('auto merge ON'),
       )
 
       // B started from intake ON / auto-merge OFF. It must invert A's newer
@@ -2399,7 +2397,7 @@ describe('abDispatch interactive keyboard controls', () => {
           .defaultAutoMerge,
       )
       await waitFor(() =>
-        latestDashboardFrame(termA).includes('auto merge default OFF'),
+        latestDashboardFrame(termA).includes('auto merge OFF'),
       )
 
       // Turn intake off once more, add work only after both processes have
@@ -2516,12 +2514,12 @@ describe('abDispatch interactive keyboard controls', () => {
       await waitFor(() =>
         stripAnsi(term.all()).includes('dispatcher auto-merge default ON'),
       )
-      expect(stripAnsi(term.all())).toContain('auto merge default ON')
+      expect(stripAnsi(term.all())).toContain('auto merge ON')
       input.press('auto-merge')
       await waitFor(() =>
         stripAnsi(term.all()).includes('dispatcher auto-merge default OFF'),
       )
-      expect(stripAnsi(term.all())).toContain('auto merge default OFF')
+      expect(stripAnsi(term.all())).toContain('auto merge OFF')
       expect(
         (await fx.store.getRepoEvents(fx.origin))
           .slice(beforeRepo.length)
