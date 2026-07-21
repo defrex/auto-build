@@ -66,7 +66,11 @@ paths = ["src/cli/dashboard/**", "src/cli/dispatch.ts", "tools/dashboard-capture
 # failure-tolerant: a failure files an observation and never kills a green
 # build (§5).
 [finalize]
-steps = []
+steps = ["changelog"]
+
+[finalize.changelog]
+kind = "agent"
+skill = "ab-finalize-changelog"
 
 # Check post-step example:
 #[finalize.publish]

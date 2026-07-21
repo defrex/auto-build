@@ -845,9 +845,11 @@ default, when you need to know what this repo's version says).
 | `ab-plan-review` | `plan-review` phase | Fresh skeptic: review the plan against the spec, verdict `approve`/`revise`/`escalate`. |
 | `ab-implement` | `implement` phase | Execute the approved plan as local commits plus deposited notes. Never pushes. |
 | `ab-code-review` | `code-review` phase | Fresh skeptic: review the implementation diff against spec and plan, same verdict vocabulary. |
+| `ab-verify-dashboard` | repository `verify:dashboard` phase | Drive the deterministic local dispatch simulation, inspect every colour PNG frame, and attach passing evidence; path applicability is kernel-owned and the skill never self-skips. |
 | `ab-verify-e2e` | a `verify:<step>` phase | **Sample** agent-verify skill: drive the running app and check acceptance criteria. Runs only if a `[verify.<step>]` table names it. |
 | `ab-reconcile` | `reconcile` phase (epilogue) | Resolve a conflicted PR with one merge commit, base merged *into* the build branch. Never rebases. |
 | `ab-finalize` | `finalize` phase | Write the PR description for a green build; the kernel opens the PR. |
+| `ab-finalize-changelog` | repository `finalize:changelog` post-step | Add the opened PR's linked summary to `CHANGELOG.md` as a local commit; the kernel publishes it. Runner-only; carries `disable-model-invocation: true`. |
 
 Everything except `ab-spec`, `ab-tickets`, and `ab-guide` is **runner-invoked**
 by the kernel and carries `disable-model-invocation: true` — do not invoke a
