@@ -179,7 +179,7 @@ Every policy field is a positive integer.
 | `maxVerifyAttempts` | `3` | Bound verify → implement retry cycles. |
 | `maxReconcileAttempts` | `3` | Bound conflict-reconciliation cycles. |
 | `maxReviewRounds` | `4` | Bound each producer/reviewer convergence loop. |
-| `harvestThreshold` | `10` | New unclaimed observations required to start one repository harvest run. |
+| `harvestThreshold` | `5` | New unclaimed observations required to start one repository harvest run. |
 
 Harvest is back-pressure driven by `ab dispatch`, independent of build
 `capacity`. At the threshold it claims the current accumulation as an immutable
@@ -283,7 +283,7 @@ stallRounds = 3
 maxVerifyAttempts = 3
 maxReconcileAttempts = 3
 maxReviewRounds = 4
-harvestThreshold = 10
+harvestThreshold = 5
 
 [tickets]
 source = "file"

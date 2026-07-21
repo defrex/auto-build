@@ -108,7 +108,7 @@ maxReviewRounds = 4
 # threshold is reached, scan -> synthesize <-> review -> file is journaled and
 # approved proposals are created in Triage only. Optional role overrides are
 # `[roles.harvest]` and `[roles.harvest-review]`.
-harvestThreshold = 10
+harvestThreshold = 5
 
 # Ticket source, ready gate, and lifecycle states (§3.2, §3.3, §13).
 # This default is the local file tracker at `.autobuild/tickets/`: four state

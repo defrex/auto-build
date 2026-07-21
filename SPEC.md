@@ -1036,7 +1036,7 @@ stallRounds = 3
 maxVerifyAttempts = 3
 maxReconcileAttempts = 3
 maxReviewRounds = 4
-harvestThreshold = 10           # observation-count back-pressure in dispatch
+harvestThreshold = 5            # observation-count back-pressure in dispatch
 
 [tickets]
 source = "file"

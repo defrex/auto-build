@@ -120,7 +120,7 @@ maxReviewRounds = 4
 # The workflow is repository-scoped and independent of build capacity; its two
 # optional runtime/model overrides are `[roles.harvest]` and
 # `[roles.harvest-review]`.
-harvestThreshold = 10
+harvestThreshold = 5
 
 # Ticket source and lifecycle states (§3.2, §3.3, §13). The Linear API key is a
 # secret — set the LINEAR_API_KEY environment variable (a local .env works),

@@ -237,7 +237,7 @@ export const policySchema = z.strictObject({
   /** converge's `maxRounds` for the review loops (SPEC §10). */
   maxReviewRounds: z.number().int().positive().default(4),
   /** Unclaimed observation occurrences required to start one harvest run. */
-  harvestThreshold: z.number().int().positive().default(10),
+  harvestThreshold: z.number().int().positive().default(5),
 })
 export type PolicyConfig = z.infer<typeof policySchema>
 

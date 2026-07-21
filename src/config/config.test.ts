@@ -162,7 +162,7 @@ describe('parseConfig — defaults', () => {
         maxVerifyAttempts: 3,
         maxReconcileAttempts: 3,
         maxReviewRounds: 4,
-        harvestThreshold: 10,
+        harvestThreshold: 5,
       },
       tickets: { source: 'file', readyState: 'ready' },
     })
@@ -220,7 +220,7 @@ skill = "ab-verify-e2e"
       maxVerifyAttempts: 3,
       maxReconcileAttempts: 3,
       maxReviewRounds: 4,
-      harvestThreshold: 10,
+      harvestThreshold: 5,
     })
   })
 })
