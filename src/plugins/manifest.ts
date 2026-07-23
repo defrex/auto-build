@@ -18,14 +18,24 @@ export interface PluginFactoryContext<Config = Record<string, unknown>> {
   repoRoot: string
 }
 
-export type PluginFactory<Adapter, Config = Record<string, unknown>> = (
-  context: PluginFactoryContext<Config>,
-) => Adapter | Promise<Adapter>
+export type PluginFactory<Adapter, Config = Record<string, unknown>> = {
+  /** Factory config is plugin-defined. The method-index form intentionally
+   * makes this callback bivariant: a manifest can retain a concrete config
+   * type while the host stores factories behind the configuration-erased
+   * manifest contract until a selector validates and invokes one. */
+  invoke(
+    context: PluginFactoryContext<Config>,
+  ): Adapter | Promise<Adapter>
+}['invoke']
 
-export type TicketSourcePluginFactory = PluginFactory<TicketSource>
-export type AgentRuntimePluginFactory = PluginFactory<RuntimeRegistration>
-export type WorkspaceProviderPluginFactory = PluginFactory<WorkspaceProvider>
-export type ForgePluginFactory = PluginFactory<Forge>
+export type TicketSourcePluginFactory<Config = Record<string, unknown>> =
+  PluginFactory<TicketSource, Config>
+export type AgentRuntimePluginFactory<Config = Record<string, unknown>> =
+  PluginFactory<RuntimeRegistration, Config>
+export type WorkspaceProviderPluginFactory<Config = Record<string, unknown>> =
+  PluginFactory<WorkspaceProvider, Config>
+export type ForgePluginFactory<Config = Record<string, unknown>> =
+  PluginFactory<Forge, Config>
 
 export interface AutobuildPluginManifest {
   /** Diagnostic/ownership identity. It need not equal the npm package name. */

@@ -55,12 +55,18 @@ describe('autobuild/plugin-sdk package surface', () => {
 
   test('a dev-only type dependency checks and builds a plugin with no Autobuild runtime import', async () => {
     const source = `
-      import type { AutobuildPluginManifest } from 'autobuild/plugin-sdk'
+      import type {
+        AutobuildPluginManifest,
+        PluginFactoryContext,
+      } from 'autobuild/plugin-sdk'
+      interface SampleConfig { endpoint: string }
       const manifest = {
         name: 'erased-types',
         apiVersion: '^1.0.0',
         ticketSources: {
-          sample: async () => { throw new Error('fixture factory is lazy') },
+          sample: async ({ config }: PluginFactoryContext<SampleConfig>) => {
+            throw new Error(\`fixture factory for \${config.endpoint} is lazy\`)
+          },
         },
       } satisfies AutobuildPluginManifest
       export default manifest
