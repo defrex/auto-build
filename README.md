@@ -34,7 +34,10 @@ triage; approve one and it runs the same loop.
 
 Every seam is an adapter: ticket sources (Linear or local files), agent
 runtimes (Claude or Pi), the forge (GitHub via `gh`), workspaces, and the
-build store all sit behind narrow interfaces you can swap or extend.
+build store all sit behind narrow interfaces. BuildStore extension happens
+through the documented [remote HTTP protocol](docs/remote-store-protocol.md),
+so an independent server can use any language or storage; Autobuild does not
+load in-process BuildStore plugins.
 
 ## Quickstart
 
@@ -180,5 +183,7 @@ pipe or a script sees exactly what you do.
   configuration, as a worked example of the config surface.
 - [`docs/architecture.md`](docs/architecture.md) — how the design maps to the
   codebase: kernel, ports, processes, and stores.
+- [`docs/remote-store-protocol.md`](docs/remote-store-protocol.md) — the
+  complete HTTP server contract and BuildStore conformance instructions.
 - [`SPEC.md`](SPEC.md) — the source of truth for the design and its
   terminology.
