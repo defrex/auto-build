@@ -122,10 +122,16 @@ ticket never blocks unrelated dispatch, but nothing that could permit double
 dispatch is tolerated.
 
 **Workspace and review base selection.**
-`src/ports/workspace/git-worktree.ts` selects the branch-cut base once at first
-creation, fetching into a build-scoped private ref; re-provisioning resumes at
-the branch tip and never re-cuts, so the first provisioning fact remains
-immutable provenance. Separately, each successful implementation terminal in
+`src/ports/workspace/create.ts` resolves `[workspace].provider` against the
+builtin-plus-plugin registry once during production wiring. The builtin stays
+store-root-aware; selected plugin factories receive their nested config,
+environment, and absolute repository root. `WorkspaceHandle.ref` remains a
+provider identifier while `path` is the locally reachable working copy used by
+runners and forge calls; both are recorded, with `ref` as the historical-event
+fallback. `src/ports/workspace/git-worktree.ts` selects the branch-cut base once
+at first creation, fetching into a build-scoped private ref; re-provisioning
+resumes at the branch tip and never re-cuts, so the first provisioning fact
+remains immutable provenance. Separately, each successful implementation terminal in
 `src/cli/terminals.ts` privately refreshes the frozen target branch and records
 the unique merge-base of that snapshot and `HEAD` in `implement.completed`.
 It fails before publication/deposit on fetch, ref, ancestry, or ambiguity
@@ -146,8 +152,9 @@ deposited, and a turn's typed terminal always beats a late failure signal.
 **Plugin bootstrap and CLI composition.** `src/plugins/load.ts` resolves every
 configured relative or package module from the consuming repository, validates
 its default manifest/API range, and atomically registers its factories before
-production wiring or the first dispatch tick. Builtin selectors intentionally
-remain unchanged in this foundation release. `src/cli/repo-state.ts` owns
+production wiring or the first dispatch tick. Workspace factories are consumed
+by the selector above; the other production selectors remain builtin-owned.
+`src/cli/repo-state.ts` owns
 repository identity and store precedence (`--store` > `AB_STORE` >
 `.autobuild/`); `src/cli/store-opening.ts` is the production composition boundary;
 `src/cli/args.ts` parses command-scoped flag contracts; `src/cli/binary.ts`

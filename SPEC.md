@@ -111,7 +111,9 @@ malformed or missing default manifests, and plugin-API incompatibility fail
 startup with both the configured module and available compatibility details.
 Builtin registration names and names registered by an earlier plugin are
 reserved per port; collisions fail atomically and nothing is shadowed. The same
-name may exist on different ports.
+name may exist on different ports. `[workspace].provider` selects from the
+workspace catalog; omission selects `git-worktree`. The selected factory is
+invoked lazily with `[workspace.config]`, environment, and repository root.
 
 Plugins execute in-process and are Bun-only. They have the same repository
 trust boundary as declarative shell commands: no sandbox is promised. This
@@ -1069,6 +1071,11 @@ baseBranch = "main"
 capacity = 3                    # concurrent builds for this repo
 plugins = ["./plugins/local.ts", "@acme/autobuild-plugin"]
 
+#[workspace]                     # optional; default provider = "git-worktree"
+#provider = "company-container" # builtin or plugin-registered name
+#[workspace.config]              # selected plugin's declarative config
+#image = "ghcr.io/acme/build:bun"
+
 #[pr.imageHost]                 # optional public inline rendering for attached images
 #provider = "github-release"
 #repository = "owner/public-review-assets"
@@ -1128,7 +1135,12 @@ readyState = "ready"            # required: the one state a ticket must sit in t
 
 The root scalars must appear before the first table header (TOML otherwise
 nests them in that table). `plugins` defaults to `[]`, preserving repositories
-with no plugin configuration. Declarative (TOML), not executable config: the
+with no plugin configuration. `[workspace]` defaults to `provider =
+"git-worktree"` and empty config; the strict selector envelope permits open
+plugin-owned values only under `[workspace.config]`. Unknown providers fail
+with the complete available-name list. Providers still yield a locally
+reachable working-copy path; remote execution remains a later sandbox project.
+Declarative (TOML), not executable config: the
 kernel, dispatcher, CLI, and any future tooling parse it without evaluating
 anything; commands are plain shell strings. Parsing is strict — an unknown table or key is an error, so a
 typo cannot silently disable a verifier. The full config surface, field

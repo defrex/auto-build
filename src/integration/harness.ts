@@ -42,7 +42,12 @@ import {
   type ScriptContext,
 } from '../ports/runner/fake'
 import { FakeTicketSource } from '../ports/tickets/fake'
-import type { AgentTurnResult, Ticket, TicketSource } from '../ports/types'
+import type {
+  AgentTurnResult,
+  Ticket,
+  TicketSource,
+  WorkspaceProvider,
+} from '../ports/types'
 import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { BuildRunner } from '../processes/build-runner'
 import {
@@ -195,13 +200,14 @@ export function agentSession(event: AbEvent): string {
   return event.actor.session
 }
 
-/** Latest `workspace.provisioned` ref not followed by `workspace.released`
- * (same projection the dispatcher's janitor scans for). */
-export function openWorkspaceRef(events: AbEvent[]): string | null {
+/** Latest open workspace's local path, with provider ref fallback for logs
+ * written before workspace path evidence was added. */
+export function openWorkspacePath(events: AbEvent[]): string | null {
   let open: string | null = null
   for (const event of events) {
-    if (event.type === 'workspace.provisioned') open = event.payload.ref
-    else if (event.type === 'workspace.released') open = null
+    if (event.type === 'workspace.provisioned') {
+      open = event.payload.path ?? event.payload.ref
+    } else if (event.type === 'workspace.released') open = null
   }
   return open
 }
@@ -247,7 +253,7 @@ export interface E2eHarness {
   ids: IdSource
   forge: FakeForge
   tickets: FakeTicketSource
-  workspaces: GitWorktreeProvider
+  workspaces: WorkspaceProvider
   agents: ScriptedAgentRunner
   dispatcher: Dispatcher
   /** The same fakes, store, clocks, ids, workspaces, and scripted runtime as a
@@ -282,6 +288,13 @@ export async function makeHarness(opts: {
   configToml?: string
   /** Forge gate existence is independent from current PR mergeability. */
   gatePresence?: 'present' | 'absent'
+  /** Optional production-like workspace composition seam. The default remains
+   * the real git-worktree adapter used by existing scenarios. */
+  createWorkspaceProvider?: (context: {
+    config: Config
+    repoRoot: string
+    worktreeRoot: string
+  }) => WorkspaceProvider | Promise<WorkspaceProvider>
 }): Promise<E2eHarness> {
   const tmp = await mkdtemp(join(tmpdir(), 'ab-e2e-'))
   const originPath = join(tmp, 'origin')
@@ -300,8 +313,11 @@ export async function makeHarness(opts: {
   const forge = new FakeForge({ gatePresence: opts.gatePresence ?? 'present' })
   const tickets = new FakeTicketSource(opts.tickets ?? [])
   const ticketSource: TicketSource = opts.ticketSource ?? tickets
-  const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })
   const config = parseConfig(configToml, 'e2e autobuild.toml')
+  const worktreeRoot = join(tmp, 'worktrees')
+  const workspaces = opts.createWorkspaceProvider === undefined
+    ? new GitWorktreeProvider({ root: worktreeRoot })
+    : await opts.createWorkspaceProvider({ config, repoRoot: origin, worktreeRoot })
 
   const launched: Array<{ slug: string; runner: BuildRunner }> = []
   const cliErrors: string[] = []
@@ -370,8 +386,8 @@ export async function makeHarness(opts: {
   let instances = 0
   const launchRunner = async (slug: string): Promise<LaunchRunnerResult> => {
     const record = await store.getBuild(slug)
-    const wsRef = openWorkspaceRef(await store.getEvents(slug))
-    if (record === null || wsRef === null) {
+    const workspacePath = openWorkspacePath(await store.getEvents(slug))
+    if (record === null || workspacePath === null) {
       throw new Error(`launchRunner("${slug}"): no build record or open workspace`)
     }
     instances += 1
@@ -387,7 +403,7 @@ export async function makeHarness(opts: {
         // serves the Kimi family for exact configured-pair validation.
         runtimes,
         defaultRuntime: 'scripted',
-        workspacePath: wsRef,
+        workspacePath,
         branch: record.branch ?? `ab/${slug}`,
         slug,
         exec: spawnExec,

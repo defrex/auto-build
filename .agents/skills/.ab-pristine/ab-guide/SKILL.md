@@ -177,9 +177,9 @@ with the same trust as configured commands and is not sandboxed.
 `autobuild/plugin-sdk` is the supported authoring entry point for manifest and
 factory types, frozen port types, contract suites, and fake adapters. Plugins
 may use type-only imports with Autobuild as a dev/peer dependency and need no
-runtime Autobuild dependency. This foundation release loads and registers
-factories but the ticket/runtime/workspace/forge selectors remain builtin-only
-until their follow-up releases.
+runtime Autobuild dependency. Workspace selection consumes registered plugin
+factories; ticket, runtime, and forge selectors remain builtin-only until their
+follow-up releases.
 
 ### `[pr]`
 
@@ -218,6 +218,24 @@ deletions remain durable and retry on later dispatcher ticks. Their inline URLs
 therefore intentionally stop working after the review window. The authoritative
 BuildStore artifacts remain queryable under the store's separate retention
 policy.
+
+### `[workspace]`
+
+Optional and backward-compatible: omission selects the builtin `git-worktree`
+provider. The selector envelope is strict; only `[workspace.config]` is an open,
+plugin-owned table.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `provider` | `"git-worktree"` | nonblank builtin or plugin-registered name | Selects the one provider used by dispatch, recovery, PR polling, and cleanup. |
+| `config` | `{}` | open nested table; must be empty for `git-worktree` | Passed unchanged to the selected plugin factory. |
+
+A selected plugin factory receives the nested config, process environment, and
+absolute repository root. Unknown names fail before claims and list all
+available providers. Providers retain the existing local-working-copy contract:
+`path` is absolute and locally reachable, while provider-scoped `ref` may differ;
+both are durable evidence and historical logs fall back from missing `path` to
+`ref`. Remote sandbox execution remains a separate project.
 
 ### `[commands]`
 
