@@ -27,8 +27,10 @@ import {
   abInit,
   claudeSkillPath,
   defaultDistRoot,
+  installedSkillFilePath,
   installedSkillPath,
   MODEL_INVOCABLE_SKILLS,
+  pristineSkillFilePath,
   pristineSkillPath,
   renderAutobuildTemplate,
   rewriteSkillSource,
@@ -90,6 +92,24 @@ describe('abInit — fresh install', () => {
       expect(await readlink(claude)).toBe(`../../.agents/skills/ab-${name}`)
       expect(await readFile(join(claude, 'SKILL.md'), 'utf8')).toBe(installed)
     }
+  })
+
+  test('vendors guide references byte-identically through live, pristine, and Claude views', async () => {
+    await abInit({ targetRepo: target })
+    const relative = 'references/plugin-authoring.md'
+    const canonical = await readFile(
+      join(DIST_ROOT, 'skills', 'guide', ...relative.split('/')),
+      'utf8',
+    )
+    expect(await readFile(installedSkillFilePath(target, 'ab-guide', relative), 'utf8')).toBe(
+      canonical,
+    )
+    expect(await readFile(pristineSkillFilePath(target, 'ab-guide', relative), 'utf8')).toBe(
+      canonical,
+    )
+    expect(
+      await readFile(join(claudeSkillPath(target, 'ab-guide'), ...relative.split('/')), 'utf8'),
+    ).toBe(canonical)
   })
 
   test('frontmatter: name rewritten; disable-model-invocation everywhere EXCEPT the model-invocable set', async () => {
@@ -463,6 +483,31 @@ describe('abInit — idempotence and safety', () => {
     })
     expect(await readFile(live, 'utf8')).toBe(edited)
     expect(await readFile(pristineSkillPath(target, 'ab-plan'), 'utf8')).toBe(pristineBefore)
+  })
+
+  test('re-init independently preserves or force-overwrites distributed support files and leaves local extras alone', async () => {
+    await abInit({ targetRepo: target })
+    const relative = 'references/plugin-authoring.md'
+    const live = installedSkillFilePath(target, 'ab-guide', relative)
+    const pristine = pristineSkillFilePath(target, 'ab-guide', relative)
+    const original = await readFile(live, 'utf8')
+    const extra = installedSkillFilePath(target, 'ab-guide', 'references/local.md')
+    await writeFile(live, 'local authoring rules\n')
+    await writeFile(extra, 'repo-only reference\n')
+
+    const kept = await abInit({ targetRepo: target })
+    expect(kept.skills.find((entry) => entry.skill === 'ab-guide')?.action).toBe('kept')
+    expect(await readFile(live, 'utf8')).toBe('local authoring rules\n')
+    expect(await readFile(pristine, 'utf8')).toBe(original)
+    expect(await readFile(extra, 'utf8')).toBe('repo-only reference\n')
+
+    const forced = await abInit({ targetRepo: target, force: true })
+    expect(forced.skills.find((entry) => entry.skill === 'ab-guide')?.action).toBe(
+      'overwritten',
+    )
+    expect(await readFile(live, 'utf8')).toBe(original)
+    expect(await readFile(pristine, 'utf8')).toBe(original)
+    expect(await readFile(extra, 'utf8')).toBe('repo-only reference\n')
   })
 
   test('force: true overwrites the edited skill AND its pristine record', async () => {
