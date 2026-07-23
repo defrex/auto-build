@@ -61,7 +61,7 @@ export { specConformance, type SpecConformance } from '../spec-standard'
  * What "ready for dispatch" means, resolved against the ticket source.
  *
  * The state gate is no longer source-defaulted: `readyState` is a required,
- * non-blank config value (src/config/schema.ts), so both sources gate on the
+ * non-blank config value (src/config/schema.ts), so every source gates on the
  * exact configured state and always return one. The removed branch — where the
  * linear source left `state` unset when `readyState` was absent — was the
  * AUT-10 hole: with no state filter, every labelled ticket was eligible in any
@@ -71,8 +71,9 @@ export { specConformance, type SpecConformance } from '../spec-standard'
  * The only per-source difference left is the *label* default. Linear has no
  * `ready/` directory, so a label is the only thing that can mark a ticket
  * dispatchable: the historical `["autobuild"]` default. The file tracker's gate
- * is otherwise the directory, so it defaults to no label gate. An explicit
- * `readyLabels` wins for either source.
+ * is otherwise the directory, so it defaults to no label gate. Plugin sources
+ * likewise receive no host-imposed label convention. An explicit
+ * `readyLabels` wins for every source.
  */
 export function readyCriteria(config: Config): { labels: string[]; state: string } {
   const { readyLabels, readyState } = config.tickets
@@ -88,6 +89,7 @@ export function readyCriteria(config: Config): { labels: string[]; state: string
  * readiness is: the file tracker's grooming area IS the `triage/` directory,
  * while a Linear team only has a "Triage" workflow state when the team's
  * triage feature is enabled — Backlog is the state every Linear team has.
+ * Plugin sources use the neutral `Triage` fallback unless configured.
  */
 export function defaultTriageState(config: Config): string {
   return (
@@ -410,8 +412,8 @@ export interface DispatcherDeps {
  * dispatcher's concern), so the janitor scans the raw log. */
 function openWorkspace(
   events: AbEvent[],
-): { provider: string; ref: string; branch: string } | null {
-  let open: { provider: string; ref: string; branch: string } | null = null
+): { provider: string; ref: string; path?: string; branch: string } | null {
+  let open: { provider: string; ref: string; path?: string; branch: string } | null = null
   for (const event of events) {
     if (event.type === 'workspace.provisioned') open = event.payload
     else if (event.type === 'workspace.released') open = null
@@ -583,7 +585,8 @@ export class Dispatcher {
     if (!pr) return
     // Forge calls run from the workspace when it still exists (it does until
     // the build completes); fall back to the repo itself for odd logs.
-    const workspacePath = openWorkspace(events)?.ref ?? this.deps.repo
+    const open = openWorkspace(events)
+    const workspacePath = open?.path ?? open?.ref ?? this.deps.repo
     const prState = await forge.getPrState(workspacePath, pr.number)
     const autoMerge =
       prState.state === 'open' ? pendingAutoMerge(state) : undefined
@@ -774,11 +777,10 @@ export class Dispatcher {
   private async releaseWorkspace(slug: string, events: AbEvent[]): Promise<void> {
     const open = openWorkspace(events)
     if (!open) return
-    // `ref` doubles as `path` for both the git-worktree and fake providers.
     await this.deps.workspaces.release({
       provider: open.provider,
       ref: open.ref,
-      path: open.ref,
+      path: open.path ?? open.ref,
       branch: open.branch,
     })
     await this.deps.store.append(slug, {
@@ -1050,6 +1052,7 @@ export class Dispatcher {
         payload: {
           provider: handle.provider,
           ref: handle.ref,
+          path: handle.path,
           branch: handle.branch,
           base: handle.base,
         },

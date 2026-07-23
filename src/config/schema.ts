@@ -25,6 +25,22 @@ export const prSchema = z.strictObject({
 })
 export type PrConfig = z.infer<typeof prSchema>
 
+// ── [workspace] ─────────────────────────────────────────────────────────────
+
+/** Workspace selector. The host validates the selector envelope; the nested
+ * config belongs to the selected plugin factory and is intentionally open. */
+export const workspaceSchema = z.strictObject({
+  provider: z
+    .string()
+    .refine(
+      (value) => value.trim().length > 0,
+      '[workspace].provider must be a nonblank provider name',
+    )
+    .default('git-worktree'),
+  config: z.record(z.string(), z.unknown()).default({}),
+})
+export type WorkspaceConfig = z.infer<typeof workspaceSchema>
+
 // ── [commands] ───────────────────────────────────────────────────────────────
 //
 // Open map of deterministic verbs the kernel may run. `setup`, `lint`,
@@ -254,7 +270,12 @@ export type PolicyConfig = z.infer<typeof policySchema>
 // file.
 
 export const ticketsSchema = z.strictObject({
-  source: z.enum(['linear', 'file']),
+  /** Builtin or plugin-registered TicketSource name. Registry membership is
+   * validated after configured plugins load. */
+  source: z.string().refine(
+    (value) => value.trim().length > 0,
+    '[tickets].source must be a nonblank builtin or plugin ticket source name',
+  ),
   /**
    * Ticket labels that additionally narrow the mandatory readyState gate
    * (§3.3). A nonempty list is conjunctive: every configured label must be
@@ -309,6 +330,11 @@ const configRootSchema = z.strictObject({
   baseBranch: z.string().min(1).default('main'),
   /** Concurrent builds for this repository (§16.1). */
   capacity: z.number().int().positive().default(1),
+  /** Forge adapter selected from builtins and configured plugins. */
+  forge: z.string().refine(
+    (value) => value.trim().length > 0,
+    'forge adapter name must be nonblank',
+  ).default('github'),
   /** Trusted in-process plugin modules, loaded in declaration order from the
    * consuming repository before production adapters are constructed. */
   plugins: z
@@ -320,6 +346,7 @@ const configRootSchema = z.strictObject({
     )
     .default([]),
   pr: prSchema.optional(),
+  workspace: workspaceSchema.prefault({}),
   commands: commandsSchema.prefault({}),
   server: serverSchema.optional(),
   verify: verifySectionSchema.prefault({}),
@@ -340,7 +367,7 @@ const configRootSchema = z.strictObject({
 })
 
 /** Root metadata keeps strict error prose and documentation coverage honest. */
-export const TOP_LEVEL_SCALARS = ['baseBranch', 'capacity', 'plugins'] as const
+export const TOP_LEVEL_SCALARS = ['baseBranch', 'capacity', 'forge', 'plugins'] as const
 export const TOP_LEVEL_TABLES = Object.keys(configRootSchema.shape).filter(
   (key) => !(TOP_LEVEL_SCALARS as readonly string[]).includes(key),
 )
@@ -352,6 +379,18 @@ export const TOP_LEVEL_KEYS = Object.keys(configRootSchema.shape)
  * discipline applied to config).
  */
 export const configSchema = configRootSchema.superRefine((config, ctx) => {
+  if (
+    config.workspace.provider === 'git-worktree' &&
+    Object.keys(config.workspace.config).length > 0
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['workspace', 'config'],
+      message:
+        '[workspace.config] is not supported by the builtin "git-worktree" provider — remove it or select a plugin workspace provider',
+    })
+  }
+
   const commandNames = Object.keys(config.commands)
   const knownCommands =
     commandNames.length > 0
@@ -458,7 +497,7 @@ export const configSchema = configRootSchema.superRefine((config, ctx) => {
           '[tickets].dir applies only to source = "file" — remove it or set source = "file"',
       })
     }
-  } else {
+  } else if (tickets.source === 'file') {
     // dir is optional for the file source: absent = .autobuild/tickets.
     for (const key of ['teamKey', 'claimedState'] as const) {
       if (tickets[key] !== undefined) {
@@ -470,6 +509,8 @@ export const configSchema = configRootSchema.superRefine((config, ctx) => {
       }
     }
   }
+  // Plugin sources receive the existing ticket lifecycle/configuration fields
+  // unchanged; adapter-specific validation belongs to their factory.
 })
 
 export type Config = z.infer<typeof configSchema>

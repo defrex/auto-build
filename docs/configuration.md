@@ -48,7 +48,8 @@ any table header.
 |---|---:|---|---|
 | `baseBranch` | `"main"` | nonempty string | Branch used to cut builds, target PRs, and merge during reconciliation. |
 | `capacity` | `1` | positive integer | Maximum concurrent nonterminal builds for this repository. Paused and blocked builds still occupy capacity. |
-| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded in declaration order at dispatcher startup. |
+| `forge` | `"github"` | nonblank string | Forge adapter name. Builtin `github` preserves existing behavior; configured plugins may register other names. |
+| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded by dispatch, `ab ticket`, and scoped phase CLI processes. |
 
 ### Plugin modules
 
@@ -65,8 +66,10 @@ must default-export a strict manifest with a plugin name, a semver range in
 `workspaceProviders`, and `forges` factory maps. One manifest may contribute
 to several ports.
 
-Plugin modules execute in-process during `ab dispatch` and have the same trust
-as repository-supplied commands; there is no sandbox. A missing module, module
+Plugin modules execute in-process during `ab dispatch`, sessionless `ab ticket`
+commands, and configured scoped phase CLI composition. They have the same trust
+as repository-supplied commands;
+there is no sandbox. A missing module, module
 that throws, malformed manifest, incompatible API range, or adapter-name
 collision fails startup before a ticket claim. Builtin names and names from
 earlier configured plugins are reserved, and declaration order never permits
@@ -76,11 +79,78 @@ Plugin authors import the stable surface from `autobuild/plugin-sdk`, normally
 with `import type`, and can develop against Autobuild as a dev/peer dependency
 without adding a runtime Autobuild dependency to the plugin. That entry point
 exports the manifest/factory types, port types, fake adapters, and reusable
-AgentRunner, TicketSource, WorkspaceProvider, Forge, BuildStore, and BlobStore
-contract suites. Plugin runtime names are selectable in any `[roles.*].runtime`;
-ticket-source, workspace, and forge selectors remain restricted to shipped
-builtins. Plugin authors should run `describeAgentRunnerContract` against every
-runtime adapter.
+TicketSource, AgentRunner, WorkspaceProvider, Forge, BuildStore, and BlobStore
+contract suites. Adapter values may use the backward-compatible bare factory or
+carry a contract fixture descriptor. Ticket sources may also declare
+`requiredEnv`; the host checks every declared variable for a nonempty value
+before invoking the adapter factory. Plugins using descriptors introduced in
+API 1.1 should require `^1.1.0`.
+
+```ts
+import type { AutobuildPluginManifest } from 'autobuild/plugin-sdk'
+
+export default {
+  name: 'acme-integrations',
+  apiVersion: '^1.1.0',
+  ticketSources: {
+    jira: {
+      requiredEnv: ['JIRA_TOKEN'],
+      factory: ({ config, env, repoRoot }) => createJira(config, env, repoRoot),
+      contract: {
+        // Return the TicketSourceContractFactory consumed by the shared suite.
+        factory: ({ env }) => makeJiraContractFactory(env),
+        live: true,
+      },
+    },
+  },
+} satisfies AutobuildPluginManifest
+```
+
+Use the sessionless author/operator loop from the repository checkout:
+
+```sh
+ab plugin list
+ab plugin doctor
+ab plugin test ticket-source jira
+AB_RUN_LIVE_PORT_CONTRACTS=1 ab plugin test ticket-source jira
+```
+
+The four test port tokens are `ticket-source`, `agent-runtime`,
+`workspace-provider`, and `forge`. `list` includes builtins and successful
+plugin registrations with module, resolved path/kind, owner, API status, and
+contract availability. `doctor` attempts every configured module in declaration
+order, reports each resolution/evaluation/manifest/registration result, and
+exits nonzero if any fail. Dispatch intentionally differs: it stops on the
+first plugin failure before opening stores or claiming work. `test` invokes one
+unchanged shared suite under `bun test`; Bun's per-test output and exit status
+are authoritative. A missing `contract.factory` is an actionable error. A
+`live = true` descriptor cannot launch or create its harness unless
+`AB_RUN_LIVE_PORT_CONTRACTS=1` is explicitly set. Plugin authors should run the
+corresponding contract suite against every adapter, including
+`describeAgentRunnerContract` for each runtime.
+
+Ticket-source, forge, workspace, and agent-runtime selection are open. Set
+`[tickets].source`, the root `forge` scalar, `[workspace].provider`, or any
+`[roles.*].runtime` to a registered name; omission selects the builtin defaults
+where applicable. A selected plugin forge factory receives an empty
+adapter-specific `config` object, while a workspace factory receives
+`[workspace.config]`; both receive the process environment and absolute
+repository root and are invoked lazily after the complete plugin catalog loads.
+Unknown names fail with the available names for that port, and factory failures
+are contextualized with the adapter and plugin names. Scoped build-session CLI
+processes repeat forge config/plugin loading from the build worktree, so phase
+terminal plumbing uses the same configured forge. The returned forge is not
+wrapped: an absent `prAttachments` capability intentionally selects text-only
+attachment summaries, while a present capability serves upload and terminal
+reclamation.
+
+Plugin runtimes receive empty adapter config, the process environment, and the
+absolute repository root. They participate in the same eager exact-name,
+model-family, and default-model role validation as builtins, and their
+registration key is used for session event and transcript attribution. A
+runtime's optional one-shot capability serves slug naming and lazy upgrade
+conflict resolution; when absent, each caller retains its existing safe
+fallback.
 
 ## `[pr]`
 
@@ -133,6 +203,38 @@ durable and retry on later dispatcher ticks. Upload, target-validation, and
 timeout failures create follow-up observations but preserve every text download
 command and do not fail verification or finalize. BuildStore artifacts remain
 the authoritative copies under the store's own retention policy.
+
+## `[workspace]`
+
+Optional. Omission preserves the shipped git-worktree behavior. The surrounding
+table is strict; only the explicit nested `config` table is plugin-owned.
+
+| Field | Default | Constraints | Purpose |
+|---|---:|---|---|
+| `provider` | `"git-worktree"` | nonblank builtin or plugin-registered name | Select the provider used for provisioning, recovery, PR epilogue working-directory calls, and release. |
+| `config` | `{}` | nested open table; must be empty for `git-worktree` | Adapter-specific declarative configuration passed unchanged to the selected plugin factory. |
+
+<!-- config-fragment:workspace -->
+```toml
+[workspace]
+provider = "company-container"
+
+[workspace.config]
+image = "ghcr.io/acme/build:bun"
+writableCache = true
+```
+
+The builtin `git-worktree` provider needs no table and accepts no adapter
+configuration. A plugin factory receives exactly `[workspace.config]`, the
+process environment, and the absolute repository root. Factory invocation is
+lazy: registering an unselected provider constructs nothing. An unknown name
+fails before claims and lists every available builtin and plugin provider.
+
+Every provider must satisfy the exported `WorkspaceProvider` contract and
+return a locally reachable absolute working-copy `path`. Its provider-scoped
+`ref` need not be that path; both are retained as durable workspace evidence.
+Remote sandbox execution, where build processes run off-host, is a separate
+architecture and is not enabled by this selector.
 
 ## `[commands]`
 
@@ -426,17 +528,18 @@ state. Within a present table, `source` and `readyState` are required.
 
 | Field | Default | Constraints | Purpose |
 |---|---:|---|---|
-| `source` | — | required `"file"` or `"linear"` | Select the ticket adapter. |
+| `source` | — | required nonblank builtin or plugin registration name | Select the ticket adapter after configured plugins load. |
 | `readyLabels` | source-aware | optional array of nonempty strings; `[]` allowed | Require every listed label in addition to the state gate. |
 | `readyState` | — | required nonblank string | The one workflow state eligible for dispatch. |
-| `teamKey` | — | required for Linear; forbidden for file; nonempty string | Linear team key such as `"ENG"`. |
-| `claimedState` | `"In Progress"` for Linear | optional nonempty string; Linear only | Workflow state entered when a Linear issue is claimed. |
+| `teamKey` | — | required for Linear; forbidden for file; optional for plugins | Linear team key such as `"ENG"`, or an existing plugin config field. |
+| `claimedState` | `"In Progress"` for Linear | optional nonempty string; forbidden for file; allowed for plugins | Workflow state entered when a ticket is claimed. |
 | `createState` | provider default | optional nonempty string | State used by newly created tickets. |
-| `triageState` | Linear: `"Backlog"`; file: `"Triage"` | optional nonempty string | State used for spec-gate bounces, aborts, and closed-unmerged PRs. |
-| `dir` | selected local state root's `tickets/` (normally `.autobuild/tickets`) | optional nonempty path; file only | Root containing the file source's state directories. Relative paths resolve from the repository; absolute paths are used as given. |
+| `triageState` | Linear: `"Backlog"`; file/plugin: `"Triage"` | optional nonempty string | State used for spec-gate bounces, aborts, and closed-unmerged PRs. |
+| `dir` | file: selected local state root's `tickets/`; plugin: omitted | optional nonempty path; forbidden for Linear; allowed for plugins | Root containing file-source state directories, or an existing plugin config field. Relative file paths resolve from the repository. |
 
-When `readyLabels` is absent, Linear uses `["autobuild"]`; the file source uses
-`[]`, meaning no label gate. An explicit value always wins. A nonempty list is
+When `readyLabels` is absent, Linear uses `["autobuild"]`; file and plugin
+sources use `[]`, meaning no host-imposed label gate. An explicit value always
+wins. A nonempty list is
 conjunctive: every configured label must be present. `readyState` remains
 mandatory regardless of labels. Linear compares state and label names exactly
 and case-sensitively. The file source accepts state names case-insensitively and
@@ -446,8 +549,10 @@ Source-specific validation is strict:
 
 - Linear requires `teamKey` and rejects `dir`.
 - File rejects `teamKey` and `claimedState`; `dir` is optional.
-- `createState` and `triageState` are valid for either source, but the named
+- `createState` and `triageState` are valid for every source, but the named
   state must exist in that provider when used.
+- Plugin sources receive the existing fields in this table unchanged and own
+  any additional semantic validation. No untyped plugin-options table exists.
 
 For Linear, omitting `createState` lets the team's default state apply. For the
 file source it defaults to `Triage`. An omitted Linear `triageState` uses
@@ -473,6 +578,27 @@ triageState = "Backlog"
 Linear credentials do not belong in this table. Set `LINEAR_API_KEY` in the
 environment or local `.env` file described below.
 
+A plugin registration is selected the same way. `ab dispatch` and every
+`ab ticket` subcommand load the plugin and route through that source. Within a
+dispatch process, one selected instance serves dependencies, claim/projections,
+harvest filing, and janitor completion. Unknown names fail with the available
+builtin and loaded plugin names. Missing descriptor credentials name both the
+source and each variable.
+
+<!-- config-fragment:plugin-tickets -->
+```toml
+plugins = ["./plugins/company.ts"]
+
+[tickets]
+source = "company"
+readyState = "Ready"
+claimedState = "Doing"
+createState = "Triage"
+triageState = "Triage"
+```
+
+Set `COMPANY_TICKET_TOKEN` in the environment, never in this table.
+
 ## Complete example
 
 The following deliberately exercises every fixed table and both verify/finalize
@@ -483,7 +609,14 @@ that exist in your repository and providers.
 ```toml
 baseBranch = "main"
 capacity = 2
+forge = "github"
 plugins = ["./plugins/company.ts", "@acme/autobuild-plugin"]
+
+[workspace]
+provider = "company-container"
+
+[workspace.config]
+image = "ghcr.io/acme/build:bun"
 
 [pr.imageHost]
 provider = "github-release"
@@ -567,6 +700,7 @@ On the first `ab init [target]`, when `autobuild.toml` is absent, Autobuild
 renders a valid setup-oriented baseline with:
 
 - `baseBranch = "main"` and `capacity = 1`;
+- the omitted `[workspace]` default, selecting `git-worktree` with empty config;
 - `setup = "bun install"` in `[commands]`;
 - no verify or finalize steps unless recognized package scripts add checks;
 - the default policy values above;

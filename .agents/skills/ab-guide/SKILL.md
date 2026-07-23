@@ -163,7 +163,8 @@ under the preceding table.
 |---|---|---|---|
 | `baseBranch` | `"main"` | nonempty string | The branch builds branch from and target with their PR; what `reconcile` merges into the build branch. |
 | `capacity` | `1` | positive integer | Maximum concurrent builds for this repository. |
-| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded in declaration order before dispatch wiring. |
+| `forge` | `"github"` | nonblank string | Selects a builtin or plugin-registered Forge adapter. |
+| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded in declaration order before dispatch and scoped phase wiring. |
 
 Relative paths and npm package specifiers resolve from the consuming repository,
 so packages come from its installed dependencies rather than Autobuild's.
@@ -177,10 +178,20 @@ with the same trust as configured commands and is not sandboxed.
 `autobuild/plugin-sdk` is the supported authoring entry point for manifest and
 factory types, frozen port types, contract suites, and fake adapters. Plugins
 may use type-only imports with Autobuild as a dev/peer dependency and need no
-runtime Autobuild dependency. Plugin runtime names are selectable in any
-`[roles.*].runtime`; ticket-source, workspace, and forge selectors remain
-builtin-only. Plugin runtime authors should run the exported AgentRunner
-contract suite.
+runtime Autobuild dependency. `[tickets].source`, the root `forge` scalar,
+`[workspace].provider`, and every `[roles.*].runtime` can select loaded plugin
+registrations. Omitted forge and workspace selectors use `github` and
+`git-worktree`. Selected factories receive their adapter config, the process
+environment, and the absolute repository root; runtime and forge config is
+currently empty. Unknown names list all available adapters for that port.
+Dispatch and scoped phase CLI processes resolve the same configured forge name,
+preserving the adapter's optional `prAttachments` capability.
+
+Plugin runtimes participate in the same eager exact-name, model-family, and
+default-model role validation and session attribution as builtins. Their
+optional one-shot capability serves slug and upgrade judgments; absence retains
+each caller's existing safe fallback. Plugin authors should run the exported
+AgentRunner contract suite for runtime adapters.
 
 ### `[pr]`
 
@@ -219,6 +230,24 @@ deletions remain durable and retry on later dispatcher ticks. Their inline URLs
 therefore intentionally stop working after the review window. The authoritative
 BuildStore artifacts remain queryable under the store's separate retention
 policy.
+
+### `[workspace]`
+
+Optional and backward-compatible: omission selects the builtin `git-worktree`
+provider. The selector envelope is strict; only `[workspace.config]` is an open,
+plugin-owned table.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `provider` | `"git-worktree"` | nonblank builtin or plugin-registered name | Selects the one provider used by dispatch, recovery, PR polling, and cleanup. |
+| `config` | `{}` | open nested table; must be empty for `git-worktree` | Passed unchanged to the selected plugin factory. |
+
+A selected plugin factory receives the nested config, process environment, and
+absolute repository root. Unknown names fail before claims and list all
+available providers. Providers retain the existing local-working-copy contract:
+`path` is absolute and locally reachable, while provider-scoped `ref` may differ;
+both are durable evidence and historical logs fall back from missing `path` to
+`ref`. Remote sandbox execution remains a separate project.
 
 ### `[commands]`
 
