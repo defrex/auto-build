@@ -1667,6 +1667,47 @@ test('g. two-axis routing: one phase on pi×kimi-k3, the rest on the default run
   expect(planTranscript.metadata['model']).toBeUndefined()
 }, 30_000)
 
+const PLUGIN_RUNTIME_TOML = `${CONFIG_TOML}
+[roles.default]
+runtime = "plugin-scripted"
+`
+
+test('g2. a plugin-registered runtime and its default model drive a full build', async () => {
+  const h = await track(
+    makeHarness({
+      handlers: happyHandlers(),
+      tickets: [readyTicket('T-PLUGIN')],
+      configToml: PLUGIN_RUNTIME_TOML,
+    }),
+  )
+
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    dispatched: 1,
+  })
+  const state = await h.runLatest()
+  expect(state.prState).toBe('open')
+  expect(h.cliErrors).toEqual([])
+
+  const events = await h.events(SLUG)
+  const started = ofType(events, 'session.started')
+  expect(started).toHaveLength(5)
+  expect(
+    started.map((event) => [event.payload.runner, event.payload.model]),
+  ).toEqual(Array.from({ length: 5 }, () => ['plugin-scripted', 'plugin/default']))
+
+  const transcripts = await h.store.listArtifacts(SLUG, 'transcript')
+  expect(transcripts).toHaveLength(5)
+  expect(
+    transcripts.map((artifact) => [
+      artifact.metadata['runner'],
+      artifact.metadata['model'],
+    ]),
+  ).toEqual(Array.from({ length: 5 }, () => ['plugin-scripted', 'plugin/default']))
+  expect(h.agents.sessions.size).toBe(5)
+  expect([...h.agents.sessions.values()].every((session) => session.ended)).toBe(true)
+}, 30_000)
+
 // ── h. Observation harvest through dispatcher + real CLI (§12) ──────────────
 
 test('h. harvest e2e: threshold → revise → file once → wait for K new observations', async () => {

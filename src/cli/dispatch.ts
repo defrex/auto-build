@@ -27,6 +27,7 @@ import { loadConfig } from '../config/load'
 import type { Config } from '../config/schema'
 import { loadPlugins } from '../plugins/load'
 import type { PluginRegistry } from '../plugins/registry'
+import { materializePluginRuntimes } from '../plugins/runtimes'
 import type { AbEvent } from '../events/catalog'
 import { humanActor } from '../events/envelope'
 import {
@@ -166,8 +167,8 @@ export interface DispatchWiring {
   ids: IdSource
   uuids: UuidSource
   clock: Clock
-  /** Validated startup catalog. Existing selectors remain builtin-only in
-   * this foundation release; follow-up tickets consume these factories. */
+  /** Validated startup catalog. Agent-runtime factories are materialized into
+   * `runtimes`; the remaining adapter selectors are still builtin-only. */
   plugins?: PluginRegistry
 }
 
@@ -1438,8 +1439,13 @@ export async function abDispatch(opts: DispatchOpts): Promise<void> {
   const plugins = await loadPlugins(config.plugins, resolvedOpts.targetRepo)
   const wire = resolvedOpts.wire ?? defaultWire
   const wired = await wire(config, resolvedOpts, state, plugins)
+  const runtimes = await materializePluginRuntimes(wired.runtimes, plugins, {
+    repoRoot: resolvedOpts.targetRepo,
+    env: resolvedOpts.env,
+  })
   const wiring: DispatchWiring = {
     ...wired,
+    runtimes,
     plugins: wired.plugins ?? plugins,
   }
   // §9: resolve the whole config against the registry ONCE, at startup — a

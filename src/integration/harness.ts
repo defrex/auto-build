@@ -34,6 +34,8 @@ import type { AbEvent } from '../events/catalog'
 import type { EventType } from '../events/payloads'
 import { sequentialIds, sequentialUuids, type IdSource } from '../ids'
 import type { BuildState } from '../kernel/reducer'
+import { createPluginRegistry } from '../plugins/registry'
+import { materializePluginRuntimes } from '../plugins/runtimes'
 import { FakeForge } from '../ports/forge/fake'
 import {
   defaultTurnResult,
@@ -357,12 +359,29 @@ export async function makeHarness(opts: {
 
   // Both direct harness runners and injected abDispatch wiring use this one
   // registry, so capture scenarios cannot accidentally exercise a second fake
-  // pipeline implementation.
-  const runtimes = {
-    scripted: { runner: agents, servesModels: [] },
-    claude: { runner: agents, servesModels: ['claude-'] },
-    pi: { runner: agents, servesModels: ['kimi-'] },
-  }
+  // pipeline implementation. `plugin-scripted` crosses the real plugin
+  // materialization boundary while reusing the contract-tested scripted fake.
+  const pluginRegistry = createPluginRegistry()
+  pluginRegistry.register({
+    name: 'e2e-runtime-plugin',
+    apiVersion: '^1.0.0',
+    agentRuntimes: {
+      'plugin-scripted': () => ({
+        runner: agents,
+        servesModels: ['plugin/'],
+        defaultModel: 'plugin/default',
+      }),
+    },
+  })
+  const runtimes = await materializePluginRuntimes(
+    {
+      scripted: { runner: agents, servesModels: [] },
+      claude: { runner: agents, servesModels: ['claude-'] },
+      pi: { runner: agents, servesModels: ['kimi-'] },
+    },
+    pluginRegistry,
+    { repoRoot: origin, env: {} },
+  )
 
   // launchRunner (§3.3, §15.6-C, §15.7): construct a REAL BuildRunner over
   // the SAME store and the provisioned workspace path; the dispatcher never
