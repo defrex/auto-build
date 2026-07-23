@@ -46,7 +46,7 @@ K unclaimed observation.recorded events
 | `src/store/` | BuildStore plus repository-journal contract; memory, SQLite/blob, and remote HTTP adapters | §7 |
 | `src/kernel/` | Phase table, build reducer, engine; pure harvest, dispatcher-settings, and PR-attachment selectors; converge, stall detection, verify gating, server lifecycle | §5, §7.5, §10, §12, §15.4–15.5, §16.2 |
 | `src/ports/` | TicketSource / Workspace / Forge / AgentRunner / Telemetry interfaces, adapters, and fakes; runtime/model routing under `ports/runner/` | §3.2, §9, §13 |
-| `src/plugins/` | Strict versioned plugin manifests, repository-rooted Bun loading, and owner-aware adapter registration | §3.2.1 |
+| `src/plugins/` | Strict versioned plugin manifests, repository-rooted Bun loading, owner-aware registration, and runtime-factory materialization | §3.2.1, §9 |
 | `src/plugin-sdk/` | The sole supported `autobuild/plugin-sdk` barrel: port/manifest types, contract suites, and reference fakes | §3.2.1 |
 | `src/processes/` | build-runner, dispatcher (+ janitor duty and harvest trigger), harvest deterministic core + runner | §3.3, §12, §15.7 |
 | `src/cli/` and `bin/ab.ts` | The `ab` CLI — the only agent↔store channel — plus init/upgrade and the dispatch loop | §8, §16.3 |
@@ -134,25 +134,31 @@ execution-time target refresh in `src/processes/build-runner.ts` remains a
 third, deliberately separate boundary and also fails closed.
 
 **Agent runtimes.** `src/ports/runner/`: `runtime.ts` (capability-carrying
-registry), `routing.ts` (eager role resolver), `production.ts` (shipped
-Claude/Pi registrations), `one-shot.ts` (optional tool-free non-phase
-completions — slug naming via `src/cli/dispatch.ts`, skill-conflict
-proposals via `src/cli/upgrade-agent.ts`), `provider-error.ts` (positive-only
-permanent-failure classifier), and `session-env.ts` (per-turn environment
-merge that fronts `bin/agent/ab` on `PATH`). Adapters own SDK-native error
-extraction; processes own durable failure policy — the transcript is always
-deposited, and a turn's typed terminal always beats a late failure signal.
+registry plus boundary validation), `routing.ts` (eager role resolver),
+`production.ts` (shipped Claude/Pi registrations), `one-shot.ts` (optional
+tool-free non-phase completions — slug naming via `src/cli/dispatch.ts`,
+skill-conflict proposals via `src/cli/upgrade-agent.ts`), `provider-error.ts`
+(positive-only permanent-failure classifier), and `session-env.ts` (per-turn
+environment merge that fronts `bin/agent/ab` on `PATH`). Adapters own SDK-native
+error extraction; processes own durable failure policy — the transcript is
+always deposited, and a turn's typed terminal always beats a late failure
+signal.
 
 **Plugin bootstrap and CLI composition.** `src/plugins/load.ts` resolves every
 configured relative or package module from the consuming repository, validates
 its default manifest/API range, and atomically registers its factories before
-production wiring or the first dispatch tick. Builtin selectors intentionally
-remain unchanged in this foundation release. `src/cli/repo-state.ts` owns
-repository identity and store precedence (`--store` > `AB_STORE` >
-`.autobuild/`); `src/cli/store-opening.ts` is the production composition boundary;
+the first dispatch tick. `src/plugins/runtimes.ts` invokes runtime factories in
+registration order, validates their capability-bearing registrations, and
+returns one fresh registry containing builtins and plugins. Dispatch performs
+that composition before eager role resolution and shares the result with build,
+harvest, and slug routing. Upgrade performs the same composition lazily at its
+first merge conflict. Ticket, workspace, and forge selectors remain builtin
+composition paths. `src/cli/repo-state.ts` owns repository identity and store
+precedence (`--store` > `AB_STORE` > `.autobuild/`);
+`src/cli/store-opening.ts` is the production store composition boundary;
 `src/cli/args.ts` parses command-scoped flag contracts; `src/cli/binary.ts`
-classifies build/harvest session tuples and routes sessionless invocations,
-so phase-only commands report their complete runner context when run by hand.
+classifies build/harvest session tuples and routes sessionless invocations, so
+phase-only commands report their complete runner context when run by hand.
 
 **PR attachments.** `src/cli/artifact.ts` atomically turns an explicit
 `artifact put --attach` into an exact artifact plus designation fact.

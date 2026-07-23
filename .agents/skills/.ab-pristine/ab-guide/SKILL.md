@@ -177,9 +177,10 @@ with the same trust as configured commands and is not sandboxed.
 `autobuild/plugin-sdk` is the supported authoring entry point for manifest and
 factory types, frozen port types, contract suites, and fake adapters. Plugins
 may use type-only imports with Autobuild as a dev/peer dependency and need no
-runtime Autobuild dependency. This foundation release loads and registers
-factories but the ticket/runtime/workspace/forge selectors remain builtin-only
-until their follow-up releases.
+runtime Autobuild dependency. Plugin runtime names are selectable in any
+`[roles.*].runtime`; ticket-source, workspace, and forge selectors remain
+builtin-only. Plugin runtime authors should run the exported AgentRunner
+contract suite.
 
 ### `[pr]`
 
@@ -385,7 +386,9 @@ With no `[roles.default]`, the base is empty: sessions use the wiring-fallback
 runtime (`claude`) and that runtime's built-in default model, with no
 extensions. Two runtimes ship: **`claude`** (Claude models) and **`pi`** (SDK
 mode; provider-qualified ids such as `openai-codex/gpt-5.6-sol` — `ab models
-[query]` looks them up).
+[query]` looks them up). Trusted plugins may register additional runtime names;
+they use the same role inheritance, default-model compatibility validation,
+session event attribution, and optional one-shot capability path as builtins.
 
 The pipeline resolves `plan`, `plan-review`, `implement`, and `code-review`,
 plus each verify/finalize step by name. The repository workflow resolves

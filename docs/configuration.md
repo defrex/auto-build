@@ -76,10 +76,11 @@ Plugin authors import the stable surface from `autobuild/plugin-sdk`, normally
 with `import type`, and can develop against Autobuild as a dev/peer dependency
 without adding a runtime Autobuild dependency to the plugin. That entry point
 exports the manifest/factory types, port types, fake adapters, and reusable
-TicketSource, WorkspaceProvider, Forge, BuildStore, and BlobStore contract
-suites. This foundation release registers factories but keeps ticket source,
-agent runtime, workspace, and forge selectors restricted to shipped builtins;
-follow-up releases open those config selectors.
+AgentRunner, TicketSource, WorkspaceProvider, Forge, BuildStore, and BlobStore
+contract suites. Plugin runtime names are selectable in any `[roles.*].runtime`;
+ticket-source, workspace, and forge selectors remain restricted to shipped
+builtins. Plugin authors should run `describeAgentRunnerContract` against every
+runtime adapter.
 
 ## `[pr]`
 
@@ -375,11 +376,15 @@ to serve a configured model and never substitutes a different model to repair
 an invalid pair. The only implicit fill is when neither the role nor `default`
 names a model, in which case the selected runtime uses its own default.
 
-Two runtimes ship: `claude` and `pi`. With no configured model, Claude uses
-the SDK's built-in default and Pi uses `kimi-coding/k3`. Use
-`ab models [query]` to find provider-qualified Pi model ids. Extension entries
-match installed Pi package sources case-insensitively; runtimes without an
-extension mechanism ignore this axis. Tool-free one-shot judgments disable
+Two runtimes ship: `claude` and `pi`; trusted plugins may register additional
+names. Builtin and plugin runtimes use the same exact-pair validation and event
+attribution. With no configured model, the selected runtime uses its declared
+default when present (Claude otherwise uses the SDK default; Pi declares
+`kimi-coding/k3`). Use `ab models [query]` to find provider-qualified Pi model
+ids. Extension entries match installed Pi package sources case-insensitively;
+runtimes without an extension mechanism ignore this axis. A plugin may declare
+optional tool-free one-shot completion for `slug` and `upgrade`; absence keeps
+each caller's existing fail-safe behavior. One-shot judgments disable
 extensions even if their role grants them.
 
 Core agent phases route by phase name (`plan`, `plan-review`, `implement`,
@@ -391,7 +396,8 @@ keys are accepted, but only a name selected by one of these routes affects a
 session.
 
 Resolver construction validates `default` and every declared role eagerly and
-aggregates all unknown-runtime and incompatible-model problems. A deliberately
+aggregates all unknown-runtime and incompatible-model problems. Unknown-runtime
+diagnostics list every builtin and materialized plugin runtime. A deliberately
 different reviewer model is valid and often useful; mixed models are not a
 configuration inconsistency.
 
@@ -673,8 +679,9 @@ the wrong step kind, or source-specific ticket fields used together.
 
 Runtime routing failures use a separate heading and list all bad roles. Check
 the merged `default` plus child values, not just the child table: each axis
-inherits independently. Confirm the runtime name is shipped and use
-`ab models [query]` to choose a model family that runtime serves.
+inherits independently. Confirm the runtime name is shipped or registered by a configured plugin and
+use `ab models [query]` (or the plugin's documentation) to choose a model family
+that runtime serves.
 
 ### `tick: idle` with expected work
 
