@@ -152,8 +152,14 @@ first dispatch tick. Its structured single-module attempt feeds two policies:
 ordered failures and retains later healthy registrations for `ab plugin doctor`.
 `src/cli/plugin.ts` owns the sessionless list/doctor/test grammar and live gate;
 `src/plugins/contract-entry.ts` reloads one selected registration inside a real
-`bun test` process and registers exactly one unchanged port suite. Builtin
-selectors intentionally remain unchanged in this foundation release.
+`bun test` process and registers exactly one unchanged port suite.
+`src/ports/forge/create.ts` resolves the root `forge` selector, constructs
+GitHub or lazily invokes the registered plugin factory, and preserves the
+returned adapter's optional attachment capability. Dispatch constructs one
+selected adapter before opening the store and threads it through runners,
+epilogue, and janitor work. Scoped `src/cli/binary.ts` processes independently
+load the build worktree's immutable config/plugins and resolve the same name for
+phase terminal plumbing. The other plugin selectors remain builtin-only.
 `src/cli/repo-state.ts` owns
 repository identity and store precedence (`--store` > `AB_STORE` >
 `.autobuild/`); `src/cli/store-opening.ts` is the production composition boundary;

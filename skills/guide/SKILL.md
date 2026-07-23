@@ -163,7 +163,8 @@ under the preceding table.
 |---|---|---|---|
 | `baseBranch` | `"main"` | nonempty string | The branch builds branch from and target with their PR; what `reconcile` merges into the build branch. |
 | `capacity` | `1` | positive integer | Maximum concurrent builds for this repository. |
-| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded in declaration order before dispatch wiring. |
+| `forge` | `"github"` | nonblank string | Selects a builtin or plugin-registered Forge adapter. |
+| `plugins` | `[]` | array of nonblank module specifiers | Trusted Bun plugin modules loaded in declaration order before dispatch and scoped phase wiring. |
 
 Relative paths and npm package specifiers resolve from the consuming repository,
 so packages come from its installed dependencies rather than Autobuild's.
@@ -187,10 +188,16 @@ contract availability. `ab plugin doctor` exhaustively reports every configured
 module and exits nonzero on any failure; `ab dispatch` remains first-failure
 fail-fast. Certify one adapter with
 `ab plugin test <ticket-source|agent-runtime|workspace-provider|forge> <adapter>`.
-The command forwards Bun's per-test output
-and status. A live descriptor is refused unless
-`AB_RUN_LIVE_PORT_CONTRACTS=1` is explicitly set. Selectors remain builtin-only
-until their port follow-up releases.
+The command forwards Bun's per-test output and status. A live descriptor is
+refused unless `AB_RUN_LIVE_PORT_CONTRACTS=1` is explicitly set.
+
+Forge selection is open through the root `forge` scalar; omission selects
+`github`. A selected plugin factory receives empty adapter config, the process
+environment, and the absolute repository root. Unknown names list all available
+forges. Dispatch and scoped phase CLI processes resolve the same configured
+name, preserving the adapter's optional `prAttachments` capability.
+Ticket/runtime/workspace selectors remain builtin-only until their follow-up
+releases.
 
 ### `[pr]`
 

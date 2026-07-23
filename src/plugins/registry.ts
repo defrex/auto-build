@@ -48,8 +48,9 @@ export type RegistrationSource =
 
 export interface AdapterRegistration<Factory, ContractFactory = unknown> {
   owner: RegistrationOwner
-  /** Builtins remain reservations until their ordinary selector consumes the
-   * registry. Plugin registrations always carry a normalized factory. */
+  /** Builtins reserve their names while host construction may remain outside
+   * the registry. Plugin registrations always carry a normalized factory for
+   * open selectors to consume lazily. */
   factory?: Factory
   contract?: PluginContractDescriptor<ContractFactory>
   source: RegistrationSource
