@@ -147,6 +147,8 @@ async function seedBuild(
     ticketId?: string
     repo?: string
     workspace?: boolean
+    workspaceRef?: string
+    workspacePath?: string
     attached?: boolean
     pr?: { number: number; url: string; headSha: string }
   } = {},
@@ -171,7 +173,8 @@ async function seedBuild(
       type: 'workspace.provisioned',
       payload: {
         provider: 'fake',
-        ref: `/ws/ab/${slug}`,
+        ref: opts.workspaceRef ?? `/ws/ab/${slug}`,
+        ...(opts.workspacePath !== undefined ? { path: opts.workspacePath } : {}),
         branch: `ab/${slug}`,
         base: { source: 'remote', sha: 'fake-base-sha' },
       },
@@ -587,6 +590,7 @@ describe('Dispatcher dispatch', () => {
     expect(events[1]?.payload).toEqual({
       provider: 'fake',
       ref: '/ws/ab/add-rate-limiting',
+      path: '/ws/ab/add-rate-limiting',
       branch: 'ab/add-rate-limiting',
       base: { source: 'remote', sha: 'fake-base-sha' },
     })
@@ -749,7 +753,13 @@ releaseId = 42
     const provisioned = (await h.store.getEvents('add-rate-limiting')).find(
       (event) => event.type === 'workspace.provisioned',
     )
-    expect(provisioned?.payload.base).toEqual(base)
+    expect(provisioned?.payload).toEqual({
+      provider: 'fake',
+      ref: '/ws/ab/add-rate-limiting',
+      path: '/ws/ab/add-rate-limiting',
+      branch: 'ab/add-rate-limiting',
+      base,
+    })
   })
 
   test('spec-aware naming sees the exact final spec and can surface a buried subject', async () => {
@@ -1828,7 +1838,12 @@ describe('Dispatcher dependency gate', () => {
 describe('Dispatcher janitor', () => {
   test('merged PR: pr.merged once, release, Done transition, completed{merged}; second tick no-ops', async () => {
     const h = harness({ tickets: [readyTicket('T-1', { labels: [] })] })
-    const slug = await seedBuild(h, { ticketId: 'T-1', pr: PR })
+    const slug = await seedBuild(h, {
+      ticketId: 'T-1',
+      pr: PR,
+      workspaceRef: 'fake:workspace-1',
+      workspacePath: '/local/workspace-1',
+    })
     h.forge.setPrState(1, { state: 'merged', sha: 'squash-1' })
 
     const report = await h.dispatcher.tick()
@@ -1843,7 +1858,17 @@ describe('Dispatcher janitor', () => {
     const prMerged = events.find((e) => e.type === 'pr.merged')
     expect(prMerged?.payload).toEqual({ sha: 'squash-1' })
     expect(events.at(-1)?.payload).toEqual({ outcome: 'merged' })
-    expect(h.workspaces.releases.map((r) => r.ref)).toEqual([`/ws/ab/${slug}`])
+    expect(h.forge.getPrStateCalls).toEqual([
+      { workspacePath: '/local/workspace-1', number: 1 },
+    ])
+    expect(h.workspaces.releases).toEqual([
+      {
+        provider: 'fake',
+        ref: 'fake:workspace-1',
+        path: '/local/workspace-1',
+        branch: `ab/${slug}`,
+      },
+    ])
     expect(h.tickets.transitions).toEqual([{ id: 'T-1', state: 'Done' }])
     expect(h.tickets.comments).toEqual([
       { id: 'T-1', body: expect.stringContaining(PR.url) },
@@ -2938,6 +2963,7 @@ describe('readyCriteria — readiness is resolved against the ticket source (§3
 
   const FILE = '[tickets]\nsource = "file"\n'
   const LINEAR = '[tickets]\nsource = "linear"\nteamKey = "ENG"\n'
+  const PLUGIN = '[tickets]\nsource = "jira"\n'
 
   test('file source: the configured state is the gate, no label gate by default', () => {
     // The headline claim: no label — `mv` into the readyState directory dispatches.
@@ -2956,7 +2982,14 @@ describe('readyCriteria — readiness is resolved against the ticket source (§3
     })
   })
 
-  test('the state gate is always emitted for both sources', () => {
+  test('plugin sources have no host-imposed label convention', () => {
+    expect(criteria(`${PLUGIN}readyState = "Open"\n`)).toEqual({
+      labels: [],
+      state: 'Open',
+    })
+  })
+
+  test('the state gate is always emitted for every source', () => {
     expect(criteria(`${LINEAR}readyState = "Todo"\n`)).toEqual({
       labels: ['autobuild'],
       state: 'Todo',
@@ -2965,14 +2998,21 @@ describe('readyCriteria — readiness is resolved against the ticket source (§3
       labels: [],
       state: 'Todo',
     })
+    expect(criteria(`${PLUGIN}readyState = "Todo"\n`)).toEqual({
+      labels: [],
+      state: 'Todo',
+    })
   })
 
-  test('an explicit readyLabels wins for either source — config is never ignored', () => {
+  test('an explicit readyLabels wins for every source — config is never ignored', () => {
     expect(
       criteria(`${FILE}readyLabels = ["urgent"]\nreadyState = "Ready"\n`),
     ).toEqual({ labels: ['urgent'], state: 'Ready' })
     expect(
       criteria(`${LINEAR}readyLabels = ["urgent"]\nreadyState = "Ready"\n`),
+    ).toEqual({ labels: ['urgent'], state: 'Ready' })
+    expect(
+      criteria(`${PLUGIN}readyLabels = ["urgent"]\nreadyState = "Ready"\n`),
     ).toEqual({ labels: ['urgent'], state: 'Ready' })
   })
 

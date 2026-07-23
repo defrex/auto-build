@@ -21,6 +21,9 @@ import { randomUuids } from '../ids'
 import { decideNext } from '../kernel/engine'
 import { reduceHarvest } from '../kernel/harvest'
 import { reduceBuild } from '../kernel/reducer'
+import { createPluginRegistry } from '../plugins/registry'
+import type { PluginFactoryContext } from '../plugins/manifest'
+import type { WorkspaceHandle, WorkspaceProvider } from '../ports/types'
 import { defaultTurnResult, ScriptedAgentRunner } from '../ports/runner/fake'
 import { AGENT_BIN_DIR, sessionEnv } from '../ports/runner/session-env'
 import { FileTicketSource } from '../ports/tickets/file'
@@ -33,7 +36,8 @@ import {
   HarvestRunner,
   type HarvestRunnerResult,
 } from '../processes/harvest-runner'
-import { spawnExec } from '../ports/workspace/git-worktree'
+import { createWorkspaceProvider } from '../ports/workspace/create'
+import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { openLocalStore } from '../store/local/store'
 import { textContent } from '../store/types'
 import { steppingClock } from '../testing/fixed'
@@ -260,6 +264,102 @@ test('a. happy path: ready ticket → dispatch → pipeline → PR → janitor m
   const reduced = reduceBuild(final)
   expect(reduced.status).toBe('done')
   expect(reduced.outcome).toBe('merged')
+}, 30_000)
+
+test('plugin-selected workspace drives runner, PR polling, and terminal release with distinct ref and path', async () => {
+  const configToml = CONFIG_TOML.replace(
+    '[commands]',
+    '[workspace]\nprovider = "plugin-workspace"\n\n[workspace.config]\nprofile = "integration"\n\n[commands]',
+  )
+  let factoryContext: PluginFactoryContext | undefined
+  let selected: (WorkspaceProvider & { releases: WorkspaceHandle[] }) | undefined
+
+  const h = await track(
+    makeHarness({
+      configToml,
+      handlers: happyHandlers(),
+      tickets: [readyTicket('T-1')],
+      createWorkspaceProvider: async ({ config, repoRoot, worktreeRoot }) => {
+        const registry = createPluginRegistry()
+        const backing = new GitWorktreeProvider({ root: worktreeRoot })
+        registry.register({
+          name: 'integration-workspaces',
+          apiVersion: '^1.0.0',
+          workspaceProviders: {
+            'plugin-workspace': (context) => {
+              factoryContext = context
+              const releases: WorkspaceHandle[] = []
+              selected = {
+                name: 'plugin-workspace',
+                releases,
+                async provision(opts) {
+                  const handle = await backing.provision(opts)
+                  return {
+                    ...handle,
+                    provider: 'plugin-workspace',
+                    ref: `plugin:${opts.branch}`,
+                  }
+                },
+                async release(handle) {
+                  releases.push({ ...handle })
+                  await backing.release({
+                    ...handle,
+                    provider: backing.name,
+                    ref: handle.path,
+                  })
+                },
+              }
+              return selected
+            },
+          },
+        })
+        return createWorkspaceProvider(config.workspace, {
+          registry,
+          worktreeRoot,
+          repoRoot,
+          env: { INTEGRATION_TOKEN: 'present' },
+        })
+      },
+    }),
+  )
+
+  expect((await h.dispatcher.tick()).dispatched).toBe(1)
+  const provisioned = ofType(await h.events(SLUG), 'workspace.provisioned')[0]!
+  expect(provisioned.payload.provider).toBe('plugin-workspace')
+  expect(provisioned.payload.ref).toBe(`plugin:${BRANCH}`)
+  const workspacePath = provisioned.payload.path
+  if (workspacePath === undefined) throw new Error('new workspace event omitted path')
+  expect(workspacePath).not.toBe(provisioned.payload.ref)
+  expect(provisioned.payload.base.source).toBe('remote')
+  expect(factoryContext).toEqual({
+    config: { profile: 'integration' },
+    env: { INTEGRATION_TOKEN: 'present' },
+    repoRoot: h.origin,
+  })
+
+  expect((await h.runLatest()).prState).toBe('open')
+  expect(h.cliErrors).toEqual([])
+  await h.dispatcher.tick()
+  expect(h.forge.getPrStateCalls.at(-1)).toEqual({
+    workspacePath,
+    number: 1,
+  })
+
+  h.forge.setPrState(1, { state: 'merged', sha: 'plugin-squash' })
+  expect((await h.dispatcher.tick()).merged).toBe(1)
+  expect(selected?.releases).toEqual([
+    {
+      provider: 'plugin-workspace',
+      ref: `plugin:${BRANCH}`,
+      path: workspacePath,
+      branch: BRANCH,
+    },
+  ])
+  expect(typesOf(await h.events(SLUG)).slice(-3)).toEqual([
+    'pr.merged',
+    'workspace.released',
+    'build.completed',
+  ])
 }, 30_000)
 
 const FINALIZE_CONTENT_TOML = `${CONFIG_TOML}
@@ -1665,6 +1765,100 @@ test('g. two-axis routing: one phase on pi×kimi-k3, the rest on the default run
   const planTranscript = transcripts.find((m) => m.metadata['phase'] === 'plan')!
   expect(planTranscript.metadata['runner']).toBe('scripted')
   expect(planTranscript.metadata['model']).toBeUndefined()
+}, 30_000)
+
+const PLUGIN_RUNTIME_TOML = `${CONFIG_TOML}
+[roles.default]
+runtime = "plugin-scripted"
+`
+
+test('g2. a plugin-registered runtime and its default model drive a full build', async () => {
+  const h = await track(
+    makeHarness({
+      handlers: happyHandlers(),
+      tickets: [readyTicket('T-PLUGIN')],
+      configToml: PLUGIN_RUNTIME_TOML,
+    }),
+  )
+
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    dispatched: 1,
+  })
+  const state = await h.runLatest()
+  expect(state.prState).toBe('open')
+  expect(h.cliErrors).toEqual([])
+
+  const events = await h.events(SLUG)
+  const started = ofType(events, 'session.started')
+  expect(started).toHaveLength(5)
+  expect(
+    started.map((event) => [event.payload.runner, event.payload.model]),
+  ).toEqual(Array.from({ length: 5 }, () => ['plugin-scripted', 'plugin/default']))
+
+  const transcripts = await h.store.listArtifacts(SLUG, 'transcript')
+  expect(transcripts).toHaveLength(5)
+  expect(
+    transcripts.map((artifact) => [
+      artifact.metadata['runner'],
+      artifact.metadata['model'],
+    ]),
+  ).toEqual(Array.from({ length: 5 }, () => ['plugin-scripted', 'plugin/default']))
+  expect(h.agents.sessions.size).toBe(5)
+  expect([...h.agents.sessions.values()].every((session) => session.ended)).toBe(true)
+}, 30_000)
+
+const PLUGIN_PHASE_OVERRIDE_TOML = `${CONFIG_TOML}
+[roles.default]
+runtime = "scripted"
+
+[roles.plan]
+runtime = "plugin-scripted"
+`
+
+test('g3. a phase role can override the configured default with a plugin runtime', async () => {
+  const h = await track(
+    makeHarness({
+      handlers: happyHandlers(),
+      tickets: [readyTicket('T-PLUGIN-PHASE')],
+      configToml: PLUGIN_PHASE_OVERRIDE_TOML,
+    }),
+  )
+
+  expect(await h.dispatcher.tick()).toEqual({
+    ...emptyTickReport(),
+    dispatched: 1,
+  })
+  const state = await h.runLatest()
+  expect(state.prState).toBe('open')
+  expect(h.cliErrors).toEqual([])
+
+  const started = ofType(await h.events(SLUG), 'session.started')
+  const plan = started.find((event) => event.payload.role === 'plan')!
+  expect(plan.payload.runner).toBe('plugin-scripted')
+  expect(plan.payload.model).toBe('plugin/default')
+
+  for (const role of ['plan-review', 'implement', 'code-review', 'finalize']) {
+    const session = started.find((event) => event.payload.role === role)!
+    expect(session.payload.runner).toBe('scripted')
+    expect(session.payload.model).toBeUndefined()
+  }
+
+  const transcripts = await h.store.listArtifacts(SLUG, 'transcript')
+  const planTranscript = transcripts.find(
+    (artifact) => artifact.metadata['phase'] === 'plan',
+  )!
+  expect(planTranscript.metadata['runner']).toBe('plugin-scripted')
+  expect(planTranscript.metadata['model']).toBe('plugin/default')
+  expect(
+    transcripts
+      .filter((artifact) => artifact.metadata['phase'] !== 'plan')
+      .every(
+        (artifact) =>
+          artifact.metadata['runner'] === 'scripted' &&
+          artifact.metadata['model'] === undefined,
+      ),
+  ).toBe(true)
 }, 30_000)
 
 // ── h. Observation harvest through dispatcher + real CLI (§12) ──────────────

@@ -67,6 +67,7 @@ describe('plugin authoring guide', () => {
       'AB_RUN_LIVE_PORT_CONTRACTS=1',
       'BuildStore is **not** an in-process manifest map',
       'TelemetrySource',
+      '`requiredEnv`',
       'environment variables',
       'not a runtime `dependencies` entry',
       'npm pack --dry-run',
@@ -75,7 +76,15 @@ describe('plugin authoring guide', () => {
     ]) {
       expect(reference).toContain(contract)
     }
-    expect(reference).toContain('Ticket source, runtime, and workspace selectors remain\nbuiltin-only')
+    for (const selector of [
+      '`[tickets].source`',
+      '`[workspace].provider`',
+      '`[roles.*].runtime`',
+      'root `forge` key',
+    ]) {
+      expect(reference).toContain(selector)
+    }
+    expect(reference).toContain('All four manifest maps have production selectors')
   })
 
   test('the exact zero-network walkthrough initializes, loads, lists, and passes its contract', async () => {

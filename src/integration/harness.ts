@@ -34,9 +34,10 @@ import type { AbEvent } from '../events/catalog'
 import type { EventType } from '../events/payloads'
 import { sequentialIds, sequentialUuids, type IdSource } from '../ids'
 import type { BuildState } from '../kernel/reducer'
+import { createPluginRegistry, type PluginRegistry } from '../plugins/registry'
+import { materializePluginRuntimes } from '../plugins/runtimes'
 import { createForge } from '../ports/forge/create'
 import { FakeForge } from '../ports/forge/fake'
-import { createPluginRegistry, type PluginRegistry } from '../plugins/registry'
 import {
   defaultTurnResult,
   ScriptedAgentRunner,
@@ -44,7 +45,13 @@ import {
   type ScriptContext,
 } from '../ports/runner/fake'
 import { FakeTicketSource } from '../ports/tickets/fake'
-import type { AgentTurnResult, Forge, Ticket, TicketSource } from '../ports/types'
+import type {
+  AgentTurnResult,
+  Forge,
+  Ticket,
+  TicketSource,
+  WorkspaceProvider,
+} from '../ports/types'
 import { GitWorktreeProvider, spawnExec } from '../ports/workspace/git-worktree'
 import { BuildRunner } from '../processes/build-runner'
 import {
@@ -197,13 +204,14 @@ export function agentSession(event: AbEvent): string {
   return event.actor.session
 }
 
-/** Latest `workspace.provisioned` ref not followed by `workspace.released`
- * (same projection the dispatcher's janitor scans for). */
-export function openWorkspaceRef(events: AbEvent[]): string | null {
+/** Latest open workspace's local path, with provider ref fallback for logs
+ * written before workspace path evidence was added. */
+export function openWorkspacePath(events: AbEvent[]): string | null {
   let open: string | null = null
   for (const event of events) {
-    if (event.type === 'workspace.provisioned') open = event.payload.ref
-    else if (event.type === 'workspace.released') open = null
+    if (event.type === 'workspace.provisioned') {
+      open = event.payload.path ?? event.payload.ref
+    } else if (event.type === 'workspace.released') open = null
   }
   return open
 }
@@ -249,7 +257,7 @@ export interface E2eHarness {
   ids: IdSource
   forge: FakeForge
   tickets: FakeTicketSource
-  workspaces: GitWorktreeProvider
+  workspaces: WorkspaceProvider
   agents: ScriptedAgentRunner
   dispatcher: Dispatcher
   /** The same fakes, store, clocks, ids, workspaces, and scripted runtime as a
@@ -284,6 +292,13 @@ export async function makeHarness(opts: {
   configToml?: string
   /** Forge gate existence is independent from current PR mergeability. */
   gatePresence?: 'present' | 'absent'
+  /** Optional production-like workspace composition seam. The default remains
+   * the real git-worktree adapter used by existing scenarios. */
+  createWorkspaceProvider?: (context: {
+    config: Config
+    repoRoot: string
+    worktreeRoot: string
+  }) => WorkspaceProvider | Promise<WorkspaceProvider>
   /** Resolve the config's forge name through a plugin registration instead of
    * injecting FakeForge directly. The selected adapter still shares this one
    * fake journal across CLI terminals, runner, dispatcher, and janitor. */
@@ -326,7 +341,10 @@ export async function makeHarness(opts: {
   }
   const tickets = new FakeTicketSource(opts.tickets ?? [])
   const ticketSource: TicketSource = opts.ticketSource ?? tickets
-  const workspaces = new GitWorktreeProvider({ root: join(tmp, 'worktrees') })
+  const worktreeRoot = join(tmp, 'worktrees')
+  const workspaces = opts.createWorkspaceProvider === undefined
+    ? new GitWorktreeProvider({ root: worktreeRoot })
+    : await opts.createWorkspaceProvider({ config, repoRoot: origin, worktreeRoot })
 
   const launched: Array<{ slug: string; runner: BuildRunner }> = []
   const cliErrors: string[] = []
@@ -382,12 +400,29 @@ export async function makeHarness(opts: {
 
   // Both direct harness runners and injected abDispatch wiring use this one
   // registry, so capture scenarios cannot accidentally exercise a second fake
-  // pipeline implementation.
-  const runtimes = {
-    scripted: { runner: agents, servesModels: [] },
-    claude: { runner: agents, servesModels: ['claude-'] },
-    pi: { runner: agents, servesModels: ['kimi-'] },
-  }
+  // pipeline implementation. `plugin-scripted` crosses the real plugin
+  // materialization boundary while reusing the contract-tested scripted fake.
+  const pluginRegistry = createPluginRegistry()
+  pluginRegistry.register({
+    name: 'e2e-runtime-plugin',
+    apiVersion: '^1.0.0',
+    agentRuntimes: {
+      'plugin-scripted': () => ({
+        runner: agents,
+        servesModels: ['plugin/'],
+        defaultModel: 'plugin/default',
+      }),
+    },
+  })
+  const runtimes = await materializePluginRuntimes(
+    {
+      scripted: { runner: agents, servesModels: [] },
+      claude: { runner: agents, servesModels: ['claude-'] },
+      pi: { runner: agents, servesModels: ['kimi-'] },
+    },
+    pluginRegistry,
+    { repoRoot: origin, env: {} },
+  )
 
   // launchRunner (§3.3, §15.6-C, §15.7): construct a REAL BuildRunner over
   // the SAME store and the provisioned workspace path; the dispatcher never
@@ -395,8 +430,8 @@ export async function makeHarness(opts: {
   let instances = 0
   const launchRunner = async (slug: string): Promise<LaunchRunnerResult> => {
     const record = await store.getBuild(slug)
-    const wsRef = openWorkspaceRef(await store.getEvents(slug))
-    if (record === null || wsRef === null) {
+    const workspacePath = openWorkspacePath(await store.getEvents(slug))
+    if (record === null || workspacePath === null) {
       throw new Error(`launchRunner("${slug}"): no build record or open workspace`)
     }
     instances += 1
@@ -412,7 +447,7 @@ export async function makeHarness(opts: {
         // serves the Kimi family for exact configured-pair validation.
         runtimes,
         defaultRuntime: 'scripted',
-        workspacePath: wsRef,
+        workspacePath,
         branch: record.branch ?? `ab/${slug}`,
         slug,
         exec: spawnExec,

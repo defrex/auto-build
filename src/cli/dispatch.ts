@@ -27,6 +27,7 @@ import { loadConfig } from '../config/load'
 import type { Config } from '../config/schema'
 import { loadPlugins } from '../plugins/load'
 import type { PluginRegistry } from '../plugins/registry'
+import { materializePluginRuntimes } from '../plugins/runtimes'
 import type { AbEvent } from '../events/catalog'
 import { humanActor } from '../events/envelope'
 import {
@@ -65,7 +66,8 @@ import { createRuntimeResolver, type RuntimeResolver } from '../ports/runner/rou
 import type { RuntimeRegistry } from '../ports/runner/runtime'
 import { createTicketSource } from '../ports/tickets/create'
 import type { Forge, TicketSource, WorkspaceProvider } from '../ports/types'
-import { GitWorktreeProvider, type Exec } from '../ports/workspace/git-worktree'
+import { createWorkspaceProvider } from '../ports/workspace/create'
+import type { Exec } from '../ports/workspace/git-worktree'
 import { BuildRunner, LeaseHeldError } from '../processes/build-runner'
 import {
   HarvestRunner,
@@ -166,7 +168,8 @@ export interface DispatchWiring {
   ids: IdSource
   uuids: UuidSource
   clock: Clock
-  /** Validated startup catalog used by selected plugin adapters. */
+  /** Validated startup catalog used by selected plugin adapters. Runtime
+   * factories are materialized into `runtimes` before role resolution. */
   plugins?: PluginRegistry
 }
 
@@ -241,13 +244,14 @@ function interruptibleSleep(
   })
 }
 
-/** Latest `workspace.provisioned` ref not followed by `workspace.released` —
- * the same projection the dispatcher's janitor scans for (§15.7). */
-function openWorkspaceRef(events: AbEvent[]): string | null {
+/** Latest open workspace's locally reachable path. Historical events predate
+ * path evidence, so their provider ref remains the compatibility fallback. */
+function openWorkspacePath(events: AbEvent[]): string | null {
   let open: string | null = null
   for (const event of events) {
-    if (event.type === 'workspace.provisioned') open = event.payload.ref
-    else if (event.type === 'workspace.released') open = null
+    if (event.type === 'workspace.provisioned') {
+      open = event.payload.path ?? event.payload.ref
+    } else if (event.type === 'workspace.released') open = null
   }
   return open
 }
@@ -269,21 +273,29 @@ async function defaultWire(
   })
   const opened = openStoreForRepoState(state, { env: opts.env })
 
-  const tickets = createTicketSource(
+  const tickets = await createTicketSource(
     config.tickets,
     opts.env,
     opened.repo,
     opened.localStateRoot,
+    plugins,
   )
   const { runtimes, defaultRuntime } = createProductionRuntimes()
+  // A local override relocates the whole tree. Remote stores still need local
+  // scratch beneath the repository default. Plugin factories receive only
+  // their explicit config plus repository/environment context.
+  const workspaces = await createWorkspaceProvider(config.workspace, {
+    registry: plugins,
+    worktreeRoot: opened.worktreeRoot,
+    repoRoot: opened.repo,
+    env: opts.env,
+  })
 
   return {
     store: opened.store,
     tickets,
     forge,
-    // A local override relocates the whole tree. Remote stores still need
-    // local Git scratch, which stays beneath the repository's default root.
-    workspaces: new GitWorktreeProvider({ root: opened.worktreeRoot }),
+    workspaces,
     // Shipped registrations are shared with other non-phase judgment paths.
     // Model ids stay in config; production.ts owns adapter compatibility data.
     runtimes,
@@ -1005,8 +1017,8 @@ class DispatchLoop {
       const { store, runtimes, defaultRuntime, ids, clock, storeRef, token } =
         this.wiring
       const record = await store.getBuild(slug)
-      const wsRef = openWorkspaceRef(await store.getEvents(slug))
-      if (record === null || wsRef === null) {
+      const workspacePath = openWorkspacePath(await store.getEvents(slug))
+      if (record === null || workspacePath === null) {
         throw new Error(
           `launchRunner("${slug}"): no build record or open workspace — the ` +
             'dispatcher provisions both before launching (§12)',
@@ -1018,7 +1030,7 @@ class DispatchLoop {
         config: this.config,
         runtimes,
         defaultRuntime,
-        workspacePath: wsRef,
+        workspacePath,
         branch: record.branch ?? `ab/${slug}`,
         slug,
         exec: this.opts.exec,
@@ -1447,8 +1459,13 @@ export async function abDispatch(opts: DispatchOpts): Promise<void> {
   resolveForgeRegistration(config.forge, plugins)
   const wire = resolvedOpts.wire ?? defaultWire
   const wired = await wire(config, resolvedOpts, state, plugins)
+  const runtimes = await materializePluginRuntimes(wired.runtimes, plugins, {
+    repoRoot: resolvedOpts.targetRepo,
+    env: resolvedOpts.env,
+  })
   const wiring: DispatchWiring = {
     ...wired,
+    runtimes,
     plugins: wired.plugins ?? plugins,
   }
   // §9: resolve the whole config against the registry ONCE, at startup — a

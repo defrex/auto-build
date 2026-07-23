@@ -168,11 +168,10 @@ under the preceding table.
 
 Relative paths and npm package specifiers resolve from the consuming repository.
 Modules are trusted, in-process Bun code and cannot shadow builtin or
-previously registered names. The root `forge` scalar is the only open production
-selector today; ticket, runtime, and workspace registrations can be authored and
-contract-tested but remain builtin-only for selection. BuildStore uses the
-remote HTTP protocol, not this manifest, and TelemetrySource has no registration
-map.
+previously registered names. All four registration maps have production
+selectors: `[tickets].source`, the root `forge` scalar, `[workspace].provider`,
+and `[roles.*].runtime`. BuildStore uses the remote HTTP protocol, not this
+manifest, and TelemetrySource has no registration map.
 
 For the complete author workflow—from choosing one of the four open ports,
 through the strict versioned manifest and environment-only secrets, to the
@@ -216,6 +215,24 @@ deletions remain durable and retry on later dispatcher ticks. Their inline URLs
 therefore intentionally stop working after the review window. The authoritative
 BuildStore artifacts remain queryable under the store's separate retention
 policy.
+
+### `[workspace]`
+
+Optional and backward-compatible: omission selects the builtin `git-worktree`
+provider. The selector envelope is strict; only `[workspace.config]` is an open,
+plugin-owned table.
+
+| Field | Default | Allowed / constraints | Effect |
+|---|---|---|---|
+| `provider` | `"git-worktree"` | nonblank builtin or plugin-registered name | Selects the one provider used by dispatch, recovery, PR polling, and cleanup. |
+| `config` | `{}` | open nested table; must be empty for `git-worktree` | Passed unchanged to the selected plugin factory. |
+
+A selected plugin factory receives the nested config, process environment, and
+absolute repository root. Unknown names fail before claims and list all
+available providers. Providers retain the existing local-working-copy contract:
+`path` is absolute and locally reachable, while provider-scoped `ref` may differ;
+both are durable evidence and historical logs fall back from missing `path` to
+`ref`. Remote sandbox execution remains a separate project.
 
 ### `[commands]`
 
@@ -383,7 +400,9 @@ With no `[roles.default]`, the base is empty: sessions use the wiring-fallback
 runtime (`claude`) and that runtime's built-in default model, with no
 extensions. Two runtimes ship: **`claude`** (Claude models) and **`pi`** (SDK
 mode; provider-qualified ids such as `openai-codex/gpt-5.6-sol` — `ab models
-[query]` looks them up).
+[query]` looks them up). Trusted plugins may register additional runtime names;
+they use the same role inheritance, default-model compatibility validation,
+session event attribution, and optional one-shot capability path as builtins.
 
 The pipeline resolves `plan`, `plan-review`, `implement`, and `code-review`,
 plus each verify/finalize step by name. The repository workflow resolves

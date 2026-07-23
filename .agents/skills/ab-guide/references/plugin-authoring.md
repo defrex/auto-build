@@ -24,11 +24,11 @@ language-neutral `docs/remote-store-protocol.md` shipped with Autobuild and run
 its conformance path instead. `TelemetrySource` is a frozen port type
 with no plugin registration surface in this release.
 
-The manifest can register all four maps, but production selection is not yet
-open for all of them. The root `forge` key may select a builtin or
-plugin-registered forge. Ticket source, runtime, and workspace selectors remain
-builtin-only pending their follow-up releases. You can author and certify those
-adapters now; do not invent configuration keys to select them.
+All four manifest maps have production selectors. Use `[tickets].source` for a
+ticket source, the root `forge` key for a forge, `[workspace].provider` for a
+workspace provider, and `[roles.*].runtime` for an agent runtime. Omitted forge
+and workspace selectors retain the builtin `github` and `git-worktree` defaults;
+role inheritance retains its normal runtime fallback.
 
 ## 2. Create a repository-local module
 
@@ -76,10 +76,14 @@ Every module must default-export one strict `AutobuildPluginManifest`:
 - A registration may be a bare adapter factory, or
   `{ factory, contract: { factory, live? } }`. The first factory returns the
   adapter; the contract factory returns that port suite's fixture factory.
+  Ticket-source descriptors may additionally declare a deduplicated
+  `requiredEnv` list; the host rejects missing or empty credentials before
+  invoking that selected factory.
 - Every adapter and contract factory receives `{ config, env, repoRoot }`:
   adapter-specific read-only `config`, the process `env`, and `repoRoot` as the
-  absolute consuming-repository root. Forge currently receives an empty `config` object;
-  no public per-adapter config tables exist yet.
+  absolute consuming-repository root. Ticket sources receive the existing
+  `[tickets]` fields, workspace providers receive `[workspace.config]`, and
+  runtime and forge factories currently receive an empty `config` object.
 
 Add the module specifier at the TOML root, before any table. Relative paths and
 npm package specifiers resolve from the consuming repository:
@@ -93,8 +97,12 @@ source = "file"
 readyState = "ready"
 ```
 
-Set `forge` only when selecting a forge. There are no corresponding open
-selectors for the other three plugin maps yet.
+Select only the adapters the repository uses. Set `forge = "acme"` for the
+example forge above; set `[tickets].source`, `[workspace].provider`, or a
+`[roles.*].runtime` to the matching registration name for the other ports.
+Ticket plugins receive the existing strict `[tickets]` fields—there is no
+untyped plugin-options table. Workspace plugins put adapter-owned settings only
+under the open `[workspace.config]` table.
 
 Plugin modules load in declaration order. Resolution/evaluation failure, a
 missing or malformed default export, incompatible API range, or collision
@@ -112,7 +120,9 @@ contract output. Read them from the factory's `env` (for example
 local values in ignored environment files or the process secret manager.
 Validate missing credentials when the selected adapter or live fixture is
 created, not at module top level, so registration remains lazy and diagnostics
-can inspect unrelated adapters.
+can inspect unrelated adapters. Ticket-source descriptors should declare
+`requiredEnv` when the host can enforce the credential names before factory
+invocation; other ports validate their environment in their factories.
 
 ## 4. Add the contract harness first
 
@@ -217,7 +227,7 @@ Create `autobuild.toml`:
 plugins = ["./autobuild-plugin.ts"]
 
 [tickets]
-source = "file"
+source = "walkthrough"
 readyState = "ready"
 ```
 <!-- plugin-authoring-walkthrough-config:end -->
