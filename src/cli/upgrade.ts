@@ -42,9 +42,7 @@ import { spawnExec } from '../ports/workspace/git-worktree'
 import {
   defaultDistRoot,
   ensureClaudeSkillLink,
-  installSkillTree,
   installedSkillFilePath,
-  installedSkillPath,
   listInstalledSkills,
   migrateLegacyAgentSkills,
   migrateLegacySkill,
@@ -389,16 +387,7 @@ export async function abUpgrade(opts: {
   const dist = await readDistSkills(distRoot)
   for (const skill of dist) {
     const name = skill.installName
-    const migrated = await migrateLegacySkill(targetRepo, name)
-    const rootLocal =
-      migrated ?? (await readIfExists(installedSkillPath(targetRepo, name)))
-
-    if (rootLocal === undefined) {
-      await installSkillTree(targetRepo, skill)
-      report(name, 'installed')
-      stdout(`${name}: installed`)
-      continue
-    }
+    const migrated = await migrateLegacySkill(targetRepo, name, stdout)
     await ensureClaudeSkillLink(targetRepo, name)
 
     const incoming = new Map(skill.files.map((file) => [file.path, file.content]))
@@ -421,16 +410,24 @@ export async function abUpgrade(opts: {
     await collectPristine(dirname(pristineRoot))
 
     const paths = [...new Set([...incoming.keys(), ...pristineFiles])].sort()
+    const initialLocals = new Map<string, string>()
+    for (const path of paths) {
+      const local =
+        path === 'SKILL.md' && migrated !== undefined
+          ? migrated
+          : await readIfExists(installedSkillFilePath(targetRepo, name, path))
+      if (local !== undefined) initialLocals.set(path, local)
+    }
+    const freshInstall = pristineFiles.size === 0 && initialLocals.size === 0
     const outcomes: UpgradeSkillAction[] = []
     const details: string[] = []
+    const conflictHints: Array<{ path: string; reason: string }> = []
 
     for (const path of paths) {
       const incomingText = incoming.get(path)
       const livePath = installedSkillFilePath(targetRepo, name, path)
       const pristinePath = pristineSkillFilePath(targetRepo, name, path)
-      const local = path === 'SKILL.md' && migrated !== undefined
-        ? migrated
-        : await readIfExists(livePath)
+      const local = initialLocals.get(path)
       const pristine = await readIfExists(pristinePath)
 
       // New upstream support file (or an old install without a per-file base).
@@ -446,11 +443,12 @@ export async function abUpgrade(opts: {
             )
           }
         } else {
+          const reason =
+            'no pristine record and local differs from the new default — refusing to ' +
+            'clobber; merge by hand or re-run `ab init --force` to adopt the default'
           outcomes.push('conflicted')
-          details.push(
-            `${path}: no pristine record and local differs from the new default — refusing to ` +
-              'clobber; merge by hand or re-run `ab init --force` to adopt the default',
-          )
+          details.push(`${path}: ${reason}`)
+          conflictHints.push({ path, reason })
         }
         continue
       }
@@ -473,6 +471,14 @@ export async function abUpgrade(opts: {
         continue
       }
 
+      // A missing live file is restored independently. This must not make a
+      // partially present skill overwrite customized siblings.
+      if (local === undefined) {
+        await writeInstalledSkillFile(targetRepo, name, path, incomingText)
+        await writePristineFile(targetRepo, name, path, incomingText)
+        outcomes.push('adopted')
+        continue
+      }
       if (incomingText === pristine) {
         outcomes.push('current')
         continue
@@ -483,14 +489,6 @@ export async function abUpgrade(opts: {
         outcomes.push('adopted')
         continue
       }
-      if (local === undefined) {
-        outcomes.push('conflicted')
-        details.push(
-          `${path}: local file was removed while the upstream default changed — refusing to restore it`,
-        )
-        continue
-      }
-
       const merge = await mergeFile(exec, {
         base: pristine,
         local,
@@ -508,6 +506,7 @@ export async function abUpgrade(opts: {
         details.push(
           `${path}: ${reason}\n\nmarked merge diagnostic (not written):\n${merge.text}`,
         )
+        conflictHints.push({ path, reason })
       }
       if (opts.resolveConflict === undefined) {
         keepConflict('agent resolution unavailable')
@@ -549,20 +548,22 @@ export async function abUpgrade(opts: {
       outcomes.push('resolved')
     }
 
-    const action = outcomes.reduce<UpgradeSkillAction>(
+    const aggregatedAction = outcomes.reduce<UpgradeSkillAction>(
       (highest, outcome) =>
         precedence.indexOf(outcome) > precedence.indexOf(highest) ? outcome : highest,
       'current',
     )
+    const action: UpgradeSkillAction = freshInstall ? 'installed' : aggregatedAction
     const detail = details.length === 0 ? undefined : details.join('\n\n')
     report(name, action, detail)
     if (action === 'conflicted') {
-      const first = details[0] ?? 'manual merge required'
-      const path = first.slice(0, first.indexOf(':')) || 'SKILL.md'
-      const reason = first.slice(first.indexOf(':') + 1).split('\n', 1)[0]?.trim()
+      const conflict = conflictHints[0] ?? {
+        path: 'SKILL.md',
+        reason: 'manual merge required',
+      }
       stdout(
-        `${name}: conflicted — ${reason}; kept your local file ` +
-          `(merge by hand against .agents/skills/.ab-pristine/${name}/${path})`,
+        `${name}: conflicted — ${conflict.reason}; kept your local file ` +
+          `(merge by hand against .agents/skills/.ab-pristine/${name}/${conflict.path})`,
       )
     } else {
       stdout(`${name}: ${action}`)

@@ -468,6 +468,7 @@ export async function migrateLegacyAgentSkills(targetRepo: string): Promise<void
 export async function migrateLegacySkill(
   targetRepo: string,
   installName: string,
+  warning?: (line: string) => void,
 ): Promise<string | undefined> {
   let migrated: string | undefined
   if ((await readIfExists(installedSkillPath(targetRepo, installName))) === undefined) {
@@ -497,6 +498,15 @@ export async function migrateLegacySkill(
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
         if (code !== 'ENOENT' && code !== 'ENOTEMPTY') throw error
+      }
+      try {
+        await lstat(legacyPristineDir)
+        warning?.(
+          `${installName}: warning — conflicting legacy pristine files remain at ` +
+            `${relative(targetRepo, legacyPristineDir)} for manual recovery`,
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
   } catch (error) {
@@ -628,61 +638,66 @@ export async function abInit(opts: {
 
   const skills: InitReport['skills'] = []
   for (const skill of await readDistSkills(distRoot)) {
-    const migrated = await migrateLegacySkill(opts.targetRepo, skill.installName)
+    const migrated = await migrateLegacySkill(
+      opts.targetRepo,
+      skill.installName,
+      stdout,
+    )
     const rootLocal =
       migrated ?? (await readIfExists(installedSkillPath(opts.targetRepo, skill.installName)))
-    let action: InitSkillAction
-    if (rootLocal === undefined) {
-      await installSkillTree(opts.targetRepo, skill)
-      action = 'installed'
-    } else {
-      let divergent = false
-      for (const file of skill.files) {
-        const livePath = installedSkillFilePath(
+    let divergent = false
+    for (const file of skill.files) {
+      const livePath = installedSkillFilePath(
+        opts.targetRepo,
+        skill.installName,
+        file.path,
+      )
+      const local =
+        file.path === 'SKILL.md' && migrated !== undefined
+          ? migrated
+          : await readIfExists(livePath)
+      if (local === undefined || local === file.content) {
+        // Missing distributed files are added independently. Equality proves
+        // refreshing (or self-healing) their pristine base is safe.
+        await writeInstalledSkillFile(
           opts.targetRepo,
           skill.installName,
           file.path,
+          file.content,
         )
-        const local = file.path === 'SKILL.md' && migrated !== undefined
-          ? migrated
-          : await readIfExists(livePath)
-        if (local === undefined || local === file.content) {
-          // Missing distributed support files are added on re-init. Equality
-          // proves refreshing (or self-healing) their pristine base is safe.
-          await writeInstalledSkillFile(
-            opts.targetRepo,
-            skill.installName,
-            file.path,
-            file.content,
-          )
-          await writePristineFile(
-            opts.targetRepo,
-            skill.installName,
-            file.path,
-            file.content,
-          )
-        } else if (force) {
-          divergent = true
-          await writeInstalledSkillFile(
-            opts.targetRepo,
-            skill.installName,
-            file.path,
-            file.content,
-          )
-          await writePristineFile(
-            opts.targetRepo,
-            skill.installName,
-            file.path,
-            file.content,
-          )
-        } else {
-          // Local edits are NEVER clobbered by init (§16.3). Other files in
-          // the same tree are still independently installed/refreshed.
-          divergent = true
-        }
+        await writePristineFile(
+          opts.targetRepo,
+          skill.installName,
+          file.path,
+          file.content,
+        )
+      } else if (force) {
+        divergent = true
+        await writeInstalledSkillFile(
+          opts.targetRepo,
+          skill.installName,
+          file.path,
+          file.content,
+        )
+        await writePristineFile(
+          opts.targetRepo,
+          skill.installName,
+          file.path,
+          file.content,
+        )
+      } else {
+        // Local edits are NEVER clobbered by init (§16.3), even when SKILL.md
+        // is missing. Other files in the tree are handled independently.
+        divergent = true
       }
-      action = divergent ? (force ? 'overwritten' : 'kept') : 'unchanged'
     }
+    const action: InitSkillAction = divergent
+      ? force
+        ? 'overwritten'
+        : 'kept'
+      : rootLocal === undefined
+        ? 'installed'
+        : 'unchanged'
     await ensureClaudeSkillLink(opts.targetRepo, skill.installName)
     stdout(`${skill.installName}: ${action}`)
     skills.push({ skill: skill.installName, action })

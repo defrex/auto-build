@@ -513,6 +513,25 @@ describe('abUpgrade — complete skill trees', () => {
     '',
   ].join('\n')
 
+  test('a missing SKILL.md never lets upgrade clobber a customized distributed sibling', async () => {
+    await writeDist(distV1, { alpha: BODY }, { alpha: { [reference]: baseReference } })
+    await install()
+    const rootSkill = installedSkillPath(target, 'ab-alpha')
+    const live = installedSkillFilePath(target, 'ab-alpha', reference)
+    const pristine = pristineSkillFilePath(target, 'ab-alpha', reference)
+    const pristineBefore = await readFile(pristine, 'utf8')
+    await rm(rootSkill)
+    await writeFile(live, `${baseReference}local appendix\n`)
+    await writeDist(distV2, { alpha: BODY }, { alpha: { [reference]: baseReference } })
+
+    const report = await abUpgrade({ targetRepo: target, distRoot: distV2 })
+
+    expect(report.skills[0]?.action).toBe('adopted')
+    expect(existsSync(rootSkill)).toBe(true)
+    expect(await readFile(live, 'utf8')).toBe(`${baseReference}local appendix\n`)
+    expect(await readFile(pristine, 'utf8')).toBe(pristineBefore)
+  })
+
   test('an upgrade delivers a newly distributed reference to an old install', async () => {
     await install()
     await writeDist(distV2, { alpha: BODY }, { alpha: { [reference]: baseReference } })
@@ -571,6 +590,38 @@ describe('abUpgrade — complete skill trees', () => {
     expect(await readFile(live, 'utf8')).toBe(local)
     expect(await readFile(pristineSkillFilePath(target, 'ab-alpha', reference), 'utf8')).toBe(
       incoming,
+    )
+  })
+
+  test('conflicted stdout selects the actual conflict rather than an earlier non-conflict detail', async () => {
+    await writeDist(distV1, { alpha: BODY }, { alpha: { [reference]: baseReference } })
+    await install()
+    await rm(pristineSkillPath(target, 'ab-alpha'))
+    await writeFile(
+      installedSkillFilePath(target, 'ab-alpha', reference),
+      baseReference.replace('middle two', 'middle two (local)'),
+    )
+    await writeDist(distV2, { alpha: BODY }, {
+      alpha: {
+        [reference]: baseReference.replace('middle two', 'middle two (incoming)'),
+      },
+    })
+    const lines: string[] = []
+
+    const report = await abUpgrade({
+      targetRepo: target,
+      distRoot: distV2,
+      stdout: (line) => lines.push(line),
+    })
+
+    expect(report.skills[0]?.action).toBe('conflicted')
+    expect(report.skills[0]?.detail).toContain(
+      'SKILL.md: no pristine record; local already matches the new default',
+    )
+    expect(lines).toContain(
+      'ab-alpha: conflicted — agent resolution unavailable; kept your local file ' +
+        '(merge by hand against ' +
+        '.agents/skills/.ab-pristine/ab-alpha/references/authoring.md)',
     )
   })
 

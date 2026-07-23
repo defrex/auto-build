@@ -394,6 +394,36 @@ describe('abInit — idempotence and safety', () => {
     )
   })
 
+  test('surfaces conflicting legacy pristine leftovers for manual recovery', async () => {
+    const name = 'ab-plan'
+    const live = installedSkillPath(target, name)
+    const pristine = pristineSkillPath(target, name)
+    const legacyPristine = join(
+      target,
+      '.claude',
+      'skills',
+      '.ab-pristine',
+      name,
+      'SKILL.md',
+    )
+    await mkdir(dirname(live), { recursive: true })
+    await mkdir(dirname(pristine), { recursive: true })
+    await mkdir(dirname(legacyPristine), { recursive: true })
+    await writeFile(live, 'local plan\n')
+    await writeFile(pristine, 'new-layout pristine\n')
+    await writeFile(legacyPristine, 'conflicting legacy pristine\n')
+    const lines: string[] = []
+
+    await abInit({ targetRepo: target, stdout: (line) => lines.push(line) })
+
+    expect(lines).toContain(
+      'ab-plan: warning — conflicting legacy pristine files remain at ' +
+        '.claude/skills/.ab-pristine/ab-plan for manual recovery',
+    )
+    expect(await readFile(legacyPristine, 'utf8')).toBe('conflicting legacy pristine\n')
+    expect(await readFile(pristine, 'utf8')).toBe('new-layout pristine\n')
+  })
+
   test('migrates a legacy .claude install, preserving local edits and its pristine base', async () => {
     const name = 'ab-plan'
     const legacyLive = join(target, '.claude', 'skills', name, 'SKILL.md')
@@ -483,6 +513,26 @@ describe('abInit — idempotence and safety', () => {
     })
     expect(await readFile(live, 'utf8')).toBe(edited)
     expect(await readFile(pristineSkillPath(target, 'ab-plan'), 'utf8')).toBe(pristineBefore)
+  })
+
+  test('a missing SKILL.md never lets re-init clobber a customized distributed sibling', async () => {
+    await abInit({ targetRepo: target })
+    const root = installedSkillPath(target, 'ab-guide')
+    const relative = 'references/plugin-authoring.md'
+    const live = installedSkillFilePath(target, 'ab-guide', relative)
+    const pristine = pristineSkillFilePath(target, 'ab-guide', relative)
+    const pristineBefore = await readFile(pristine, 'utf8')
+    await rm(root)
+    await writeFile(live, 'local authoring rules survive partial cleanup\n')
+
+    const report = await abInit({ targetRepo: target })
+
+    expect(report.skills.find((entry) => entry.skill === 'ab-guide')?.action).toBe('kept')
+    expect(existsSync(root)).toBe(true)
+    expect(await readFile(live, 'utf8')).toBe(
+      'local authoring rules survive partial cleanup\n',
+    )
+    expect(await readFile(pristine, 'utf8')).toBe(pristineBefore)
   })
 
   test('re-init independently preserves or force-overwrites distributed support files and leaves local extras alone', async () => {
