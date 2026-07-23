@@ -38,8 +38,10 @@ build store all sit behind narrow interfaces. Trusted Bun plugins declared in
 `autobuild.toml` can register third-party ticket, runtime, workspace, and forge
 adapters against the versioned `autobuild/plugin-sdk` surface. The root
 `forge` setting selects a registered forge (`github` by default); selector
-support for the other plugin ports is rolling out separately. The build store
-keeps remote HTTP as its extension surface.
+support for the other plugin ports is rolling out separately. BuildStore is
+deliberately excluded from in-process plugins: its extension surface is the
+documented [remote HTTP protocol](docs/remote-store-protocol.md), so an
+independent server can use any language or storage.
 
 ## Quickstart
 
@@ -185,5 +187,7 @@ pipe or a script sees exactly what you do.
   configuration, as a worked example of the config surface.
 - [`docs/architecture.md`](docs/architecture.md) — how the design maps to the
   codebase: kernel, ports, processes, and stores.
+- [`docs/remote-store-protocol.md`](docs/remote-store-protocol.md) — the
+  complete HTTP server contract and BuildStore conformance instructions.
 - [`SPEC.md`](SPEC.md) — the source of truth for the design and its
   terminology.
